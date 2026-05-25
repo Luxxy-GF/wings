@@ -1222,8 +1222,7 @@ impl super::ServerExecutor for IncusExecutor {
                 json!({
                     "command": [script.entrypoint.as_str(), "/mnt/install/install.sh"],
                     "wait-for-websocket": false,
-                    "interactive": true,
-                    "record-output": true
+                    "interactive": true
                 }),
             )
             .await?;
@@ -1343,8 +1342,7 @@ impl super::ServerExecutor for IncusExecutor {
                 json!({
                     "command": [script.entrypoint.as_str(), "/mnt/script/script.sh"],
                     "wait-for-websocket": false,
-                    "interactive": true,
-                    "record-output": true
+                    "interactive": true
                 }),
             )
             .await?;
