@@ -160,6 +160,51 @@ impl IncusClient {
         let (ws, _) = tokio_tungstenite::client_async(url, stream).await?;
         Ok(ws)
     }
+
+    /// Exec a command interactively in an instance; returns the PTY WebSocket (FD 0).
+    /// Output from the command flows through this WebSocket, making it suitable
+    /// for streaming install-script output to the panel.
+    async fn exec_pty_websocket(
+        &self,
+        instance_name: &str,
+        command: &[&str],
+        env: std::collections::HashMap<String, String>,
+    ) -> Result<tokio_tungstenite::WebSocketStream<UnixStream>, anyhow::Error> {
+        let env_json: serde_json::Map<String, Value> = env
+            .into_iter()
+            .map(|(k, v)| (k, Value::String(v)))
+            .collect();
+
+        let resp = self
+            .post(
+                &format!("/1.0/instances/{}/exec", instance_name),
+                json!({
+                    "command": command,
+                    "wait-for-websocket": true,
+                    "interactive": true,
+                    "environment": env_json
+                }),
+            )
+            .await?;
+
+        let op_id = resp
+            .pointer("/operation")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("no operation in exec response"))?;
+
+        let secret = resp
+            .pointer("/metadata/metadata/fds/0")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("no fd0 secret in exec response"))?
+            .to_string();
+
+        let ws_path = format!("{}/websocket?secret={}", op_id, secret);
+        let stream = UnixStream::connect(&self.socket_path).await?;
+        let url = format!("ws://localhost{}", ws_path);
+
+        let (ws, _) = tokio_tungstenite::client_async(url, stream).await?;
+        Ok(ws)
+    }
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -315,6 +360,11 @@ struct IncusProcessHandle {
 }
 
 impl IncusProcessHandle {
+    /// `ws` is either a console WebSocket (for server processes) or an exec PTY WebSocket
+    /// (for installer/script processes).  When `stop_container_on_ws_close` is true the
+    /// container is force-stopped as soon as the WebSocket closes — this is used for
+    /// installer/script containers whose PID 1 is a long-running sleep so the state task can
+    /// learn the installation finished.
     async fn new(
         instance_name: String,
         client: Arc<IncusClient>,
@@ -324,6 +374,8 @@ impl IncusProcessHandle {
             super::ProcessStatus,
             super::super::resources::ResourceUsage,
         )>,
+        ws: tokio_tungstenite::WebSocketStream<tokio::net::UnixStream>,
+        stop_container_on_ws_close: bool,
     ) -> Result<Self, anyhow::Error> {
         let (stdin_tx, mut stdin_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(150);
         let (stdout_ratelimited_tx, stdout_ratelimited_rx) =
@@ -340,8 +392,6 @@ impl IncusProcessHandle {
             ..Default::default()
         }));
 
-        // Open the console WebSocket for stdin/stdout
-        let ws = client.console_websocket(&instance_name).await?;
         let (mut ws_write, mut ws_read) = ws.split();
 
         // Signals the stdout task to exit its read loop when the container stops,
@@ -364,6 +414,8 @@ impl IncusProcessHandle {
             let server = server.clone();
             let app_config = Arc::clone(&app_config);
             let stopped_notify = stdout_stopped_notify;
+            let client_for_stop = Arc::clone(&client);
+            let name_for_stop = instance_name.clone();
 
             async move {
                 let notified = stopped_notify.notified();
@@ -371,6 +423,7 @@ impl IncusProcessHandle {
 
                 let mut buffer = Vec::with_capacity(1024);
                 let mut line_start = 0;
+                let mut was_notified = false;
 
                 let mut ratelimit_counter = 0u64;
                 let mut ratelimit_start = std::time::Instant::now();
@@ -422,7 +475,7 @@ impl IncusProcessHandle {
                                 break 'ws_loop;
                             }
                         },
-                        _ = &mut notified => break 'ws_loop,
+                        _ = &mut notified => { was_notified = true; break 'ws_loop; }
                     };
 
                     buffer.extend_from_slice(&data);
@@ -499,6 +552,22 @@ impl IncusProcessHandle {
                         stdout_ratelimited_tx.send(Arc::clone(&line)).ok();
                     }
                     stdout_tx.send(line).ok();
+                }
+
+                // For installer/script containers: exec WS close means the script
+                // finished.  PID 1 is still sleeping, so force-stop the container here
+                // so the state task reports Stopped and the installation flow completes.
+                if stop_container_on_ws_close && !was_notified {
+                    tracing::debug!(instance = %name_for_stop, "exec finished, stopping container");
+                    if let Ok(resp) = client_for_stop
+                        .put(
+                            &format!("/1.0/instances/{}/state", name_for_stop),
+                            json!({ "action": "stop", "force": true }),
+                        )
+                        .await
+                    {
+                        let _ = client_for_stop.ensure_done(resp).await;
+                    }
                 }
 
                 tracing::debug!(server = %server.uuid, "incus stdout task ended");
@@ -1094,7 +1163,8 @@ impl IncusExecutor {
     }
 
     /// Build the instance-create JSON body for an installer/script container.
-    /// `script_container_path` is the full path to the script *inside* the container.
+    /// PID 1 is a long-running sleep so the container stays alive while the actual
+    /// install script is executed via exec_pty_websocket.
     fn build_installer_instance(
         &self,
         name: &str,
@@ -1103,7 +1173,6 @@ impl IncusExecutor {
         server_mount_target: &str,
         script_mount_source: &str,
         script_mount_target: &str,
-        script_container_path: &str,
     ) -> Value {
         let app_cfg = self.app_config.load();
 
@@ -1122,13 +1191,14 @@ impl IncusExecutor {
                 "limits.cpu.allowance".to_string(),
                 Value::String(format!("{}%", app_cfg.incus.installer_limits.cpu)),
             ),
-            // Run the install script as PID 1 so its output flows to the console WebSocket.
+            // PID 1 is a sleep so the container stays alive until the exec script finishes.
+            // The actual install script runs via exec_pty_websocket and its output flows
+            // through the exec PTY WebSocket instead of the LXC console.
             (
                 "raw.lxc".to_string(),
-                Value::String(format!(
-                    "lxc.init.cmd = {} {}\nlxc.cap.drop = setpcap mknod audit_write net_raw dac_override fowner fsetid net_bind_service sys_chroot setfcap sys_ptrace",
-                    script.entrypoint, script_container_path
-                )),
+                Value::String(
+                    "lxc.init.cmd = /bin/sh -c exec sleep 86400\nlxc.cap.drop = setpcap mknod audit_write net_raw dac_override fowner fsetid net_bind_service sys_chroot setfcap sys_ptrace".to_string(),
+                ),
             ),
         ]);
 
@@ -1247,6 +1317,8 @@ impl super::ServerExecutor for IncusExecutor {
             .await?;
         self.client.ensure_done(resp).await?;
 
+        let ws = self.client.console_websocket(&name).await?;
+
         let (status_tx, status_rx) = tokio::sync::mpsc::channel(1);
         let handle = Arc::new(
             IncusProcessHandle::new(
@@ -1255,6 +1327,8 @@ impl super::ServerExecutor for IncusExecutor {
                 server,
                 Arc::clone(&self.app_config),
                 status_tx,
+                ws,
+                false,
             )
             .await?,
         );
@@ -1272,6 +1346,8 @@ impl super::ServerExecutor for IncusExecutor {
             .await
             .ok_or_else(|| anyhow::anyhow!("no running incus instance found for server {}", uuid))?;
 
+        let ws = self.client.console_websocket(&name).await?;
+
         let (status_tx, status_rx) = tokio::sync::mpsc::channel(1);
         let handle = Arc::new(
             IncusProcessHandle::new(
@@ -1280,6 +1356,8 @@ impl super::ServerExecutor for IncusExecutor {
                 server,
                 Arc::clone(&self.app_config),
                 status_tx,
+                ws,
+                false,
             )
             .await?,
         );
@@ -1335,13 +1413,12 @@ impl super::ServerExecutor for IncusExecutor {
             "/mnt/server",
             &tmp_dir.to_string_lossy(),
             "/mnt/install",
-            "/mnt/install/install.sh",
         );
 
         let resp = self.client.post("/1.0/instances", body).await?;
         self.client.ensure_done(resp).await?;
 
-        // Start the container; lxc.init.cmd runs the install script as PID 1.
+        // Start the container; PID 1 is a long-running sleep.
         let resp = self
             .client
             .put(
@@ -1351,6 +1428,27 @@ impl super::ServerExecutor for IncusExecutor {
             .await?;
         self.client.ensure_done(resp).await?;
 
+        // Execute the install script via a PTY so output reliably flows to the WebSocket.
+        let env: std::collections::HashMap<String, String> = script
+            .environment
+            .iter()
+            .map(|(k, v)| {
+                let s = match v {
+                    serde_json::Value::String(s) => s.clone(),
+                    other => other.to_string(),
+                };
+                (k.to_string(), s)
+            })
+            .collect();
+        let ws = self
+            .client
+            .exec_pty_websocket(
+                &name,
+                &[script.entrypoint.as_str(), "/mnt/install/install.sh"],
+                env,
+            )
+            .await?;
+
         let (status_tx, status_rx) = tokio::sync::mpsc::channel(1);
         let handle = Arc::new(
             IncusProcessHandle::new(
@@ -1359,6 +1457,8 @@ impl super::ServerExecutor for IncusExecutor {
                 server,
                 Arc::clone(&self.app_config),
                 status_tx,
+                ws,
+                true, // stop container when exec WS closes
             )
             .await?,
         );
@@ -1372,6 +1472,8 @@ impl super::ServerExecutor for IncusExecutor {
     ) -> Result<(Arc<dyn super::ProcessHandle>, StatusReceiver), anyhow::Error> {
         let name = format!("w-{}-installer", server.uuid);
 
+        let ws = self.client.console_websocket(&name).await?;
+
         let (status_tx, status_rx) = tokio::sync::mpsc::channel(1);
         let handle = Arc::new(
             IncusProcessHandle::new(
@@ -1380,6 +1482,8 @@ impl super::ServerExecutor for IncusExecutor {
                 server,
                 Arc::clone(&self.app_config),
                 status_tx,
+                ws,
+                false,
             )
             .await?,
         );
@@ -1444,13 +1548,12 @@ impl super::ServerExecutor for IncusExecutor {
             "/mnt/server",
             &tmp_dir.to_string_lossy(),
             "/mnt/script",
-            "/mnt/script/script.sh",
         );
 
         let resp = self.client.post("/1.0/instances", body).await?;
         self.client.ensure_done(resp).await?;
 
-        // Start the container; lxc.init.cmd runs the script as PID 1.
+        // Start the container; PID 1 is a long-running sleep.
         let resp = self
             .client
             .put(
@@ -1460,6 +1563,26 @@ impl super::ServerExecutor for IncusExecutor {
             .await?;
         self.client.ensure_done(resp).await?;
 
+        let env: std::collections::HashMap<String, String> = script
+            .environment
+            .iter()
+            .map(|(k, v)| {
+                let s = match v {
+                    serde_json::Value::String(s) => s.clone(),
+                    other => other.to_string(),
+                };
+                (k.to_string(), s)
+            })
+            .collect();
+        let ws = self
+            .client
+            .exec_pty_websocket(
+                &name,
+                &[script.entrypoint.as_str(), "/mnt/script/script.sh"],
+                env,
+            )
+            .await?;
+
         let (status_tx, status_rx) = tokio::sync::mpsc::channel(1);
         let handle = Arc::new(
             IncusProcessHandle::new(
@@ -1468,6 +1591,8 @@ impl super::ServerExecutor for IncusExecutor {
                 server,
                 Arc::clone(&self.app_config),
                 status_tx,
+                ws,
+                true, // stop container when exec WS closes
             )
             .await?,
         );
