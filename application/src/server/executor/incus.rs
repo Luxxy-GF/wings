@@ -1359,7 +1359,7 @@ impl IncusExecutor {
     }
 
     async fn delete_instance_if_present(&self, name: &str) {
-        for attempt in 0..10 {
+        for attempt in 0..20u64 {
             let result = async {
                 let resp = self.client.delete(&format!("/1.0/instances/{}", name)).await?;
                 self.client.ensure_done(resp).await
@@ -1378,13 +1378,14 @@ impl IncusExecutor {
                         tracing::debug!(
                             instance = %name,
                             attempt = attempt + 1,
-                            "incus instance still in use during delete; waiting before retry"
+                            "incus instance still in use during delete; cancelling operations and retrying"
                         );
+                        // Re-cancel operations: new sessions may have appeared, or the
+                        // previous cancel hasn't propagated yet.
+                        self.cancel_instance_operations(name).await;
                         self.stop_instance_if_present(name).await;
-                        tokio::time::sleep(std::time::Duration::from_millis(
-                            250 * (attempt + 1),
-                        ))
-                        .await;
+                        let wait_ms = 500 * (attempt + 1).min(10);
+                        tokio::time::sleep(std::time::Duration::from_millis(wait_ms)).await;
                         continue;
                     }
 
@@ -1400,12 +1401,65 @@ impl IncusExecutor {
 
         tracing::error!(
             instance = %name,
-            "failed to delete incus instance: still in use after retries"
+            "failed to delete incus instance after retries: still in use"
         );
+    }
+
+    /// Cancel all active Incus operations (exec, console) for the given instance.
+    /// This is required before deletion: Incus returns "In use" if any WebSocket
+    /// session is still registered, even after the process has exited.
+    async fn cancel_instance_operations(&self, instance_name: &str) {
+        let resp = match self.client.get("/1.0/operations?recursion=1").await {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+
+        let metadata = match resp.pointer("/metadata").and_then(Value::as_object) {
+            Some(m) => m.clone(),
+            None => return,
+        };
+
+        for (_, ops) in &metadata {
+            let op_list = match ops.as_array() {
+                Some(l) => l,
+                None => continue,
+            };
+            for op in op_list {
+                let involves = op
+                    .pointer("/resources/instances")
+                    .and_then(Value::as_array)
+                    .map(|instances| {
+                        instances.iter().any(|inst| {
+                            inst.as_str()
+                                .map(|s| s.ends_with(&format!("/{}", instance_name)))
+                                .unwrap_or(false)
+                        })
+                    })
+                    .unwrap_or(false);
+
+                if involves {
+                    if let Some(op_id) = op.get("id").and_then(Value::as_str) {
+                        tracing::debug!(
+                            instance = %instance_name,
+                            operation = %op_id,
+                            "cancelling incus operation before cleanup"
+                        );
+                        let _ = self
+                            .client
+                            .delete(&format!("/1.0/operations/{}", op_id))
+                            .await;
+                    }
+                }
+            }
+        }
+
+        // Give Incus a moment to process the cancellations before we delete.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     }
 
     async fn cleanup_instance_name(&self, name: &str) {
         self.stop_instance_if_present(name).await;
+        self.cancel_instance_operations(name).await;
         self.delete_instance_if_present(name).await;
         self.wait_for_instance_cleanup(name).await;
     }
