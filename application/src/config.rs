@@ -458,6 +458,9 @@ fn remote_query_retry_limit() -> u64 {
 fn incus_socket() -> String {
     "/var/lib/incus/unix.socket".to_string()
 }
+fn incus_storage_pool() -> String {
+    "default".to_string()
+}
 fn incus_delete_container_on_stop() -> bool {
     true
 }
@@ -992,6 +995,8 @@ nestify::nest! {
         pub incus: #[derive(ToSchema, Deserialize, Serialize, DefaultFromSerde)] #[serde(default)] pub struct Incus {
             #[serde(default = "incus_socket")]
             pub socket: String,
+            #[serde(default = "incus_storage_pool")]
+            pub storage_pool: String,
             #[serde(default)]
             pub server_name_in_container_name: bool,
             #[serde(default = "incus_delete_container_on_stop")]

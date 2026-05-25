@@ -1094,6 +1094,10 @@ impl IncusExecutor {
 
         // Devices
         let mut devices: HashMap<String, Value> = HashMap::new();
+        devices.insert(
+            "root".to_string(),
+            json!({ "type": "disk", "path": "/", "pool": app_cfg.incus.storage_pool }),
+        );
         devices.insert("eth0".to_string(), build_nic_device(&app_cfg.incus.network.bridge));
 
         // Server data mount
@@ -1212,6 +1216,10 @@ impl IncusExecutor {
         }
 
         let mut devices: HashMap<String, Value> = HashMap::new();
+        devices.insert(
+            "root".to_string(),
+            json!({ "type": "disk", "path": "/", "pool": app_cfg.incus.storage_pool }),
+        );
         devices.insert("eth0".to_string(), build_nic_device(&app_cfg.incus.network.bridge));
         devices.insert(
             "server-data".to_string(),
