@@ -344,6 +344,11 @@ impl IncusProcessHandle {
         let ws = client.console_websocket(&instance_name).await?;
         let (mut ws_write, mut ws_read) = ws.split();
 
+        // Signals the stdout task to exit its read loop when the container stops,
+        // in case Incus doesn't send a WS close frame promptly after container exit.
+        let stopped_notify = Arc::new(tokio::sync::Notify::new());
+        let stdout_stopped_notify = Arc::clone(&stopped_notify);
+
         // stdin task: forward data from the channel to the WebSocket
         let stdin_task = tokio::spawn(async move {
             while let Some(data) = stdin_rx.recv().await {
@@ -358,8 +363,12 @@ impl IncusProcessHandle {
         let stdout_task = tokio::spawn({
             let server = server.clone();
             let app_config = Arc::clone(&app_config);
+            let stopped_notify = stdout_stopped_notify;
 
             async move {
+                let notified = stopped_notify.notified();
+                tokio::pin!(notified);
+
                 let mut buffer = Vec::with_capacity(1024);
                 let mut line_start = 0;
 
@@ -396,20 +405,24 @@ impl IncusProcessHandle {
                     true
                 };
 
-                while let Some(msg) = ws_read.next().await {
-                    let data = match msg {
-                        Ok(Message::Binary(b)) => b.to_vec(),
-                        Ok(Message::Text(t)) => t.into_bytes(),
-                        Ok(Message::Close(_)) => break,
-                        Ok(_) => continue,
-                        Err(err) => {
-                            tracing::debug!(
-                                server = %server.uuid,
-                                error = %err,
-                                "incus console ws closed"
-                            );
-                            break;
-                        }
+                'ws_loop: loop {
+                    let data = tokio::select! {
+                        biased;
+                        msg = ws_read.next() => match msg {
+                            Some(Ok(Message::Binary(b))) => b.to_vec(),
+                            Some(Ok(Message::Text(t))) => t.into_bytes(),
+                            Some(Ok(Message::Close(_))) | None => break 'ws_loop,
+                            Some(Ok(_)) => continue 'ws_loop,
+                            Some(Err(err)) => {
+                                tracing::debug!(
+                                    server = %server.uuid,
+                                    error = %err,
+                                    "incus console ws closed"
+                                );
+                                break 'ws_loop;
+                            }
+                        },
+                        _ = &mut notified => break 'ws_loop,
                     };
 
                     buffer.extend_from_slice(&data);
@@ -574,6 +587,7 @@ impl IncusProcessHandle {
         let state_client = Arc::clone(&client);
         let state_name = instance_name.clone();
         let state_usage = Arc::clone(&resource_usage);
+        let state_stopped_notify = Arc::clone(&stopped_notify);
 
         let state_task = tokio::spawn(async move {
             loop {
@@ -599,11 +613,10 @@ impl IncusProcessHandle {
                     .and_then(Value::as_str)
                     .unwrap_or("Unknown");
 
+                let is_stopped = !matches!(status, "Running" | "Frozen");
+
                 let process_status = match status {
-                    "Running" => {
-                        // Update uptime from instance started_at if available
-                        super::ProcessStatus::Running
-                    }
+                    "Running" => super::ProcessStatus::Running,
                     "Frozen" => super::ProcessStatus::Paused,
                     _ => {
                         state_usage.write().await.uptime = 0;
@@ -616,6 +629,13 @@ impl IncusProcessHandle {
 
                 let usage = *state_usage.read().await;
                 if status_tx.send((process_status, usage)).await.is_err() {
+                    break;
+                }
+
+                if is_stopped {
+                    // Wake the stdout task so it exits its read loop and the
+                    // installation/server flow can complete cleanly.
+                    state_stopped_notify.notify_one();
                     break;
                 }
             }
