@@ -50,7 +50,13 @@ impl IncusClient {
         let resp = sender.send_request(req).await?;
         let status = resp.status();
         let body = resp.collect().await?.to_bytes();
-        let json: Value = serde_json::from_slice(&body)?;
+
+        // Some endpoints (e.g. console?action=show) may return an empty body.
+        let json: Value = if body.is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_slice(&body)?
+        };
 
         if !status.is_success() && status.as_u16() != 202 {
             let msg = json
@@ -730,17 +736,54 @@ impl super::ProcessHandle for IncusProcessHandle {
     }
 
     async fn start(&self) -> Result<(), anyhow::Error> {
-        match self
-            .client
-            .put(
-                &format!("/1.0/instances/{}/state", self.instance_name),
-                json!({ "action": "start" }),
-            )
-            .await
-        {
-            Ok(resp) => self.client.ensure_done(resp).await,
-            Err(e) if e.to_string().to_lowercase().contains("already running") => Ok(()),
-            Err(e) => Err(e),
+        let result = async {
+            let resp = self
+                .client
+                .put(
+                    &format!("/1.0/instances/{}/state", self.instance_name),
+                    json!({ "action": "start" }),
+                )
+                .await?;
+            self.client.ensure_done(resp).await
+        }
+        .await;
+
+        match result {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                let msg = e.to_string().to_lowercase();
+                if msg.contains("already running") || msg.contains("already started") {
+                    return Ok(());
+                }
+                // Incus error messages vary by version; fall back to checking real state.
+                match self
+                    .client
+                    .get(&format!("/1.0/instances/{}/state", self.instance_name))
+                    .await
+                {
+                    Ok(state)
+                        if state
+                            .pointer("/metadata/status")
+                            .and_then(Value::as_str)
+                            == Some("Running") =>
+                    {
+                        tracing::debug!(
+                            instance = %self.instance_name,
+                            "start() failed but instance is running, treating as no-op: {:#}",
+                            e
+                        );
+                        Ok(())
+                    }
+                    _ => {
+                        tracing::warn!(
+                            instance = %self.instance_name,
+                            "start() failed: {:#}",
+                            e
+                        );
+                        Err(e)
+                    }
+                }
+            }
         }
     }
 
