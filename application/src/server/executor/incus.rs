@@ -730,14 +730,18 @@ impl super::ProcessHandle for IncusProcessHandle {
     }
 
     async fn start(&self) -> Result<(), anyhow::Error> {
-        let resp = self
+        match self
             .client
             .put(
                 &format!("/1.0/instances/{}/state", self.instance_name),
                 json!({ "action": "start" }),
             )
-            .await?;
-        self.client.ensure_done(resp).await
+            .await
+        {
+            Ok(resp) => self.client.ensure_done(resp).await,
+            Err(e) if e.to_string().to_lowercase().contains("already running") => Ok(()),
+            Err(e) => Err(e),
+        }
     }
 
     async fn stop(&self) -> Result<(), anyhow::Error> {
@@ -876,14 +880,17 @@ impl IncusExecutor {
                 _ => continue,
             };
 
-            // Stop first (ignore errors — might already be stopped)
-            let _ = self
+            // Stop first; wait for completion so the instance is fully stopped before delete.
+            if let Ok(resp) = self
                 .client
                 .put(
                     &format!("/1.0/instances/{}/state", name),
                     json!({ "action": "stop", "force": true }),
                 )
-                .await;
+                .await
+            {
+                let _ = self.client.ensure_done(resp).await;
+            }
 
             if let Err(err) = self
                 .client
@@ -1000,6 +1007,7 @@ impl IncusExecutor {
     }
 
     /// Build the instance-create JSON body for an installer/script container.
+    /// `script_container_path` is the full path to the script *inside* the container.
     fn build_installer_instance(
         &self,
         name: &str,
@@ -1008,6 +1016,7 @@ impl IncusExecutor {
         server_mount_target: &str,
         script_mount_source: &str,
         script_mount_target: &str,
+        script_container_path: &str,
     ) -> Value {
         let app_cfg = self.app_config.load();
 
@@ -1025,6 +1034,14 @@ impl IncusExecutor {
             (
                 "limits.cpu.allowance".to_string(),
                 Value::String(format!("{}%", app_cfg.incus.installer_limits.cpu)),
+            ),
+            // Run the install script as PID 1 so its output flows to the console WebSocket.
+            (
+                "raw.lxc".to_string(),
+                Value::String(format!(
+                    "lxc.init.cmd = {} {}\nlxc.cap.drop = setpcap mknod audit_write net_raw dac_override fowner fsetid net_bind_service sys_chroot setfcap sys_ptrace",
+                    script.entrypoint, script_container_path
+                )),
             ),
         ]);
 
@@ -1111,14 +1128,17 @@ impl super::ServerExecutor for IncusExecutor {
             instance_name(&server_cfg.uuid, &app_cfg, &server_cfg.meta.name)
         };
 
-        // Clean up any leftover instance before creating a fresh one
-        let _ = self
+        // Clean up any leftover instance before creating a fresh one.
+        if let Ok(resp) = self
             .client
             .put(
                 &format!("/1.0/instances/{}/state", name),
                 json!({ "action": "stop", "force": true }),
             )
-            .await;
+            .await
+        {
+            let _ = self.client.ensure_done(resp).await;
+        }
         let _ = self.client.delete(&format!("/1.0/instances/{}", name)).await;
 
         let body = self.build_server_instance(&name, server).await?;
@@ -1189,14 +1209,18 @@ impl super::ServerExecutor for IncusExecutor {
     ) -> Result<(Arc<dyn super::ProcessHandle>, StatusReceiver), anyhow::Error> {
         let name = format!("w-{}-installer", server.uuid);
 
-        // Clean up any leftover instance from a previous failed install
-        let _ = self
+        // Clean up any leftover instance from a previous failed install.
+        // Wait for stop to complete before deleting so the instance is fully stopped.
+        if let Ok(resp) = self
             .client
             .put(
                 &format!("/1.0/instances/{}/state", name),
                 json!({ "action": "stop", "force": true }),
             )
-            .await;
+            .await
+        {
+            let _ = self.client.ensure_done(resp).await;
+        }
         let _ = self.client.delete(&format!("/1.0/instances/{}", name)).await;
 
         let tmp_dir = std::path::Path::new(&self.app_config.load().system.tmp_directory)
@@ -1220,11 +1244,13 @@ impl super::ServerExecutor for IncusExecutor {
             "/mnt/server",
             &tmp_dir.to_string_lossy(),
             "/mnt/install",
+            "/mnt/install/install.sh",
         );
 
         let resp = self.client.post("/1.0/instances", body).await?;
         self.client.ensure_done(resp).await?;
 
+        // Start the container; lxc.init.cmd runs the install script as PID 1.
         let resp = self
             .client
             .put(
@@ -1233,20 +1259,6 @@ impl super::ServerExecutor for IncusExecutor {
             )
             .await?;
         self.client.ensure_done(resp).await?;
-
-        // Kick off the install script via exec
-        let exec_resp = self
-            .client
-            .post(
-                &format!("/1.0/instances/{}/exec", name),
-                json!({
-                    "command": [script.entrypoint.as_str(), "/mnt/install/install.sh"],
-                    "wait-for-websocket": false,
-                    "interactive": true
-                }),
-            )
-            .await?;
-        self.client.ensure_done(exec_resp).await?;
 
         let (status_tx, status_rx) = tokio::sync::mpsc::channel(1);
         let handle = Arc::new(
@@ -1341,11 +1353,13 @@ impl super::ServerExecutor for IncusExecutor {
             "/mnt/server",
             &tmp_dir.to_string_lossy(),
             "/mnt/script",
+            "/mnt/script/script.sh",
         );
 
         let resp = self.client.post("/1.0/instances", body).await?;
         self.client.ensure_done(resp).await?;
 
+        // Start the container; lxc.init.cmd runs the script as PID 1.
         let resp = self
             .client
             .put(
@@ -1354,19 +1368,6 @@ impl super::ServerExecutor for IncusExecutor {
             )
             .await?;
         self.client.ensure_done(resp).await?;
-
-        let exec_resp = self
-            .client
-            .post(
-                &format!("/1.0/instances/{}/exec", name),
-                json!({
-                    "command": [script.entrypoint.as_str(), "/mnt/script/script.sh"],
-                    "wait-for-websocket": false,
-                    "interactive": true
-                }),
-            )
-            .await?;
-        self.client.ensure_done(exec_resp).await?;
 
         let (status_tx, status_rx) = tokio::sync::mpsc::channel(1);
         let handle = Arc::new(
