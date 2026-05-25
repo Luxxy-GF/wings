@@ -1111,6 +1111,16 @@ impl super::ServerExecutor for IncusExecutor {
             instance_name(&server_cfg.uuid, &app_cfg, &server_cfg.meta.name)
         };
 
+        // Clean up any leftover instance before creating a fresh one
+        let _ = self
+            .client
+            .put(
+                &format!("/1.0/instances/{}/state", name),
+                json!({ "action": "stop", "force": true }),
+            )
+            .await;
+        let _ = self.client.delete(&format!("/1.0/instances/{}", name)).await;
+
         let body = self.build_server_instance(&name, server).await?;
 
         let resp = self.client.post("/1.0/instances", body).await?;
@@ -1178,6 +1188,16 @@ impl super::ServerExecutor for IncusExecutor {
         script: &super::super::installation::InstallationScript,
     ) -> Result<(Arc<dyn super::ProcessHandle>, StatusReceiver), anyhow::Error> {
         let name = format!("w-{}-installer", server.uuid);
+
+        // Clean up any leftover instance from a previous failed install
+        let _ = self
+            .client
+            .put(
+                &format!("/1.0/instances/{}/state", name),
+                json!({ "action": "stop", "force": true }),
+            )
+            .await;
+        let _ = self.client.delete(&format!("/1.0/instances/{}", name)).await;
 
         let tmp_dir = std::path::Path::new(&self.app_config.load().system.tmp_directory)
             .join(server.uuid.to_string());
