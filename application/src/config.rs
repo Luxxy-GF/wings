@@ -453,6 +453,42 @@ fn remote_query_retry_limit() -> u64 {
     10
 }
 
+fn incus_socket() -> String {
+    "/var/lib/incus/unix.socket".to_string()
+}
+fn incus_delete_container_on_stop() -> bool {
+    true
+}
+fn incus_network_bridge() -> String {
+    "incusbr0".to_string()
+}
+fn incus_network_dns() -> Vec<String> {
+    vec!["1.1.1.1".to_string(), "1.0.0.1".to_string()]
+}
+fn incus_tmpfs_size() -> u64 {
+    100
+}
+fn incus_container_pid_limit() -> u64 {
+    5120
+}
+fn incus_installer_limits_memory() -> MiB {
+    1024u64.into()
+}
+fn incus_installer_limits_cpu() -> u64 {
+    100
+}
+fn incus_installer_limits_timeout() -> u64 {
+    30 * 60
+}
+
+#[derive(ToSchema, Deserialize, Serialize, Default, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ExecutorType {
+    #[default]
+    Docker,
+    Incus,
+}
+
 /// Represents a size in Mebibytes (MiB). The inner value is the number of MiB (not bytes!!).
 #[derive(
     ToSchema, Deserialize, Serialize, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default,
@@ -937,6 +973,46 @@ nestify::nest! {
                 pub r#type: String,
                 #[serde(default = "docker_log_config_config")]
                 pub config: BTreeMap<String, String>,
+            },
+        },
+
+        #[serde(default)]
+        #[schema(value_type = String)]
+        pub executor: ExecutorType,
+
+        #[serde(default)]
+        #[schema(inline)]
+        pub incus: #[derive(ToSchema, Deserialize, Serialize, DefaultFromSerde)] #[serde(default)] pub struct Incus {
+            #[serde(default = "incus_socket")]
+            pub socket: String,
+            #[serde(default)]
+            pub server_name_in_container_name: bool,
+            #[serde(default = "incus_delete_container_on_stop")]
+            pub delete_container_on_stop: bool,
+
+            #[serde(default)]
+            #[schema(inline)]
+            pub network: #[derive(ToSchema, Deserialize, Serialize, DefaultFromSerde)] #[serde(default)] pub struct IncusNetwork {
+                #[serde(default = "incus_network_bridge")]
+                pub bridge: String,
+                #[serde(default = "incus_network_dns")]
+                pub dns: Vec<String>,
+            },
+
+            #[serde(default = "incus_tmpfs_size")]
+            pub tmpfs_size: u64,
+            #[serde(default = "incus_container_pid_limit")]
+            pub container_pid_limit: u64,
+
+            #[serde(default)]
+            #[schema(inline)]
+            pub installer_limits: #[derive(ToSchema, Deserialize, Serialize, DefaultFromSerde)] #[serde(default)] pub struct IncusInstallerLimits {
+                #[serde(default = "incus_installer_limits_timeout")]
+                pub timeout: u64,
+                #[serde(default = "incus_installer_limits_memory")]
+                pub memory: MiB,
+                #[serde(default = "incus_installer_limits_cpu")]
+                pub cpu: u64,
             },
         },
 
