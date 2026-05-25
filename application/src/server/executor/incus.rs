@@ -183,10 +183,21 @@ fn instance_name(
     }
 }
 
-/// Parse a Docker-style image reference into an Incus OCI source object.
-fn parse_image_source(image: &str) -> Value {
+/// Extract the registry hostname from a Docker-style image reference.
+fn registry_for_image(image: &str) -> &str {
     let image = image.trim_end_matches('~');
-    // Split off the registry if the first component contains a dot or colon
+    let parts: Vec<&str> = image.splitn(2, '/').collect();
+    if parts.len() == 2 && (parts[0].contains('.') || parts[0].contains(':')) {
+        parts[0]
+    } else {
+        "docker.io"
+    }
+}
+
+/// Parse a Docker-style image reference into an Incus OCI source object.
+/// Pass `credentials` as `Some((username, password))` to authenticate with the registry.
+fn parse_image_source(image: &str, credentials: Option<(&str, &str)>) -> Value {
+    let image = image.trim_end_matches('~');
     let parts: Vec<&str> = image.splitn(2, '/').collect();
     let (server, alias) = if parts.len() == 2
         && (parts[0].contains('.') || parts[0].contains(':'))
@@ -196,12 +207,21 @@ fn parse_image_source(image: &str) -> Value {
         ("https://docker.io".to_string(), image.to_string())
     };
 
-    json!({
+    let mut source = json!({
         "type": "image",
         "protocol": "oci",
         "server": server,
         "alias": alias
-    })
+    });
+
+    if let Some((username, password)) = credentials {
+        if !username.is_empty() {
+            source["username"] = Value::String(username.to_string());
+            source["password"] = Value::String(password.to_string());
+        }
+    }
+
+    source
 }
 
 /// Build Incus config keys for resource limits.
@@ -1025,10 +1045,14 @@ impl IncusExecutor {
 
         drop(server_cfg);
 
+        let registry = registry_for_image(&image);
+        let creds = app_cfg.incus.registries.get(registry);
+        let credentials = creds.as_ref().map(|c| (c.username.as_str(), c.password.as_str()));
+
         let mut body = json!({
             "name": name,
             "type": "container",
-            "source": parse_image_source(&image),
+            "source": parse_image_source(&image, credentials),
             "config": config,
             "devices": devices
         });
@@ -1116,10 +1140,14 @@ impl IncusExecutor {
             }),
         );
 
+        let registry = registry_for_image(&script.container_image);
+        let creds = app_cfg.incus.registries.get(registry);
+        let credentials = creds.as_ref().map(|c| (c.username.as_str(), c.password.as_str()));
+
         json!({
             "name": name,
             "type": "container",
-            "source": parse_image_source(&script.container_image),
+            "source": parse_image_source(&script.container_image, credentials),
             "config": config,
             "devices": devices
         })

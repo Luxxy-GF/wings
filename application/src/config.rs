@@ -1006,6 +1006,10 @@ nestify::nest! {
                 pub dns: Vec<String>,
             },
 
+            #[serde(default)]
+            #[schema(inline)]
+            pub registries: HashMap<String, DockerRegistryConfiguration>,
+
             #[serde(default = "incus_tmpfs_size")]
             pub tmpfs_size: u64,
             #[serde(default = "incus_container_pid_limit")]
