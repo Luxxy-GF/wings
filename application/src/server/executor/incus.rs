@@ -8,10 +8,24 @@ use rand::distr::SampleString;
 use serde_json::{Value, json};
 use std::{
     collections::HashMap,
-    sync::{Arc, Weak},
+    path::PathBuf,
+    sync::{
+        atomic::{AtomicI32, Ordering},
+        Arc, Weak,
+    },
 };
 use tokio::{net::UnixStream, sync::RwLock};
 use tokio_tungstenite::tungstenite::Message;
+
+const INCUS_SLEEP_ENTRYPOINT: &str = "/bin/sh -lc \"exec sleep 86400\"";
+const INCUS_CAP_DROP: &str =
+    "lxc.cap.drop = setpcap mknod audit_write net_raw dac_override fowner fsetid net_bind_service sys_chroot setfcap sys_ptrace";
+
+struct IncusExecSession {
+    ws: tokio_tungstenite::WebSocketStream<UnixStream>,
+    control_ws: Option<tokio_tungstenite::WebSocketStream<UnixStream>>,
+    operation: String,
+}
 
 // ─── HTTP client over Incus Unix socket ───────────────────────────────────────
 
@@ -170,7 +184,7 @@ impl IncusClient {
         command: &[&str],
         env: std::collections::HashMap<String, String>,
         cwd: Option<&str>,
-    ) -> Result<tokio_tungstenite::WebSocketStream<UnixStream>, anyhow::Error> {
+    ) -> Result<IncusExecSession, anyhow::Error> {
         let env_json: serde_json::Map<String, Value> = env
             .into_iter()
             .map(|(k, v)| (k, Value::String(v)))
@@ -194,6 +208,7 @@ impl IncusClient {
             .pointer("/operation")
             .and_then(Value::as_str)
             .ok_or_else(|| anyhow::anyhow!("no operation in exec response"))?;
+        let operation = op_id.to_string();
 
         let secret = resp
             .pointer("/metadata/metadata/fds/0")
@@ -201,6 +216,28 @@ impl IncusClient {
             .ok_or_else(|| anyhow::anyhow!("no fd0 secret in exec response"))?
             .to_string();
 
+        let ws = self.connect_operation_websocket(op_id, &secret).await?;
+
+        let control_ws = match resp
+            .pointer("/metadata/metadata/fds/control")
+            .and_then(Value::as_str)
+        {
+            Some(secret) => Some(self.connect_operation_websocket(op_id, secret).await?),
+            None => None,
+        };
+
+        Ok(IncusExecSession {
+            ws,
+            control_ws,
+            operation,
+        })
+    }
+
+    async fn connect_operation_websocket(
+        &self,
+        op_id: &str,
+        secret: &str,
+    ) -> Result<tokio_tungstenite::WebSocketStream<UnixStream>, anyhow::Error> {
         let ws_path = format!("{}/websocket?secret={}", op_id, secret);
         let stream = UnixStream::connect(&self.socket_path).await?;
         let url = format!("ws://localhost{}", ws_path);
@@ -342,6 +379,156 @@ fn build_nic_device(bridge: &str) -> Value {
     })
 }
 
+fn incus_mount_target(target: &str) -> &str {
+    match target {
+        // In LXC, /sys/class/dmi/id/product_uuid is a symlink. Mounting over the
+        // resolved sysfs node preserves reads through the symlink and avoids
+        // LXC's symlink mount refusal during forkstart.
+        "/sys/class/dmi/id/product_uuid" => "/sys/devices/virtual/dmi/id/product_uuid",
+        _ => target,
+    }
+}
+
+fn shell_command(command: &str) -> Vec<String> {
+    vec!["/bin/sh".to_string(), "-lc".to_string(), command.to_string()]
+}
+
+fn parse_config_u32(config: &Value, key: &str) -> Option<u32> {
+    config.get(key)?.as_str()?.parse().ok()
+}
+
+fn map_id_from_idmap(config: &Value, nsid: u32, is_uid: bool) -> u32 {
+    let Some(idmap) = config
+        .get("volatile.idmap.current")
+        .and_then(Value::as_str)
+        .and_then(|value| serde_json::from_str::<Value>(value).ok())
+    else {
+        return nsid;
+    };
+
+    let Some(entries) = idmap.as_array() else {
+        return nsid;
+    };
+
+    for entry in entries {
+        if entry.get(if is_uid { "Isuid" } else { "Isgid" }) != Some(&Value::Bool(true)) {
+            continue;
+        }
+
+        let hostid = entry.get("Hostid").and_then(Value::as_u64).unwrap_or(0) as u32;
+        let start = entry.get("Nsid").and_then(Value::as_u64).unwrap_or(0) as u32;
+        let range = entry
+            .get("Maprange")
+            .and_then(Value::as_u64)
+            .unwrap_or(0) as u32;
+        if nsid >= start && nsid < start.saturating_add(range) {
+            return hostid.saturating_add(nsid - start);
+        }
+    }
+
+    nsid
+}
+
+async fn make_server_data_writable(base_path: PathBuf) -> Result<(), anyhow::Error> {
+    tokio::task::spawn_blocking(move || -> Result<(), anyhow::Error> {
+        let mut stack = vec![base_path];
+
+        while let Some(path) = stack.pop() {
+            let metadata = match std::fs::symlink_metadata(&path) {
+                Ok(metadata) => metadata,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(err) => return Err(err.into()),
+            };
+
+            if metadata.file_type().is_symlink() {
+                continue;
+            }
+
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = if metadata.is_dir() { 0o777 } else { 0o666 };
+                let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode));
+            }
+
+            if !metadata.is_dir() {
+                continue;
+            }
+
+            for entry in std::fs::read_dir(&path)? {
+                stack.push(entry?.path());
+            }
+        }
+
+        Ok(())
+    })
+    .await??;
+
+    Ok(())
+}
+
+fn is_in_use_error(err: &anyhow::Error) -> bool {
+    let msg = err.to_string().to_lowercase();
+    msg.contains("in use") || msg.contains("busy")
+}
+
+fn is_missing_instance_error(err: &anyhow::Error) -> bool {
+    let msg = err.to_string().to_lowercase();
+    msg.contains("not found") || msg.contains("instance not found")
+}
+
+fn sanitize_console_line(bytes: &[u8]) -> compact_str::CompactString {
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+
+    while i < bytes.len() {
+        match bytes[i] {
+            // Strip ANSI/VT escape sequences. Progress tools often emit cursor
+            // movement or erase-line controls which corrupt the panel console.
+            0x1b => {
+                i += 1;
+                if i < bytes.len() && bytes[i] == b'[' {
+                    i += 1;
+                    while i < bytes.len() {
+                        let byte = bytes[i];
+                        i += 1;
+                        if (0x40..=0x7e).contains(&byte) {
+                            break;
+                        }
+                    }
+                }
+            }
+            b'\x08' => {
+                out.pop();
+                i += 1;
+            }
+            byte if byte < 0x20 && byte != b'\t' => {
+                i += 1;
+            }
+            byte => {
+                out.push(byte);
+                i += 1;
+            }
+        }
+    }
+
+    compact_str::CompactString::from_utf8_lossy(&out).trim().into()
+}
+
+fn incus_lifecycle_lock(server_uuid: &str) -> Arc<tokio::sync::Mutex<()>> {
+    static LOCKS: std::sync::OnceLock<
+        std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    > = std::sync::OnceLock::new();
+
+    let locks = LOCKS.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    let mut locks = locks.lock().expect("incus lifecycle lock poisoned");
+    Arc::clone(
+        locks
+            .entry(server_uuid.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
+    )
+}
+
 // ─── Process handle ───────────────────────────────────────────────────────────
 
 struct IncusProcessHandle {
@@ -360,6 +547,7 @@ struct IncusProcessHandle {
     stats_task: tokio::task::JoinHandle<()>,
     stdin_task: tokio::task::JoinHandle<()>,
     stdout_task: tokio::task::JoinHandle<()>,
+    control_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl IncusProcessHandle {
@@ -378,6 +566,8 @@ impl IncusProcessHandle {
             super::super::resources::ResourceUsage,
         )>,
         ws: tokio_tungstenite::WebSocketStream<tokio::net::UnixStream>,
+        exec_operation: Option<String>,
+        control_ws: Option<tokio_tungstenite::WebSocketStream<tokio::net::UnixStream>>,
         stop_container_on_ws_close: bool,
     ) -> Result<Self, anyhow::Error> {
         let (stdin_tx, mut stdin_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(150);
@@ -397,10 +587,21 @@ impl IncusProcessHandle {
 
         let (mut ws_write, mut ws_read) = ws.split();
 
+        let control_task = control_ws.map(|mut control_ws| {
+            tokio::spawn(async move {
+                while let Some(msg) = control_ws.next().await {
+                    if msg.is_err() {
+                        break;
+                    }
+                }
+            })
+        });
+
         // Signals the stdout task to exit its read loop when the container stops,
         // in case Incus doesn't send a WS close frame promptly after container exit.
         let stopped_notify = Arc::new(tokio::sync::Notify::new());
         let stdout_stopped_notify = Arc::clone(&stopped_notify);
+        let exec_exit_code = Arc::new(AtomicI32::new(i32::MIN));
 
         // stdin task: forward data from the channel to the WebSocket
         let stdin_task = tokio::spawn(async move {
@@ -419,6 +620,7 @@ impl IncusProcessHandle {
             let stopped_notify = stdout_stopped_notify;
             let client_for_stop = Arc::clone(&client);
             let name_for_stop = instance_name.clone();
+            let exec_exit_code = Arc::clone(&exec_exit_code);
 
             async move {
                 let notified = stopped_notify.notified();
@@ -426,6 +628,7 @@ impl IncusProcessHandle {
 
                 let mut buffer = Vec::with_capacity(1024);
                 let mut line_start = 0;
+                let mut pending_carriage_return = false;
                 let mut was_notified = false;
 
                 let mut ratelimit_counter = 0u64;
@@ -481,7 +684,20 @@ impl IncusProcessHandle {
                         _ = &mut notified => { was_notified = true; break 'ws_loop; }
                     };
 
-                    buffer.extend_from_slice(&data);
+                    for byte in data {
+                        if pending_carriage_return {
+                            if byte != b'\n' {
+                                buffer.push(b'\n');
+                            }
+                            pending_carriage_return = false;
+                        }
+
+                        if byte == b'\r' {
+                            pending_carriage_return = true;
+                        } else {
+                            buffer.push(byte);
+                        }
+                    }
 
                     let mut search_start = line_start;
 
@@ -492,11 +708,7 @@ impl IncusProcessHandle {
                             let newline_pos = search_start + pos;
 
                             if newline_pos - line_start <= 512 {
-                                let line = compact_str::CompactString::from_utf8_lossy(
-                                    &buffer[line_start..newline_pos],
-                                )
-                                .trim()
-                                .into();
+                                let line = sanitize_console_line(&buffer[line_start..newline_pos]);
                                 let line = Arc::new(line);
                                 if allow_ratelimit() {
                                     stdout_ratelimited_tx.send(Arc::clone(&line)).ok();
@@ -505,11 +717,8 @@ impl IncusProcessHandle {
                                 line_start = newline_pos + 1;
                                 search_start = line_start;
                             } else {
-                                let line = compact_str::CompactString::from_utf8_lossy(
-                                    &buffer[line_start..(line_start + 512)],
-                                )
-                                .trim()
-                                .into();
+                                let line =
+                                    sanitize_console_line(&buffer[line_start..(line_start + 512)]);
                                 let line = Arc::new(line);
                                 if allow_ratelimit() {
                                     stdout_ratelimited_tx.send(Arc::clone(&line)).ok();
@@ -521,11 +730,8 @@ impl IncusProcessHandle {
                         } else {
                             let current_line_length = buffer.len() - line_start;
                             if current_line_length > 512 {
-                                let line = compact_str::CompactString::from_utf8_lossy(
-                                    &buffer[line_start..(line_start + 512)],
-                                )
-                                .trim()
-                                .into();
+                                let line =
+                                    sanitize_console_line(&buffer[line_start..(line_start + 512)]);
                                 let line = Arc::new(line);
                                 if allow_ratelimit() {
                                     stdout_ratelimited_tx.send(Arc::clone(&line)).ok();
@@ -545,11 +751,12 @@ impl IncusProcessHandle {
                     }
                 }
 
+                if pending_carriage_return {
+                    buffer.push(b'\n');
+                }
+
                 if line_start < buffer.len() {
-                    let line =
-                        compact_str::CompactString::from_utf8_lossy(&buffer[line_start..])
-                            .trim()
-                            .into();
+                    let line = sanitize_console_line(&buffer[line_start..]);
                     let line = Arc::new(line);
                     if allow_ratelimit() {
                         stdout_ratelimited_tx.send(Arc::clone(&line)).ok();
@@ -558,10 +765,36 @@ impl IncusProcessHandle {
                 }
 
                 // For installer/script containers: exec WS close means the script
-                // finished.  PID 1 is still sleeping, so force-stop the container here
-                // so the state task reports Stopped and the installation flow completes.
+                // finished. PID 1 is still sleeping, so force-stop the container here
+                // and report the exec operation's real exit code.
                 if stop_container_on_ws_close && !was_notified {
-                    tracing::debug!(instance = %name_for_stop, "exec finished, stopping container");
+                    let exit_code = match exec_operation.as_deref() {
+                        Some(operation) => {
+                            match client_for_stop.wait_for_operation(operation).await {
+                                Ok(resp) => resp
+                                    .pointer("/metadata/metadata/return")
+                                    .or_else(|| resp.pointer("/metadata/return"))
+                                    .and_then(Value::as_i64)
+                                    .unwrap_or(0) as i32,
+                                Err(err) => {
+                                    tracing::warn!(
+                                        operation = %operation,
+                                        "failed to wait for incus exec operation: {}",
+                                        err
+                                    );
+                                    -1
+                                }
+                            }
+                        }
+                        None => -1,
+                    };
+
+                    tracing::debug!(
+                        instance = %name_for_stop,
+                        exit_code,
+                        "exec finished, stopping container"
+                    );
+                    exec_exit_code.store(exit_code, Ordering::Relaxed);
                     if let Ok(resp) = client_for_stop
                         .put(
                             &format!("/1.0/instances/{}/state", name_for_stop),
@@ -598,6 +831,14 @@ impl IncusProcessHandle {
                 let state = match state_result {
                     Ok(v) => v,
                     Err(err) => {
+                        if is_missing_instance_error(&err) || err.to_string().contains("Invalid PID") {
+                            tracing::debug!(
+                                server = %stats_server.uuid,
+                                "incus instance state disappeared; ending stats task"
+                            );
+                            break;
+                        }
+
                         tracing::warn!(
                             server = %stats_server.uuid,
                             "failed to get incus instance state: {:?}",
@@ -660,6 +901,7 @@ impl IncusProcessHandle {
         let state_name = instance_name.clone();
         let state_usage = Arc::clone(&resource_usage);
         let state_stopped_notify = Arc::clone(&stopped_notify);
+        let state_exec_exit_code = Arc::clone(&exec_exit_code);
 
         let state_task = tokio::spawn(async move {
             loop {
@@ -674,16 +916,20 @@ impl IncusProcessHandle {
                         // "Invalid PID -1" means the container's init process exited
                         // and Incus hasn't updated the state record yet.  Treat it as
                         // stopped so the installation/server flow completes cleanly.
-                        if err.to_string().contains("Invalid PID") {
+                        if err.to_string().contains("Invalid PID") || is_missing_instance_error(&err) {
                             tracing::debug!(
                                 instance = %state_name,
-                                "incus returned Invalid PID; treating as stopped"
+                                "incus instance is gone; treating as stopped"
                             );
                             let usage = *state_usage.read().await;
+                            let exit_code = match state_exec_exit_code.load(Ordering::Relaxed) {
+                                i32::MIN => -1,
+                                code => code,
+                            };
                             let _ = status_tx
                                 .send((
                                     super::ProcessStatus::Stopped {
-                                        exit_code: -1,
+                                        exit_code,
                                         oom_killed: false,
                                     },
                                     usage,
@@ -713,8 +959,12 @@ impl IncusProcessHandle {
                     "Frozen" => super::ProcessStatus::Paused,
                     _ => {
                         state_usage.write().await.uptime = 0;
+                        let exit_code = match state_exec_exit_code.load(Ordering::Relaxed) {
+                            i32::MIN => -1,
+                            code => code,
+                        };
                         super::ProcessStatus::Stopped {
-                            exit_code: -1,
+                            exit_code,
                             oom_killed: false,
                         }
                     }
@@ -747,6 +997,7 @@ impl IncusProcessHandle {
             stats_task,
             stdin_task,
             stdout_task,
+            control_task,
         })
     }
 }
@@ -757,6 +1008,9 @@ impl Drop for IncusProcessHandle {
         self.stats_task.abort();
         self.stdin_task.abort();
         self.stdout_task.abort();
+        if let Some(control_task) = &self.control_task {
+            control_task.abort();
+        }
     }
 }
 
@@ -869,6 +1123,10 @@ impl super::ProcessHandle for IncusProcessHandle {
     }
 
     async fn start(&self) -> Result<(), anyhow::Error> {
+        if let Some(server) = self.server.upgrade() {
+            make_server_data_writable(PathBuf::from(server.filesystem.base().as_str())).await?;
+        }
+
         let result = async {
             let resp = self
                 .client
@@ -937,32 +1195,62 @@ impl super::ProcessHandle for IncusProcessHandle {
                     .map(|s| s.as_bytes().to_vec())
                     .unwrap_or_default();
                 command.push(b'\n');
-                self.stdin_tx
-                    .send(command)
-                    .await
-                    .map_err(|e| anyhow::anyhow!(e))
+                match self.stdin_tx.send(command).await {
+                    Ok(()) => Ok(()),
+                    Err(_) => {
+                        let resp = self
+                            .client
+                            .put(
+                                &format!("/1.0/instances/{}/state", self.instance_name),
+                                json!({ "action": "stop", "force": true }),
+                            )
+                            .await?;
+                        match self.client.ensure_done(resp).await {
+                            Ok(()) => Ok(()),
+                            Err(err) => {
+                                let msg = err.to_string().to_lowercase();
+                                if msg.contains("already stopped")
+                                    || msg.contains("not running")
+                                    || msg.contains("not found")
+                                {
+                                    Ok(())
+                                } else {
+                                    Err(err)
+                                }
+                            }
+                        }
+                    }
+                }
             }
             "signal" => {
-                // Incus does not have a direct signal API; send via exec
-                let signal = match stop_value.as_deref().map(str::to_uppercase).as_deref() {
-                    Some("SIGINT") | Some("C") => "SIGINT",
-                    Some("SIGTERM") => "SIGTERM",
-                    Some("SIGQUIT") => "SIGQUIT",
-                    Some("SIGABRT") => "SIGABRT",
-                    _ => "SIGKILL",
+                // PID 1 is the sleep shim used to keep the OCI container alive.
+                // Killing PID 1 leaves the actual exec process ambiguous, so use
+                // Incus' container stop path for signal-style stops.
+                let timeout = match stop_value.as_deref().map(str::to_uppercase).as_deref() {
+                    Some("SIGKILL") | Some("KILL") => 0,
+                    _ => 30,
                 };
                 let resp = self
                     .client
-                    .post(
-                        &format!("/1.0/instances/{}/exec", self.instance_name),
-                        json!({
-                            "command": ["kill", format!("-{}", signal), "1"],
-                            "wait-for-websocket": false,
-                            "interactive": false,
-                        }),
+                    .put(
+                        &format!("/1.0/instances/{}/state", self.instance_name),
+                        json!({ "action": "stop", "timeout": timeout, "force": timeout == 0 }),
                     )
                     .await?;
-                self.client.ensure_done(resp).await
+                match self.client.ensure_done(resp).await {
+                    Ok(()) => Ok(()),
+                    Err(err) => {
+                        let msg = err.to_string().to_lowercase();
+                        if msg.contains("already stopped")
+                            || msg.contains("not running")
+                            || msg.contains("not found")
+                        {
+                            Ok(())
+                        } else {
+                            Err(err)
+                        }
+                    }
+                }
             }
             _ => {
                 let resp = self
@@ -972,20 +1260,51 @@ impl super::ProcessHandle for IncusProcessHandle {
                         json!({ "action": "stop", "timeout": 30 }),
                     )
                     .await?;
-                self.client.ensure_done(resp).await
+                match self.client.ensure_done(resp).await {
+                    Ok(()) => Ok(()),
+                    Err(err) => {
+                        let msg = err.to_string().to_lowercase();
+                        if msg.contains("already stopped")
+                            || msg.contains("not running")
+                            || msg.contains("not found")
+                        {
+                            Ok(())
+                        } else {
+                            Err(err)
+                        }
+                    }
+                }
             }
         }
     }
 
     async fn kill(&self) -> Result<(), anyhow::Error> {
-        let resp = self
-            .client
-            .put(
-                &format!("/1.0/instances/{}/state", self.instance_name),
-                json!({ "action": "stop", "force": true }),
-            )
-            .await?;
-        self.client.ensure_done(resp).await
+        let result = async {
+            let resp = self
+                .client
+                .put(
+                    &format!("/1.0/instances/{}/state", self.instance_name),
+                    json!({ "action": "stop", "force": true }),
+                )
+                .await?;
+            self.client.ensure_done(resp).await
+        }
+        .await;
+
+        match result {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                let msg = err.to_string().to_lowercase();
+                if msg.contains("already stopped")
+                    || msg.contains("not running")
+                    || msg.contains("not found")
+                {
+                    Ok(())
+                } else {
+                    Err(err)
+                }
+            }
+        }
     }
 }
 
@@ -1003,6 +1322,289 @@ impl IncusExecutor {
             client: Arc::new(IncusClient::new(&socket)),
             app_config,
         }
+    }
+
+    async fn stop_instance_if_present(&self, name: &str) {
+        match self
+            .client
+            .put(
+                &format!("/1.0/instances/{}/state", name),
+                json!({ "action": "stop", "force": true }),
+            )
+            .await
+        {
+            Ok(resp) => {
+                if let Err(err) = self.client.ensure_done(resp).await {
+                    tracing::debug!(
+                        instance = %name,
+                        "failed to wait for incus instance stop, continuing cleanup: {}",
+                        err
+                    );
+                }
+            }
+            Err(err) => {
+                let msg = err.to_string().to_lowercase();
+                if !msg.contains("not found")
+                    && !msg.contains("already stopped")
+                    && !msg.contains("not running")
+                {
+                    tracing::debug!(
+                        instance = %name,
+                        "failed to stop incus instance before cleanup, continuing: {}",
+                        err
+                    );
+                }
+            }
+        }
+    }
+
+    async fn delete_instance_if_present(&self, name: &str) {
+        for attempt in 0..10 {
+            let result = async {
+                let resp = self.client.delete(&format!("/1.0/instances/{}", name)).await?;
+                self.client.ensure_done(resp).await
+            }
+            .await;
+
+            match result {
+                Ok(()) => return,
+                Err(err) => {
+                    let msg = err.to_string().to_lowercase();
+                    if msg.contains("not found") {
+                        return;
+                    }
+
+                    if msg.contains("in use") || msg.contains("busy") {
+                        tracing::debug!(
+                            instance = %name,
+                            attempt = attempt + 1,
+                            "incus instance still in use during delete; waiting before retry"
+                        );
+                        self.stop_instance_if_present(name).await;
+                        tokio::time::sleep(std::time::Duration::from_millis(
+                            250 * (attempt + 1),
+                        ))
+                        .await;
+                        continue;
+                    }
+
+                    tracing::error!(
+                        instance = %name,
+                        "failed to delete incus instance: {}",
+                        err
+                    );
+                    return;
+                }
+            }
+        }
+
+        tracing::error!(
+            instance = %name,
+            "failed to delete incus instance: still in use after retries"
+        );
+    }
+
+    async fn cleanup_instance_name(&self, name: &str) {
+        self.stop_instance_if_present(name).await;
+        self.delete_instance_if_present(name).await;
+        self.wait_for_instance_cleanup(name).await;
+    }
+
+    async fn wait_for_instance_cleanup(&self, name: &str) {
+        let pool = self.app_config.load().incus.storage_pool.clone();
+        let instance_path = format!("/1.0/instances/{}", name);
+        let volume_path = format!("/1.0/storage-pools/{}/volumes/container/{}", pool, name);
+
+        for attempt in 0..20 {
+            let instance_gone = match self.client.get(&instance_path).await {
+                Ok(_) => false,
+                Err(err) => is_missing_instance_error(&err),
+            };
+            let volume_gone = match self.client.get(&volume_path).await {
+                Ok(_) => false,
+                Err(err) => is_missing_instance_error(&err),
+            };
+
+            if instance_gone && volume_gone {
+                return;
+            }
+
+            tracing::debug!(
+                instance = %name,
+                attempt = attempt + 1,
+                instance_gone,
+                volume_gone,
+                "waiting for incus instance cleanup"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+
+        tracing::debug!(
+            instance = %name,
+            "continuing after waiting for incus cleanup"
+        );
+    }
+
+    async fn set_sleep_entrypoint(&self, name: &str) -> Result<Option<Vec<String>>, anyhow::Error> {
+        let instance = self.client.get(&format!("/1.0/instances/{}", name)).await?;
+        let image_entrypoint = instance
+            .pointer("/metadata/config/oci.entrypoint")
+            .and_then(Value::as_str)
+            .filter(|entrypoint| !entrypoint.trim().is_empty())
+            .map(shell_command);
+
+        let resp = self
+            .client
+            .patch(
+                &format!("/1.0/instances/{}", name),
+                json!({
+                    "config": {
+                        "oci.entrypoint": INCUS_SLEEP_ENTRYPOINT
+                    }
+                }),
+            )
+            .await?;
+        self.client.ensure_done(resp).await?;
+
+        Ok(image_entrypoint)
+    }
+
+    async fn create_instance(&self, name: &str, body: &Value) -> Result<(), anyhow::Error> {
+        self.wait_for_instance_cleanup(name).await;
+
+        let result = async {
+            let resp = self.client.post("/1.0/instances", body.clone()).await?;
+            self.client.ensure_done(resp).await
+        }
+        .await;
+
+        if let Err(err) = result {
+            if is_in_use_error(&err) {
+                self.cleanup_instance_name(name).await;
+            }
+            return Err(err);
+        }
+
+        Ok(())
+    }
+
+    async fn start_instance(&self, name: &str) -> Result<(), anyhow::Error> {
+        let state_path = format!("/1.0/instances/{}/state", name);
+
+        for attempt in 0..10 {
+            let result = async {
+                let resp = self
+                    .client
+                    .put(&state_path, json!({ "action": "start" }))
+                    .await?;
+                self.client.ensure_done(resp).await
+            }
+            .await;
+
+            match result {
+                Ok(()) => return Ok(()),
+                Err(err) => {
+                    let msg = err.to_string().to_lowercase();
+                    if !msg.contains("address already in use")
+                        && !msg.contains("in use")
+                        && !msg.contains("busy")
+                    {
+                        return Err(err);
+                    }
+
+                    tracing::warn!(
+                        instance = %name,
+                        attempt = attempt + 1,
+                        "incus instance was still busy during start; waiting before retry"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(
+                        500 * (attempt + 1),
+                    ))
+                    .await;
+                }
+            }
+        }
+
+        unreachable!("start retry loop always returns");
+    }
+
+    async fn build_script_environment(
+        &self,
+        server: &super::super::Server,
+        script: &super::super::installation::InstallationScript,
+    ) -> HashMap<String, String> {
+        let server_cfg = server.configuration.read().await;
+        let mut env: HashMap<String, String> = server_cfg
+            .environment(&self.app_config)
+            .into_iter()
+            .filter_map(|var| {
+                let mut parts = var.splitn(2, '=');
+                Some((parts.next()?.to_string(), parts.next()?.to_string()))
+            })
+            .collect();
+        drop(server_cfg);
+
+        for (k, v) in &script.environment {
+            let s = match v {
+                serde_json::Value::String(s) => s.clone(),
+                other => other.to_string(),
+            };
+            env.insert(k.to_string(), s);
+        }
+
+        env
+    }
+
+    async fn chown_server_data_for_instance(
+        &self,
+        name: &str,
+        server: &super::super::Server,
+    ) -> Result<(), anyhow::Error> {
+        let instance = self.client.get(&format!("/1.0/instances/{}", name)).await?;
+        let config = instance
+            .pointer("/metadata/config")
+            .ok_or_else(|| anyhow::anyhow!("missing incus instance config"))?;
+
+        let uid = parse_config_u32(config, "oci.uid").unwrap_or(0);
+        let gid = parse_config_u32(config, "oci.gid").unwrap_or(0);
+        let host_uid = map_id_from_idmap(config, uid, true);
+        let host_gid = map_id_from_idmap(config, gid, false);
+        let base_path = PathBuf::from(server.filesystem.base().as_str());
+
+        tokio::task::spawn_blocking(move || -> Result<(), anyhow::Error> {
+            let mut stack = vec![base_path.clone()];
+
+            while let Some(path) = stack.pop() {
+                #[cfg(unix)]
+                std::os::unix::fs::chown(&path, Some(host_uid), Some(host_gid))?;
+
+                let metadata = match std::fs::symlink_metadata(&path) {
+                    Ok(metadata) => metadata,
+                    Err(_) => continue,
+                };
+
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let mode = if metadata.is_dir() { 0o777 } else { 0o666 };
+                    let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode));
+                }
+
+                if !metadata.is_dir() {
+                    continue;
+                }
+
+                for entry in std::fs::read_dir(&path)? {
+                    let entry = entry?;
+                    stack.push(entry.path());
+                }
+            }
+
+            Ok(())
+        })
+        .await??;
+
+        Ok(())
     }
 
     /// Find a running instance whose name contains `name_filter` but not `exclude`.
@@ -1056,25 +1658,7 @@ impl IncusExecutor {
                 _ => continue,
             };
 
-            // Stop first; wait for completion so the instance is fully stopped before delete.
-            if let Ok(resp) = self
-                .client
-                .put(
-                    &format!("/1.0/instances/{}/state", name),
-                    json!({ "action": "stop", "force": true }),
-                )
-                .await
-            {
-                let _ = self.client.ensure_done(resp).await;
-            }
-
-            if let Err(err) = self
-                .client
-                .delete(&format!("/1.0/instances/{}", name))
-                .await
-            {
-                tracing::error!(instance = %name, "failed to delete incus instance: {}", err);
-            }
+            self.cleanup_instance_name(&name).await;
         }
         Ok(())
     }
@@ -1111,14 +1695,17 @@ impl IncusExecutor {
 
         config.insert("security.nesting".to_string(), Value::String("false".to_string()));
         config.insert("security.privileged".to_string(), Value::String("false".to_string()));
-        // PID 1 is a long-running sleep; the actual game-server process is started
-        // via exec_pty_websocket so its I/O reliably flows to the panel.
-        config.insert(
-            "raw.lxc".to_string(),
-            Value::String(
-                "lxc.init.cmd = /bin/sh -c exec sleep 86400\nlxc.cap.drop = setpcap mknod audit_write net_raw dac_override fowner fsetid net_bind_service sys_chroot setfcap sys_ptrace".to_string(),
-            ),
-        );
+        config.insert("raw.lxc".to_string(), Value::String(INCUS_CAP_DROP.to_string()));
+        let (run_uid, run_gid) = if app_cfg.system.user.rootless.enabled {
+            (
+                app_cfg.system.user.rootless.container_uid,
+                app_cfg.system.user.rootless.container_gid,
+            )
+        } else {
+            (app_cfg.system.user.uid, app_cfg.system.user.gid)
+        };
+        config.insert("oci.uid".to_string(), Value::String(run_uid.to_string()));
+        config.insert("oci.gid".to_string(), Value::String(run_gid.to_string()));
 
         // Devices
         let mut devices: HashMap<String, Value> = HashMap::new();
@@ -1135,7 +1722,8 @@ impl IncusExecutor {
             json!({
                 "type": "disk",
                 "path": "/home/container",
-                "source": server_base
+                "source": server_base,
+                "shift": "true"
             }),
         );
 
@@ -1153,18 +1741,19 @@ impl IncusExecutor {
             .collect();
 
         for mount in server_cfg.mounts(&self.app_config, &server.filesystem).await {
-            if occupied.contains(mount.target.as_str()) {
+            let target = incus_mount_target(mount.target.as_str());
+            if occupied.contains(target) {
                 continue;
             }
             let key = format!(
                 "mount-{}",
-                mount.target.replace('/', "-").trim_start_matches('-')
+                target.replace('/', "-").trim_start_matches('-')
             );
             devices.insert(
                 key,
                 json!({
                     "type": "disk",
-                    "path": mount.target,
+                    "path": target,
                     "source": mount.source,
                     "readonly": mount.read_only
                 }),
@@ -1211,6 +1800,7 @@ impl IncusExecutor {
         name: &str,
         server: &super::super::Server,
         script: &super::super::installation::InstallationScript,
+        env: &HashMap<String, String>,
         server_mount_target: &str,
         script_mount_source: &str,
         script_mount_target: &str,
@@ -1232,24 +1822,15 @@ impl IncusExecutor {
                 "limits.cpu.allowance".to_string(),
                 Value::String(format!("{}%", app_cfg.incus.installer_limits.cpu)),
             ),
-            // PID 1 is a sleep so the container stays alive until the exec script finishes.
-            // The actual install script runs via exec_pty_websocket and its output flows
-            // through the exec PTY WebSocket instead of the LXC console.
             (
-                "raw.lxc".to_string(),
-                Value::String(
-                    "lxc.init.cmd = /bin/sh -c exec sleep 86400\nlxc.cap.drop = setpcap mknod audit_write net_raw dac_override fowner fsetid net_bind_service sys_chroot setfcap sys_ptrace".to_string(),
-                ),
+                "security.privileged".to_string(),
+                Value::String("true".to_string()),
             ),
         ]);
 
         // Environment
-        for (k, v) in &script.environment {
-            let val = match v {
-                serde_json::Value::String(s) => s.clone(),
-                other => other.to_string(),
-            };
-            config.insert(format!("environment.{}", k), Value::String(val));
+        for (k, v) in env {
+            config.insert(format!("environment.{}", k), Value::String(v.clone()));
         }
 
         let mut devices: HashMap<String, Value> = HashMap::new();
@@ -1328,53 +1909,42 @@ impl super::ServerExecutor for IncusExecutor {
         &self,
         server: &super::super::Server,
     ) -> Result<(Arc<dyn super::ProcessHandle>, StatusReceiver), anyhow::Error> {
+        let lifecycle_lock = incus_lifecycle_lock(&server.uuid.to_string());
+        let _lifecycle_guard = lifecycle_lock.lock().await;
+
         let name = {
             let app_cfg = self.app_config.load();
             let server_cfg = server.configuration.read().await;
             instance_name(&server_cfg.uuid, &app_cfg, &server_cfg.meta.name)
         };
 
-        // Clean up any leftover instance before creating a fresh one.
-        if let Ok(resp) = self
-            .client
-            .put(
-                &format!("/1.0/instances/{}/state", name),
-                json!({ "action": "stop", "force": true }),
-            )
-            .await
-        {
-            let _ = self.client.ensure_done(resp).await;
-        }
-        let _ = self.client.delete(&format!("/1.0/instances/{}", name)).await;
+        // Clean up any leftover instance before creating a fresh one. Incus
+        // deletes asynchronously, so wait for deletion before reusing the name.
+        self.cleanup_instance_name(&name).await;
 
         let (body, entrypoint, env) = self.build_server_instance(&name, server).await?;
 
-        let resp = self.client.post("/1.0/instances", body).await?;
-        self.client.ensure_done(resp).await?;
+        self.create_instance(&name, &body).await?;
+
+        let image_entrypoint = self.set_sleep_entrypoint(&name).await?;
+        self.chown_server_data_for_instance(&name, server).await?;
 
         // Start the instance (PID 1 = sleep; game server runs via exec below).
-        let resp = self
-            .client
-            .put(
-                &format!("/1.0/instances/{}/state", name),
-                json!({ "action": "start" }),
-            )
-            .await?;
-        self.client.ensure_done(resp).await?;
+        self.start_instance(&name).await?;
 
         // Launch the game server via exec so its I/O flows through the PTY WebSocket.
-        let (ws, stop_on_close) = if let Some(ep) = entrypoint {
+        let exec_entrypoint = entrypoint.or(image_entrypoint);
+        let (ws, exec_operation, control_ws, stop_on_close) = if let Some(ep) = exec_entrypoint {
             let cmd: Vec<&str> = ep.iter().map(String::as_str).collect();
-            let ws = self
+            let session = self
                 .client
                 .exec_pty_websocket(&name, &cmd, env, Some("/home/container"))
                 .await?;
-            (ws, true)
+            (session.ws, Some(session.operation), session.control_ws, true)
         } else {
-            // No explicit entrypoint; fall back to console WebSocket and let the
-            // OCI image's default CMD run as PID 1.
+            // No known entrypoint; fall back to the console WebSocket.
             let ws = self.client.console_websocket(&name).await?;
-            (ws, false)
+            (ws, None, None, false)
         };
 
         let (status_tx, status_rx) = tokio::sync::mpsc::channel(1);
@@ -1386,6 +1956,8 @@ impl super::ServerExecutor for IncusExecutor {
                 Arc::clone(&self.app_config),
                 status_tx,
                 ws,
+                exec_operation,
+                control_ws,
                 stop_on_close,
             )
             .await?,
@@ -1415,6 +1987,8 @@ impl super::ServerExecutor for IncusExecutor {
                 Arc::clone(&self.app_config),
                 status_tx,
                 ws,
+                None,
+                None,
                 false,
             )
             .await?,
@@ -1425,7 +1999,10 @@ impl super::ServerExecutor for IncusExecutor {
 
     async fn cleanup_server_process(&self, server: &super::super::Server) -> Result<(), anyhow::Error> {
         let uuid = server.uuid.to_string();
-        // Delete all instances containing the server UUID but not installer/script
+        let lifecycle_lock = incus_lifecycle_lock(&uuid);
+        let _lifecycle_guard = lifecycle_lock.lock().await;
+
+        // Delete all instances containing the server UUID.
         self.delete_instances_matching(&uuid).await
     }
 
@@ -1434,21 +2011,13 @@ impl super::ServerExecutor for IncusExecutor {
         server: &super::super::Server,
         script: &super::super::installation::InstallationScript,
     ) -> Result<(Arc<dyn super::ProcessHandle>, StatusReceiver), anyhow::Error> {
+        let lifecycle_lock = incus_lifecycle_lock(&server.uuid.to_string());
+        let _lifecycle_guard = lifecycle_lock.lock().await;
+
         let name = format!("w-{}-installer", server.uuid);
 
         // Clean up any leftover instance from a previous failed install.
-        // Wait for stop to complete before deleting so the instance is fully stopped.
-        if let Ok(resp) = self
-            .client
-            .put(
-                &format!("/1.0/instances/{}/state", name),
-                json!({ "action": "stop", "force": true }),
-            )
-            .await
-        {
-            let _ = self.client.ensure_done(resp).await;
-        }
-        let _ = self.client.delete(&format!("/1.0/instances/{}", name)).await;
+        self.cleanup_instance_name(&name).await;
 
         let tmp_dir = std::path::Path::new(&self.app_config.load().system.tmp_directory)
             .join(server.uuid.to_string());
@@ -1464,41 +2033,26 @@ impl super::ServerExecutor for IncusExecutor {
             tokio::fs::set_permissions(&tmp_dir, std::fs::Permissions::from_mode(0o755)).await?;
         }
 
+        let env = self.build_script_environment(server, script).await;
         let body = self.build_installer_instance(
             &name,
             server,
             script,
+            &env,
             "/mnt/server",
             &tmp_dir.to_string_lossy(),
             "/mnt/install",
         );
 
-        let resp = self.client.post("/1.0/instances", body).await?;
-        self.client.ensure_done(resp).await?;
+        self.create_instance(&name, &body).await?;
+
+        self.set_sleep_entrypoint(&name).await?;
 
         // Start the container; PID 1 is a long-running sleep.
-        let resp = self
-            .client
-            .put(
-                &format!("/1.0/instances/{}/state", name),
-                json!({ "action": "start" }),
-            )
-            .await?;
-        self.client.ensure_done(resp).await?;
+        self.start_instance(&name).await?;
 
         // Execute the install script via a PTY so output reliably flows to the WebSocket.
-        let env: std::collections::HashMap<String, String> = script
-            .environment
-            .iter()
-            .map(|(k, v)| {
-                let s = match v {
-                    serde_json::Value::String(s) => s.clone(),
-                    other => other.to_string(),
-                };
-                (k.to_string(), s)
-            })
-            .collect();
-        let ws = self
+        let session = self
             .client
             .exec_pty_websocket(
                 &name,
@@ -1516,7 +2070,9 @@ impl super::ServerExecutor for IncusExecutor {
                 server,
                 Arc::clone(&self.app_config),
                 status_tx,
-                ws,
+                session.ws,
+                Some(session.operation),
+                session.control_ws,
                 true, // stop container when exec WS closes
             )
             .await?,
@@ -1542,6 +2098,8 @@ impl super::ServerExecutor for IncusExecutor {
                 Arc::clone(&self.app_config),
                 status_tx,
                 ws,
+                None,
+                None,
                 false,
             )
             .await?,
@@ -1554,23 +2112,12 @@ impl super::ServerExecutor for IncusExecutor {
         &self,
         server: &super::super::Server,
     ) -> Result<(), anyhow::Error> {
+        let lifecycle_lock = incus_lifecycle_lock(&server.uuid.to_string());
+        let _lifecycle_guard = lifecycle_lock.lock().await;
+
         let name = format!("w-{}-installer", server.uuid);
 
-        let _ = self
-            .client
-            .put(
-                &format!("/1.0/instances/{}/state", name),
-                json!({ "action": "stop", "force": true }),
-            )
-            .await;
-
-        if let Err(err) = self
-            .client
-            .delete(&format!("/1.0/instances/{}", name))
-            .await
-        {
-            tracing::error!(instance = %name, "failed to delete installer instance: {}", err);
-        }
+        self.cleanup_instance_name(&name).await;
 
         Ok(())
     }
@@ -1580,6 +2127,9 @@ impl super::ServerExecutor for IncusExecutor {
         server: &super::super::Server,
         script: &super::super::installation::InstallationScript,
     ) -> Result<(Arc<dyn super::ProcessHandle>, StatusReceiver), anyhow::Error> {
+        let lifecycle_lock = incus_lifecycle_lock(&server.uuid.to_string());
+        let _lifecycle_guard = lifecycle_lock.lock().await;
+
         let name = format!(
             "w-{}-script-{}",
             server.uuid,
@@ -1600,40 +2150,25 @@ impl super::ServerExecutor for IncusExecutor {
             tokio::fs::set_permissions(&tmp_dir, std::fs::Permissions::from_mode(0o755)).await?;
         }
 
+        let env = self.build_script_environment(server, script).await;
         let body = self.build_installer_instance(
             &name,
             server,
             script,
+            &env,
             "/mnt/server",
             &tmp_dir.to_string_lossy(),
             "/mnt/script",
         );
 
-        let resp = self.client.post("/1.0/instances", body).await?;
-        self.client.ensure_done(resp).await?;
+        self.create_instance(&name, &body).await?;
+
+        self.set_sleep_entrypoint(&name).await?;
 
         // Start the container; PID 1 is a long-running sleep.
-        let resp = self
-            .client
-            .put(
-                &format!("/1.0/instances/{}/state", name),
-                json!({ "action": "start" }),
-            )
-            .await?;
-        self.client.ensure_done(resp).await?;
+        self.start_instance(&name).await?;
 
-        let env: std::collections::HashMap<String, String> = script
-            .environment
-            .iter()
-            .map(|(k, v)| {
-                let s = match v {
-                    serde_json::Value::String(s) => s.clone(),
-                    other => other.to_string(),
-                };
-                (k.to_string(), s)
-            })
-            .collect();
-        let ws = self
+        let session = self
             .client
             .exec_pty_websocket(
                 &name,
@@ -1651,7 +2186,9 @@ impl super::ServerExecutor for IncusExecutor {
                 server,
                 Arc::clone(&self.app_config),
                 status_tx,
-                ws,
+                session.ws,
+                Some(session.operation),
+                session.control_ws,
                 true, // stop container when exec WS closes
             )
             .await?,
