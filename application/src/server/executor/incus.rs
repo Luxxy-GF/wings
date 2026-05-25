@@ -1405,56 +1405,88 @@ impl IncusExecutor {
         );
     }
 
-    /// Cancel all active Incus operations (exec, console) for the given instance.
-    /// This is required before deletion: Incus returns "In use" if any WebSocket
-    /// session is still registered, even after the process has exited.
+    /// Cancel all active Incus operations (exec, console) for the given instance and
+    /// wait until they actually disappear. This is required before deletion: Incus
+    /// returns "In use" if any WebSocket session is still registered, even after the
+    /// process has exited.
     async fn cancel_instance_operations(&self, instance_name: &str) {
-        let resp = match self.client.get("/1.0/operations?recursion=1").await {
-            Ok(v) => v,
-            Err(_) => return,
-        };
+        let suffix = format!("/{}", instance_name);
 
-        let metadata = match resp.pointer("/metadata").and_then(Value::as_object) {
-            Some(m) => m.clone(),
-            None => return,
-        };
-
-        for (_, ops) in &metadata {
-            let op_list = match ops.as_array() {
-                Some(l) => l,
-                None => continue,
+        for attempt in 0..10u64 {
+            let resp = match self.client.get("/1.0/operations?recursion=1").await {
+                Ok(v) => v,
+                Err(_) => return,
             };
-            for op in op_list {
-                let involves = op
-                    .pointer("/resources/instances")
-                    .and_then(Value::as_array)
-                    .map(|instances| {
-                        instances.iter().any(|inst| {
-                            inst.as_str()
-                                .map(|s| s.ends_with(&format!("/{}", instance_name)))
-                                .unwrap_or(false)
-                        })
-                    })
-                    .unwrap_or(false);
 
-                if involves {
+            let metadata = match resp.pointer("/metadata").and_then(Value::as_object) {
+                Some(m) => m.clone(),
+                None => return,
+            };
+
+            let mut cancelled_any = false;
+            let mut still_present = false;
+
+            for (_, ops) in &metadata {
+                let op_list = match ops.as_array() {
+                    Some(l) => l,
+                    None => continue,
+                };
+                for op in op_list {
+                    let involves = op
+                        .pointer("/resources/instances")
+                        .and_then(Value::as_array)
+                        .map(|instances| {
+                            instances.iter().any(|inst| {
+                                inst.as_str()
+                                    .map(|s| s.ends_with(&suffix))
+                                    .unwrap_or(false)
+                            })
+                        })
+                        .unwrap_or(false);
+
+                    if !involves {
+                        continue;
+                    }
+
+                    still_present = true;
                     if let Some(op_id) = op.get("id").and_then(Value::as_str) {
+                        let class = op.get("class").and_then(Value::as_str).unwrap_or("");
+                        let status = op.get("status").and_then(Value::as_str).unwrap_or("");
                         tracing::debug!(
                             instance = %instance_name,
                             operation = %op_id,
+                            class,
+                            status,
+                            attempt = attempt + 1,
                             "cancelling incus operation before cleanup"
                         );
-                        let _ = self
+                        if self
                             .client
                             .delete(&format!("/1.0/operations/{}", op_id))
-                            .await;
+                            .await
+                            .is_ok()
+                        {
+                            cancelled_any = true;
+                        }
                     }
                 }
             }
+
+            if !still_present {
+                return;
+            }
+
+            // If we cancelled operations, give Incus a moment to process them.
+            // If nothing was cancelled but operations are still present (maybe
+            // they're already cancelling), wait briefly before re-checking.
+            let wait = if cancelled_any { 400 } else { 200 };
+            tokio::time::sleep(std::time::Duration::from_millis(wait)).await;
         }
 
-        // Give Incus a moment to process the cancellations before we delete.
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        tracing::warn!(
+            instance = %instance_name,
+            "incus operations still present after cancel attempts"
+        );
     }
 
     async fn cleanup_instance_name(&self, name: &str) {
@@ -1526,26 +1558,43 @@ impl IncusExecutor {
     async fn create_instance(&self, name: &str, body: &Value) -> Result<(), anyhow::Error> {
         self.wait_for_instance_cleanup(name).await;
 
-        let result = async {
-            let resp = self.client.post("/1.0/instances", body.clone()).await?;
-            self.client.ensure_done(resp).await
-        }
-        .await;
-
-        if let Err(err) = result {
-            if is_in_use_error(&err) {
-                self.cleanup_instance_name(name).await;
+        let mut last_err: Option<anyhow::Error> = None;
+        for attempt in 0..15u64 {
+            let result = async {
+                let resp = self.client.post("/1.0/instances", body.clone()).await?;
+                self.client.ensure_done(resp).await
             }
-            return Err(err);
+            .await;
+
+            match result {
+                Ok(()) => return Ok(()),
+                Err(err) => {
+                    if !is_in_use_error(&err) {
+                        return Err(err);
+                    }
+
+                    tracing::warn!(
+                        instance = %name,
+                        attempt = attempt + 1,
+                        "incus reported 'In use' during create; cancelling stale operations and retrying: {}",
+                        err
+                    );
+                    self.cleanup_instance_name(name).await;
+                    let wait_ms = 500 * (attempt + 1).min(10);
+                    tokio::time::sleep(std::time::Duration::from_millis(wait_ms)).await;
+                    last_err = Some(err);
+                }
+            }
         }
 
-        Ok(())
+        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("incus create_instance failed after retries")))
     }
 
     async fn start_instance(&self, name: &str) -> Result<(), anyhow::Error> {
         let state_path = format!("/1.0/instances/{}/state", name);
+        let mut last_err: Option<anyhow::Error> = None;
 
-        for attempt in 0..10 {
+        for attempt in 0..10u64 {
             let result = async {
                 let resp = self
                     .client
@@ -1569,17 +1618,20 @@ impl IncusExecutor {
                     tracing::warn!(
                         instance = %name,
                         attempt = attempt + 1,
-                        "incus instance was still busy during start; waiting before retry"
+                        "incus instance was still busy during start; cancelling operations before retry: {}",
+                        err
                     );
+                    self.cancel_instance_operations(name).await;
                     tokio::time::sleep(std::time::Duration::from_millis(
-                        500 * (attempt + 1),
+                        500 * (attempt + 1).min(10),
                     ))
                     .await;
+                    last_err = Some(err);
                 }
             }
         }
 
-        unreachable!("start retry loop always returns");
+        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("incus start_instance failed after retries")))
     }
 
     async fn build_script_environment(
