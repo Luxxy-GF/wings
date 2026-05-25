@@ -668,6 +668,27 @@ impl IncusProcessHandle {
                 {
                     Ok(v) => v,
                     Err(err) => {
+                        // "Invalid PID -1" means the container's init process exited
+                        // and Incus hasn't updated the state record yet.  Treat it as
+                        // stopped so the installation/server flow completes cleanly.
+                        if err.to_string().contains("Invalid PID") {
+                            tracing::debug!(
+                                instance = %state_name,
+                                "incus returned Invalid PID; treating as stopped"
+                            );
+                            let usage = *state_usage.read().await;
+                            let _ = status_tx
+                                .send((
+                                    super::ProcessStatus::Stopped {
+                                        exit_code: -1,
+                                        oom_killed: false,
+                                    },
+                                    usage,
+                                ))
+                                .await;
+                            state_stopped_notify.notify_one();
+                            break;
+                        }
                         tracing::warn!(
                             instance = %state_name,
                             "failed to inspect incus instance state: {:?}",
@@ -1116,8 +1137,18 @@ impl IncusExecutor {
             devices.insert(k, v);
         }
 
-        // Additional mounts from server configuration
+        // Additional mounts from server configuration.
+        // mounts() may include the server data directory itself; skip any path
+        // already occupied by an existing device to avoid duplicate-path errors.
+        let occupied: std::collections::HashSet<String> = devices
+            .values()
+            .filter_map(|v| v.get("path").and_then(Value::as_str).map(str::to_string))
+            .collect();
+
         for mount in server_cfg.mounts(&self.app_config, &server.filesystem).await {
+            if occupied.contains(mount.target.as_str()) {
+                continue;
+            }
             let key = format!(
                 "mount-{}",
                 mount.target.replace('/', "-").trim_start_matches('-')
