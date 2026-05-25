@@ -169,22 +169,25 @@ impl IncusClient {
         instance_name: &str,
         command: &[&str],
         env: std::collections::HashMap<String, String>,
+        cwd: Option<&str>,
     ) -> Result<tokio_tungstenite::WebSocketStream<UnixStream>, anyhow::Error> {
         let env_json: serde_json::Map<String, Value> = env
             .into_iter()
             .map(|(k, v)| (k, Value::String(v)))
             .collect();
 
+        let mut body = json!({
+            "command": command,
+            "wait-for-websocket": true,
+            "interactive": true,
+            "environment": env_json
+        });
+        if let Some(dir) = cwd {
+            body["cwd"] = Value::String(dir.to_string());
+        }
+
         let resp = self
-            .post(
-                &format!("/1.0/instances/{}/exec", instance_name),
-                json!({
-                    "command": command,
-                    "wait-for-websocket": true,
-                    "interactive": true,
-                    "environment": env_json
-                }),
-            )
+            .post(&format!("/1.0/instances/{}/exec", instance_name), body)
             .await?;
 
         let op_id = resp
@@ -1077,11 +1080,13 @@ impl IncusExecutor {
     }
 
     /// Build the full instance-create JSON body for a server container.
+    /// Returns (body, entrypoint, env) where entrypoint and env are passed to
+    /// exec_pty_websocket after the container starts.
     async fn build_server_instance(
         &self,
         name: &str,
         server: &super::super::Server,
-    ) -> Result<Value, anyhow::Error> {
+    ) -> Result<(Value, Option<Vec<String>>, HashMap<String, String>), anyhow::Error> {
         let app_cfg = self.app_config.load();
         let server_cfg = server.configuration.read().await;
 
@@ -1106,10 +1111,12 @@ impl IncusExecutor {
 
         config.insert("security.nesting".to_string(), Value::String("false".to_string()));
         config.insert("security.privileged".to_string(), Value::String("false".to_string()));
+        // PID 1 is a long-running sleep; the actual game-server process is started
+        // via exec_pty_websocket so its I/O reliably flows to the panel.
         config.insert(
             "raw.lxc".to_string(),
             Value::String(
-                "lxc.cap.drop = setpcap mknod audit_write net_raw dac_override fowner fsetid net_bind_service sys_chroot setfcap sys_ptrace".to_string(),
+                "lxc.init.cmd = /bin/sh -c exec sleep 86400\nlxc.cap.drop = setpcap mknod audit_write net_raw dac_override fowner fsetid net_bind_service sys_chroot setfcap sys_ptrace".to_string(),
             ),
         );
 
@@ -1167,13 +1174,25 @@ impl IncusExecutor {
         let image = server_cfg.container.image.clone();
         let entrypoint = server_cfg.entrypoint.clone();
 
+        // Collect environment for the caller to pass to exec_pty_websocket.
+        let env: HashMap<String, String> = server_cfg
+            .environment(&self.app_config)
+            .into_iter()
+            .filter_map(|var| {
+                let mut parts = var.splitn(2, '=');
+                let k = parts.next()?.to_string();
+                let v = parts.next()?.to_string();
+                Some((k, v))
+            })
+            .collect();
+
         drop(server_cfg);
 
         let registry = registry_for_image(&image);
         let creds = app_cfg.incus.registries.get(registry);
         let credentials = creds.as_ref().map(|c| (c.username.as_str(), c.password.as_str()));
 
-        let mut body = json!({
+        let body = json!({
             "name": name,
             "type": "container",
             "source": parse_image_source(&image, credentials),
@@ -1181,20 +1200,7 @@ impl IncusExecutor {
             "devices": devices
         });
 
-        // Set entrypoint via raw exec config if present
-        if let Some(ep) = entrypoint {
-            if let Some(obj) = body.get_mut("config").and_then(Value::as_object_mut) {
-                obj.insert(
-                    "raw.lxc".to_string(),
-                    Value::String(format!(
-                        "lxc.init.cmd = {}\nlxc.cap.drop = setpcap mknod audit_write net_raw dac_override fowner fsetid net_bind_service sys_chroot setfcap sys_ptrace",
-                        ep.join(" ")
-                    )),
-                );
-            }
-        }
-
-        Ok(body)
+        Ok((body, entrypoint, env))
     }
 
     /// Build the instance-create JSON body for an installer/script container.
@@ -1341,12 +1347,12 @@ impl super::ServerExecutor for IncusExecutor {
         }
         let _ = self.client.delete(&format!("/1.0/instances/{}", name)).await;
 
-        let body = self.build_server_instance(&name, server).await?;
+        let (body, entrypoint, env) = self.build_server_instance(&name, server).await?;
 
         let resp = self.client.post("/1.0/instances", body).await?;
         self.client.ensure_done(resp).await?;
 
-        // Start the instance
+        // Start the instance (PID 1 = sleep; game server runs via exec below).
         let resp = self
             .client
             .put(
@@ -1356,7 +1362,20 @@ impl super::ServerExecutor for IncusExecutor {
             .await?;
         self.client.ensure_done(resp).await?;
 
-        let ws = self.client.console_websocket(&name).await?;
+        // Launch the game server via exec so its I/O flows through the PTY WebSocket.
+        let (ws, stop_on_close) = if let Some(ep) = entrypoint {
+            let cmd: Vec<&str> = ep.iter().map(String::as_str).collect();
+            let ws = self
+                .client
+                .exec_pty_websocket(&name, &cmd, env, Some("/home/container"))
+                .await?;
+            (ws, true)
+        } else {
+            // No explicit entrypoint; fall back to console WebSocket and let the
+            // OCI image's default CMD run as PID 1.
+            let ws = self.client.console_websocket(&name).await?;
+            (ws, false)
+        };
 
         let (status_tx, status_rx) = tokio::sync::mpsc::channel(1);
         let handle = Arc::new(
@@ -1367,7 +1386,7 @@ impl super::ServerExecutor for IncusExecutor {
                 Arc::clone(&self.app_config),
                 status_tx,
                 ws,
-                false,
+                stop_on_close,
             )
             .await?,
         );
@@ -1485,6 +1504,7 @@ impl super::ServerExecutor for IncusExecutor {
                 &name,
                 &[script.entrypoint.as_str(), "/mnt/install/install.sh"],
                 env,
+                Some("/mnt/server"),
             )
             .await?;
 
@@ -1619,6 +1639,7 @@ impl super::ServerExecutor for IncusExecutor {
                 &name,
                 &[script.entrypoint.as_str(), "/mnt/script/script.sh"],
                 env,
+                Some("/mnt/server"),
             )
             .await?;
 
