@@ -453,6 +453,8 @@ fn remote_query_retry_limit() -> u64 {
     10
 }
 
+// These default fns must always be compiled because nestify unconditionally
+// emits the Incus sub-struct type definitions (even when the field is cfg-gated).
 fn incus_socket() -> String {
     "/var/lib/incus/unix.socket".to_string()
 }
@@ -481,6 +483,9 @@ fn incus_installer_limits_timeout() -> u64 {
     30 * 60
 }
 
+// The executor selector and its Incus variant are only present when the
+// `incus` Cargo feature is enabled (Calagopus builds).
+#[cfg(feature = "incus")]
 #[derive(ToSchema, Deserialize, Serialize, Default, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum ExecutorType {
@@ -976,10 +981,12 @@ nestify::nest! {
             },
         },
 
+        #[cfg(feature = "incus")]
         #[serde(default)]
         #[schema(value_type = String)]
         pub executor: ExecutorType,
 
+        #[cfg(feature = "incus")]
         #[serde(default)]
         #[schema(inline)]
         pub incus: #[derive(ToSchema, Deserialize, Serialize, DefaultFromSerde)] #[serde(default)] pub struct Incus {

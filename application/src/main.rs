@@ -342,44 +342,76 @@ async fn main_rt() {
 
     let executor: Arc<dyn crate::server::executor::ServerExecutor> = {
         let config_ref = config.load();
-        match config_ref.executor {
-            crate::config::ExecutorType::Docker => {
-                tracing::info!("connecting to docker");
-                let docker = Arc::new(
-                    match if config_ref.docker.socket.starts_with("http://")
-                        || config_ref.docker.socket.starts_with("tcp://")
-                    {
-                        bollard::Docker::connect_with_http(
-                            &config_ref.docker.socket,
-                            120,
-                            bollard::API_DEFAULT_VERSION,
-                        )
-                    } else {
-                        bollard::Docker::connect_with_local(
-                            &config_ref.docker.socket,
-                            120,
-                            bollard::API_DEFAULT_VERSION,
-                        )
-                    } {
-                        Ok(docker) => docker,
-                        Err(err) => exit_error!("failed to connect to docker: {:?}", err),
-                    },
-                );
 
-                Arc::new(crate::server::executor::docker::DockerExecutor::new(
-                    docker,
-                    config.clone(),
-                ))
+        #[cfg(feature = "incus")]
+        {
+            match config_ref.executor {
+                crate::config::ExecutorType::Docker => {
+                    tracing::info!("connecting to docker");
+                    let docker = Arc::new(
+                        match if config_ref.docker.socket.starts_with("http://")
+                            || config_ref.docker.socket.starts_with("tcp://")
+                        {
+                            bollard::Docker::connect_with_http(
+                                &config_ref.docker.socket,
+                                120,
+                                bollard::API_DEFAULT_VERSION,
+                            )
+                        } else {
+                            bollard::Docker::connect_with_local(
+                                &config_ref.docker.socket,
+                                120,
+                                bollard::API_DEFAULT_VERSION,
+                            )
+                        } {
+                            Ok(docker) => docker,
+                            Err(err) => exit_error!("failed to connect to docker: {:?}", err),
+                        },
+                    );
+                    Arc::new(crate::server::executor::docker::DockerExecutor::new(
+                        docker,
+                        config.clone(),
+                    ))
+                }
+                crate::config::ExecutorType::Incus => {
+                    tracing::info!(
+                        "connecting to incus at {}",
+                        config_ref.incus.socket
+                    );
+                    Arc::new(crate::server::executor::incus::IncusExecutor::new(
+                        config.clone(),
+                    ))
+                }
             }
-            crate::config::ExecutorType::Incus => {
-                tracing::info!(
-                    "connecting to incus at {}",
-                    config_ref.incus.socket
-                );
-                Arc::new(crate::server::executor::incus::IncusExecutor::new(
-                    config.clone(),
-                ))
-            }
+        }
+
+        #[cfg(not(feature = "incus"))]
+        {
+            tracing::info!("connecting to docker");
+            let docker = Arc::new(
+                match if config_ref.docker.socket.starts_with("http://")
+                    || config_ref.docker.socket.starts_with("tcp://")
+                {
+                    bollard::Docker::connect_with_http(
+                        &config_ref.docker.socket,
+                        120,
+                        bollard::API_DEFAULT_VERSION,
+                    )
+                } else {
+                    bollard::Docker::connect_with_local(
+                        &config_ref.docker.socket,
+                        120,
+                        bollard::API_DEFAULT_VERSION,
+                    )
+                } {
+                    Ok(docker) => docker,
+                    Err(err) => exit_error!("failed to connect to docker: {:?}", err),
+                },
+            );
+            Arc::new(crate::server::executor::docker::DockerExecutor::new(
+                docker,
+                config.clone(),
+            ))
         }
     };
 
