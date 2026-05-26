@@ -669,12 +669,14 @@ impl IncusProcessHandle {
                     true
                 };
 
-                'ws_loop: loop {
-                    // Poll the exec operation status every ~3s as a backstop:
-                    // if Incus doesn't send a WS close frame after the process
-                    // exits (a known PTY edge case), we'd block here forever.
-                    let tick = tokio::time::sleep(std::time::Duration::from_secs(3));
+                // Poll the exec operation status every ~3s as a backstop:
+                // if Incus doesn't send a WS close frame after the process
+                // exits (a known PTY edge case), we'd block here forever.
+                // Created OUTSIDE the loop so messages don't keep resetting it.
+                let mut op_poll = tokio::time::interval(std::time::Duration::from_secs(3));
+                op_poll.tick().await; // consume the immediate first tick
 
+                'ws_loop: loop {
                     let data = tokio::select! {
                         biased;
                         msg = ws_read.next() => match msg {
@@ -692,7 +694,7 @@ impl IncusProcessHandle {
                             }
                         },
                         _ = &mut notified => { was_notified = true; break 'ws_loop; },
-                        _ = tick => {
+                        _ = op_poll.tick() => {
                             // Check if the exec operation is already done so we
                             // don't rely solely on the WS close frame.
                             if let Some(op) = exec_operation.as_deref() {
