@@ -324,9 +324,14 @@ fn build_resource_config(
     }
 
     if build.cpu_limit > 0 {
+        // Match Docker's cpu_quota/cpu_period behaviour:
+        // Docker sets quota = cpu_limit*1000µs with a 100000µs period.
+        // Incus "X%" means X% of total system CPU (all cores), which differs
+        // from Docker where 100 = one full core.  Use the time-based format
+        // so that cpu_limit=100 → one full core, cpu_limit=200 → two cores.
         cfg.insert(
             "limits.cpu.allowance".to_string(),
-            format!("{}%", build.cpu_limit),
+            format!("{}ms/100ms", build.cpu_limit),
         );
     }
     if let Some(threads) = &build.threads {
@@ -770,19 +775,33 @@ impl IncusProcessHandle {
                 if stop_container_on_ws_close && !was_notified {
                     let exit_code = match exec_operation.as_deref() {
                         Some(operation) => {
-                            match client_for_stop.wait_for_operation(operation).await {
-                                Ok(resp) => resp
+                            // The operation should already be done since the WS closed, so
+                            // use a short timeout to avoid hanging the stdout task.
+                            let wait_result = tokio::time::timeout(
+                                std::time::Duration::from_secs(5),
+                                client_for_stop.wait_for_operation(operation),
+                            )
+                            .await;
+                            match wait_result {
+                                Ok(Ok(resp)) => resp
                                     .pointer("/metadata/metadata/return")
                                     .or_else(|| resp.pointer("/metadata/return"))
                                     .and_then(Value::as_i64)
                                     .unwrap_or(0) as i32,
-                                Err(err) => {
+                                Ok(Err(err)) => {
                                     tracing::warn!(
                                         operation = %operation,
                                         "failed to wait for incus exec operation: {}",
                                         err
                                     );
                                     -1
+                                }
+                                Err(_) => {
+                                    tracing::warn!(
+                                        operation = %operation,
+                                        "timed out waiting for incus exec operation result"
+                                    );
+                                    0
                                 }
                             }
                         }
@@ -795,15 +814,21 @@ impl IncusProcessHandle {
                         "exec finished, stopping container"
                     );
                     exec_exit_code.store(exit_code, Ordering::Relaxed);
-                    if let Ok(resp) = client_for_stop
-                        .put(
-                            &format!("/1.0/instances/{}/state", name_for_stop),
-                            json!({ "action": "stop", "force": true }),
-                        )
-                        .await
-                    {
-                        let _ = client_for_stop.ensure_done(resp).await;
-                    }
+
+                    // Use a timeout so a slow Incus stop doesn't freeze the stdout task.
+                    // The state task will also detect the stopped state independently.
+                    let stop_fut = async {
+                        if let Ok(resp) = client_for_stop
+                            .put(
+                                &format!("/1.0/instances/{}/state", name_for_stop),
+                                json!({ "action": "stop", "force": true }),
+                            )
+                            .await
+                        {
+                            let _ = client_for_stop.ensure_done(resp).await;
+                        }
+                    };
+                    let _ = tokio::time::timeout(std::time::Duration::from_secs(15), stop_fut).await;
                 }
 
                 tracing::debug!(server = %server.uuid, "incus stdout task ended");
@@ -1799,8 +1824,13 @@ impl IncusExecutor {
             }
         }
 
+        // Run privileged so the container root maps directly to host root.
+        // With unprivileged containers (security.privileged=false), Incus uses
+        // idmapped mounts which blocks COPY_ATTRIBUTES file operations inside
+        // the container (Java's AtomicFiles, sed temp renames, etc).
+        // This matches Docker's default behaviour: no user-namespace remapping.
         config.insert("security.nesting".to_string(), Value::String("false".to_string()));
-        config.insert("security.privileged".to_string(), Value::String("false".to_string()));
+        config.insert("security.privileged".to_string(), Value::String("true".to_string()));
         config.insert("raw.lxc".to_string(), Value::String(INCUS_CAP_DROP.to_string()));
         let (run_uid, run_gid) = if app_cfg.system.user.rootless.enabled {
             (
@@ -1821,15 +1851,14 @@ impl IncusExecutor {
         );
         devices.insert("eth0".to_string(), build_nic_device(&app_cfg.incus.network.bridge));
 
-        // Server data mount
+        // Server data mount — no shift needed since we use privileged mode.
         let server_base = server.filesystem.base().to_string();
         devices.insert(
             "server-data".to_string(),
             json!({
                 "type": "disk",
                 "path": "/home/container",
-                "source": server_base,
-                "shift": "true"
+                "source": server_base
             }),
         );
 
@@ -2033,10 +2062,15 @@ impl super::ServerExecutor for IncusExecutor {
         self.create_instance(&name, &body).await?;
 
         let image_entrypoint = self.set_sleep_entrypoint(&name).await?;
-        self.chown_server_data_for_instance(&name, server).await?;
 
-        // Start the instance (PID 1 = sleep; game server runs via exec below).
+        // Start the instance before chowning so that Incus populates
+        // volatile.idmap.current — we need the idmap to compute the correct
+        // host UID/GID for the container's files.
         self.start_instance(&name).await?;
+
+        // Give Incus a moment to finish writing the idmap into the instance config.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        self.chown_server_data_for_instance(&name, server).await?;
 
         // Launch the game server via exec so its I/O flows through the PTY WebSocket.
         let exec_entrypoint = entrypoint.or(image_entrypoint);
