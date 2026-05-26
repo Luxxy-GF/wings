@@ -670,6 +670,11 @@ impl IncusProcessHandle {
                 };
 
                 'ws_loop: loop {
+                    // Poll the exec operation status every ~3s as a backstop:
+                    // if Incus doesn't send a WS close frame after the process
+                    // exits (a known PTY edge case), we'd block here forever.
+                    let tick = tokio::time::sleep(std::time::Duration::from_secs(3));
+
                     let data = tokio::select! {
                         biased;
                         msg = ws_read.next() => match msg {
@@ -686,7 +691,35 @@ impl IncusProcessHandle {
                                 break 'ws_loop;
                             }
                         },
-                        _ = &mut notified => { was_notified = true; break 'ws_loop; }
+                        _ = &mut notified => { was_notified = true; break 'ws_loop; },
+                        _ = tick => {
+                            // Check if the exec operation is already done so we
+                            // don't rely solely on the WS close frame.
+                            if let Some(op) = exec_operation.as_deref() {
+                                if let Ok(resp) = client_for_stop.get(op).await {
+                                    let status = resp
+                                        .pointer("/metadata/status")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or("Running");
+                                    if !matches!(status, "Running" | "Pending") {
+                                        tracing::debug!(
+                                            instance = %name_for_stop,
+                                            status,
+                                            "exec operation finished; breaking WS loop"
+                                        );
+                                        break 'ws_loop;
+                                    }
+                                } else {
+                                    // 404 = operation already cleaned up = done
+                                    tracing::debug!(
+                                        instance = %name_for_stop,
+                                        "exec operation gone; breaking WS loop"
+                                    );
+                                    break 'ws_loop;
+                                }
+                            }
+                            continue 'ws_loop;
+                        }
                     };
 
                     for byte in data {
