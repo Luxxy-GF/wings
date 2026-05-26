@@ -123,6 +123,53 @@ impl IncusClient {
         Ok(resp)
     }
 
+    /// Wait for an async operation while calling `on_progress` with any
+    /// `download_progress` string changes. Used during instance creation to
+    /// stream OCI image pull progress to the panel console (like docker pull).
+    async fn wait_for_operation_with_progress<F>(
+        &self,
+        op_url: &str,
+        mut on_progress: F,
+    ) -> Result<Value, anyhow::Error>
+    where
+        F: FnMut(&str),
+    {
+        let mut last_progress = String::new();
+
+        loop {
+            let resp = self.get(op_url).await?;
+            let status = resp
+                .pointer("/metadata/status")
+                .and_then(Value::as_str)
+                .unwrap_or("Unknown");
+
+            // Emit download_progress whenever it changes.
+            if let Some(progress) = resp
+                .pointer("/metadata/metadata/download_progress")
+                .and_then(Value::as_str)
+            {
+                if progress != last_progress {
+                    on_progress(progress);
+                    last_progress = progress.to_string();
+                }
+            }
+
+            match status {
+                "Running" | "Pending" => {
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                }
+                "Failure" => {
+                    let err = resp
+                        .pointer("/metadata/err")
+                        .and_then(Value::as_str)
+                        .unwrap_or("operation failed");
+                    return Err(anyhow::anyhow!("incus operation failed: {}", err));
+                }
+                _ => return Ok(resp),
+            }
+        }
+    }
+
     /// If the API response is async, wait for the operation to finish.
     async fn ensure_done(&self, resp: Value) -> Result<(), anyhow::Error> {
         let resp_type = resp.get("type").and_then(Value::as_str).unwrap_or("sync");
@@ -1611,16 +1658,43 @@ impl IncusExecutor {
         Ok(image_entrypoint)
     }
 
-    async fn create_instance(&self, name: &str, body: &Value) -> Result<(), anyhow::Error> {
+    async fn create_instance<F>(
+        &self,
+        name: &str,
+        body: &Value,
+        mut on_progress: F,
+    ) -> Result<(), anyhow::Error>
+    where
+        F: FnMut(&str),
+    {
         self.wait_for_instance_cleanup(name).await;
 
         let mut last_err: Option<anyhow::Error> = None;
         for attempt in 0..15u64 {
-            let result = async {
-                let resp = self.client.post("/1.0/instances", body.clone()).await?;
+            let resp = match self.client.post("/1.0/instances", body.clone()).await {
+                Ok(r) => r,
+                Err(err) => {
+                    if !is_in_use_error(&err) {
+                        return Err(err);
+                    }
+                    last_err = Some(err);
+                    continue;
+                }
+            };
+
+            // If this is an async operation, stream progress while waiting.
+            let result = if resp.get("type").and_then(Value::as_str) == Some("async") {
+                if let Some(op) = resp.get("operation").and_then(Value::as_str) {
+                    self.client
+                        .wait_for_operation_with_progress(op, &mut on_progress)
+                        .await
+                        .map(|_| ())
+                } else {
+                    self.client.ensure_done(resp).await
+                }
+            } else {
                 self.client.ensure_done(resp).await
-            }
-            .await;
+            };
 
             match result {
                 Ok(()) => return Ok(()),
@@ -2090,7 +2164,10 @@ impl super::ServerExecutor for IncusExecutor {
 
         let (body, entrypoint, env) = self.build_server_instance(&name, server).await?;
 
-        self.create_instance(&name, &body).await?;
+        let server_for_progress = server.clone();
+        self.create_instance(&name, &body, move |progress| {
+            server_for_progress.log_daemon_with_prelude(&format!("[Incus] {}", progress));
+        }).await?;
 
         let image_entrypoint = self.set_sleep_entrypoint(&name).await?;
 
@@ -2215,7 +2292,10 @@ impl super::ServerExecutor for IncusExecutor {
             "/mnt/install",
         );
 
-        self.create_instance(&name, &body).await?;
+        let server_for_progress = server.clone();
+        self.create_instance(&name, &body, move |progress| {
+            server_for_progress.log_daemon_with_prelude(&format!("[Incus] {}", progress));
+        }).await?;
 
         self.set_sleep_entrypoint(&name).await?;
 
@@ -2332,7 +2412,10 @@ impl super::ServerExecutor for IncusExecutor {
             "/mnt/script",
         );
 
-        self.create_instance(&name, &body).await?;
+        let server_for_progress = server.clone();
+        self.create_instance(&name, &body, move |progress| {
+            server_for_progress.log_daemon_with_prelude(&format!("[Incus] {}", progress));
+        }).await?;
 
         self.set_sleep_entrypoint(&name).await?;
 
