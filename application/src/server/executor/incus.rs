@@ -7,7 +7,7 @@ use hyper_util::rt::TokioIo;
 use rand::distr::SampleString;
 use serde_json::{Value, json};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     path::PathBuf,
     sync::{
         atomic::{AtomicI32, Ordering},
@@ -547,6 +547,8 @@ struct IncusProcessHandle {
     stdout_ratelimited_rx:
         tokio::sync::broadcast::Receiver<Arc<compact_str::CompactString>>,
     stdout_rx: tokio::sync::broadcast::Receiver<Arc<compact_str::CompactString>>,
+    /// Ring buffer of recent log lines for `logs()` — populated by stdout_task.
+    log_buffer: Arc<std::sync::Mutex<VecDeque<String>>>,
 
     state_task: tokio::task::JoinHandle<()>,
     stats_task: tokio::task::JoinHandle<()>,
@@ -589,6 +591,10 @@ impl IncusProcessHandle {
             state: server.state.get_state(),
             ..Default::default()
         }));
+
+        let log_buffer: Arc<std::sync::Mutex<VecDeque<String>>> =
+            Arc::new(std::sync::Mutex::new(VecDeque::new()));
+        let log_buffer_for_task = Arc::clone(&log_buffer);
 
         let (mut ws_write, mut ws_read) = ws.split();
 
@@ -638,6 +644,17 @@ impl IncusProcessHandle {
 
                 let mut ratelimit_counter = 0u64;
                 let mut ratelimit_start = std::time::Instant::now();
+
+                // Keep at most 500 lines for log replay on panel reconnect.
+                const LOG_BUFFER_MAX: usize = 500;
+                let push_log = |line: &Arc<compact_str::CompactString>| {
+                    if let Ok(mut buf) = log_buffer_for_task.lock() {
+                        if buf.len() >= LOG_BUFFER_MAX {
+                            buf.pop_front();
+                        }
+                        buf.push_back(line.to_string());
+                    }
+                };
 
                 let mut allow_ratelimit = || {
                     ratelimit_counter += 1;
@@ -753,6 +770,7 @@ impl IncusProcessHandle {
                                 if allow_ratelimit() {
                                     stdout_ratelimited_tx.send(Arc::clone(&line)).ok();
                                 }
+                                push_log(&line);
                                 stdout_tx.send(line).ok();
                                 line_start = newline_pos + 1;
                                 search_start = line_start;
@@ -763,6 +781,7 @@ impl IncusProcessHandle {
                                 if allow_ratelimit() {
                                     stdout_ratelimited_tx.send(Arc::clone(&line)).ok();
                                 }
+                                push_log(&line);
                                 stdout_tx.send(line).ok();
                                 line_start += 512;
                                 search_start = line_start;
@@ -776,6 +795,7 @@ impl IncusProcessHandle {
                                 if allow_ratelimit() {
                                     stdout_ratelimited_tx.send(Arc::clone(&line)).ok();
                                 }
+                                push_log(&line);
                                 stdout_tx.send(line).ok();
                                 line_start += 512;
                                 search_start = line_start;
@@ -801,6 +821,7 @@ impl IncusProcessHandle {
                     if allow_ratelimit() {
                         stdout_ratelimited_tx.send(Arc::clone(&line)).ok();
                     }
+                    push_log(&line);
                     stdout_tx.send(line).ok();
                 }
 
@@ -1053,6 +1074,7 @@ impl IncusProcessHandle {
             stdin_tx,
             stdout_ratelimited_rx,
             stdout_rx,
+            log_buffer,
             state_task,
             stats_task,
             stdin_task,
@@ -1086,48 +1108,22 @@ impl super::ProcessHandle for IncusProcessHandle {
         &self,
         lines: Option<usize>,
     ) -> Result<Box<dyn tokio::io::AsyncRead + Send + Unpin>, anyhow::Error> {
-        let resp = self
-            .client
-            .get(&format!(
-                "/1.0/instances/{}/console?action=show",
-                self.instance_name
-            ))
-            .await?;
-
-        // The console log is returned as a base64-encoded string in metadata
-        let content = resp
-            .pointer("/metadata")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
-
-        let bytes = if content.is_empty() {
-            Vec::new()
-        } else {
-            use base64::Engine;
-            base64::engine::general_purpose::STANDARD
-                .decode(&content)
-                .unwrap_or_else(|_| content.into_bytes())
-        };
-
-        // Apply line limit if requested
-        let bytes = if let Some(n) = lines {
-            let mut start = 0;
-            let mut count = 0;
-            for (i, &b) in bytes.iter().enumerate().rev() {
-                if b == b'\n' {
-                    count += 1;
-                    if count >= n {
-                        start = i + 1;
-                        break;
-                    }
-                }
+        // All output flows through the exec PTY WebSocket, not the Incus console,
+        // so GET /console?action=show always returns empty. Use our in-memory ring
+        // buffer instead — it holds the last 500 lines seen by the stdout task.
+        let buf = self.log_buffer.lock().map_err(|e| anyhow::anyhow!("log buffer lock: {e}"))?;
+        let iter: Box<dyn Iterator<Item = &String>> = match lines {
+            Some(n) => {
+                let skip = buf.len().saturating_sub(n);
+                Box::new(buf.iter().skip(skip))
             }
-            bytes[start..].to_vec()
-        } else {
-            bytes
+            None => Box::new(buf.iter()),
         };
-
+        let mut bytes: Vec<u8> = Vec::new();
+        for line in iter {
+            bytes.extend_from_slice(line.as_bytes());
+            bytes.push(b'\n');
+        }
         Ok(Box::new(std::io::Cursor::new(bytes)))
     }
 
