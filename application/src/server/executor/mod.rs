@@ -1,6 +1,8 @@
 use std::sync::Arc;
 
 pub mod docker;
+#[cfg(feature = "incus")]
+pub mod incus;
 
 type StatusReceiver = tokio::sync::mpsc::Receiver<(ProcessStatus, super::resources::ResourceUsage)>;
 
