@@ -1426,6 +1426,8 @@ nestify::nest! {
         #[serde(default)]
         pub allowed_mounts: Vec<compact_str::CompactString>,
         #[serde(default)]
+        pub allowed_devices: Vec<compact_str::CompactString>,
+        #[serde(default)]
         pub allowed_origins: Vec<String>,
 
         #[serde(default)]
@@ -1508,6 +1510,7 @@ pub const FORBIDDEN_PATHS: &[&str] = &[
     "tundra.image",
     "tundra.source_image",
     "allowed_mounts",
+    "allowed_devices",
     "ignore_panel_config_updates",
     "ignore_panel_wings_upgrades",
     "api.host",
@@ -2511,6 +2514,22 @@ mod tests {
 
     fn from_yaml(yaml: &str) -> InnerConfig {
         serde_norway::from_str(yaml).expect("failed to parse config")
+    }
+
+    #[test]
+    fn allowed_devices_default_to_empty_and_cannot_be_changed_by_panel_patches() {
+        assert!(from_yaml("{}").allowed_devices.is_empty());
+        let config = from_yaml("allowed_devices:\n  - /dev/null\n");
+        let mut doc = serde_json::to_value(config).expect("config should serialize");
+        let mut patch = serde_json::json!({ "allowed_devices": ["/dev"], "debug": true });
+        crate::utils::strip_paths(&mut patch, FORBIDDEN_PATHS);
+        json_patch::merge(&mut doc, &patch);
+        let config: InnerConfig = serde_json::from_value(doc).expect("config should deserialize");
+        assert_eq!(
+            config.allowed_devices,
+            vec![compact_str::CompactString::from("/dev/null")]
+        );
+        assert!(config.debug);
     }
 
     #[test]

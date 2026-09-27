@@ -124,30 +124,7 @@ impl AllowedMounts {
     }
 
     pub async fn from_entries<E: AsRef<Path>>(entries: impl IntoIterator<Item = E>) -> Self {
-        let entries = entries.into_iter();
-
-        let mut allowed = Vec::with_capacity(entries.size_hint().0);
-        for entry in entries {
-            let entry = entry.as_ref();
-
-            match tokio::fs::canonicalize(entry).await {
-                Ok(path) => allowed.push(path),
-                Err(err) => {
-                    tracing::warn!(
-                        "ignoring allowed_mounts entry {}, it could not be resolved: {:#?}",
-                        entry.display(),
-                        err
-                    );
-                }
-            }
-        }
-
-        Self(allowed)
-    }
-
-    #[inline]
-    pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
+        Self(load_allowed_paths(entries, "allowed_mounts").await)
     }
 }
 
@@ -156,39 +133,133 @@ impl Mount {
         &self,
         allowed: &AllowedMounts,
     ) -> Result<PathBuf, anyhow::Error> {
-        if allowed.is_empty() {
-            return Err(anyhow::anyhow!("allowed_mounts is empty"));
-        }
+        resolve_allowed_path(&self.source, &self.target, &allowed.0, "allowed_mounts").await
+    }
+}
 
-        if !is_plain_absolute_path(Path::new(self.target.as_str())) {
+#[derive(ToSchema, Deserialize, Serialize, Clone, PartialEq, Eq)]
+pub struct Device {
+    pub target: compact_str::CompactString,
+    pub source: compact_str::CompactString,
+    #[serde(default = "device_permissions")]
+    pub permissions: compact_str::CompactString,
+}
+
+fn device_permissions() -> compact_str::CompactString {
+    "rwm".into()
+}
+
+#[cfg(unix)]
+#[derive(Default)]
+pub struct AllowedDevices(Vec<PathBuf>);
+
+#[cfg(unix)]
+impl AllowedDevices {
+    pub async fn load(config: &crate::config::Config) -> Self {
+        let configured = config.load().allowed_devices.clone();
+
+        Self::from_entries(configured).await
+    }
+
+    pub async fn from_entries<E: AsRef<Path>>(entries: impl IntoIterator<Item = E>) -> Self {
+        Self(load_allowed_paths(entries, "allowed_devices").await)
+    }
+}
+
+#[cfg(unix)]
+impl Device {
+    pub async fn resolve_allowed_source(
+        &self,
+        allowed: &AllowedDevices,
+    ) -> Result<PathBuf, anyhow::Error> {
+        use std::os::unix::fs::FileTypeExt;
+
+        if self.permissions.is_empty()
+            || !self
+                .permissions
+                .bytes()
+                .all(|permission| matches!(permission, b'r' | b'w' | b'm'))
+        {
             return Err(anyhow::anyhow!(
-                "target {} is not an absolute, normalized path",
-                self.target
+                "permissions {} must be a nonempty combination of r, w and m",
+                self.permissions
             ));
         }
 
-        let source = Path::new(self.source.as_str());
-        if !is_plain_absolute_path(source) {
+        let source =
+            resolve_allowed_path(&self.source, &self.target, &allowed.0, "allowed_devices").await?;
+        let file_type = tokio::fs::metadata(&source).await?.file_type();
+        if !file_type.is_char_device() && !file_type.is_block_device() {
             return Err(anyhow::anyhow!(
-                "source {} is not an absolute, normalized path",
-                self.source
-            ));
-        }
-
-        let source = tokio::fs::canonicalize(source)
-            .await
-            .with_context(|| format!("source {} could not be resolved", self.source))?;
-
-        if !allowed.0.iter().any(|allowed| source.starts_with(allowed)) {
-            return Err(anyhow::anyhow!(
-                "source {} resolves to {}, which is outside allowed_mounts",
-                self.source,
+                "source {} is not a character or block device",
                 source.display()
             ));
         }
 
         Ok(source)
     }
+}
+
+async fn load_allowed_paths<E: AsRef<Path>>(
+    entries: impl IntoIterator<Item = E>,
+    name: &str,
+) -> Vec<PathBuf> {
+    let entries = entries.into_iter();
+
+    let mut allowed = Vec::with_capacity(entries.size_hint().0);
+    for entry in entries {
+        let entry = entry.as_ref();
+
+        match tokio::fs::canonicalize(entry).await {
+            Ok(path) => allowed.push(path),
+            Err(err) => {
+                tracing::warn!(
+                    "ignoring {} entry {}, it could not be resolved: {:#?}",
+                    name,
+                    entry.display(),
+                    err
+                );
+            }
+        }
+    }
+
+    allowed
+}
+
+async fn resolve_allowed_path(
+    source: &str,
+    target: &str,
+    allowed: &[PathBuf],
+    name: &str,
+) -> Result<PathBuf, anyhow::Error> {
+    if allowed.is_empty() {
+        return Err(anyhow::anyhow!("{name} is empty"));
+    }
+
+    if !is_plain_absolute_path(Path::new(target)) {
+        return Err(anyhow::anyhow!(
+            "target {target} is not an absolute, normalized path"
+        ));
+    }
+
+    if !is_plain_absolute_path(Path::new(source)) {
+        return Err(anyhow::anyhow!(
+            "source {source} is not an absolute, normalized path"
+        ));
+    }
+
+    let resolved = tokio::fs::canonicalize(source)
+        .await
+        .with_context(|| format!("source {source} could not be resolved"))?;
+
+    if !allowed.iter().any(|allowed| resolved.starts_with(allowed)) {
+        return Err(anyhow::anyhow!(
+            "source {source} resolves to {}, which is outside {name}",
+            resolved.display()
+        ));
+    }
+
+    Ok(resolved)
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -261,6 +332,8 @@ nestify::nest! {
             pub oom_disabled: bool,
         },
         pub mounts: Vec<Mount>,
+        #[serde(default)]
+        pub devices: Vec<Device>,
         #[serde(default, deserialize_with = "crate::deserialize::deserialize_nullable")]
         pub firewall: Vec<super::firewall::FirewallRule>,
         #[schema(inline)]
@@ -415,6 +488,7 @@ impl ServerConfiguration {
                 oom_disabled: false,
             },
             mounts: Vec::new(),
+            devices: Vec::new(),
             firewall: Vec::new(),
             egg: ServerConfigurationEgg {
                 id: uuid::Uuid::new_v4(),
@@ -782,6 +856,148 @@ mod tests {
         }
     }
 
+    #[test]
+    fn devices_default_to_empty_and_permissions_default_to_rwm() {
+        let mut value = serde_json::to_value(ServerConfiguration::mock(uuid::Uuid::new_v4()))
+            .expect("configuration should serialize");
+        value
+            .as_object_mut()
+            .expect("configuration should be an object")
+            .remove("devices");
+        let configuration: ServerConfiguration =
+            serde_json::from_value(value).expect("existing configurations should deserialize");
+        assert!(configuration.devices.is_empty());
+
+        let device: Device = serde_json::from_value(serde_json::json!({
+            "source": "/dev/null", "target": "/dev/example"
+        }))
+        .expect("device should deserialize");
+        assert_eq!(device.permissions, "rwm");
+    }
+
+    #[cfg(unix)]
+    fn device(source: impl AsRef<Path>) -> Device {
+        Device {
+            source: source.as_ref().to_string_lossy().to_compact_string(),
+            target: "/dev/example".into(),
+            permissions: "rw".into(),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn devices_allow_exact_paths_and_directory_ancestors() {
+        tokio_test::block_on(async {
+            for entry in ["/dev/null", "/dev"] {
+                let allowed = AllowedDevices::from_entries([entry]).await;
+                assert_eq!(
+                    device("/dev/null")
+                        .resolve_allowed_source(&allowed)
+                        .await
+                        .expect("device should be allowed"),
+                    std::fs::canonicalize("/dev/null").expect("device should exist")
+                );
+            }
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn devices_reject_empty_unrelated_and_unresolvable_allowlists() {
+        tokio_test::block_on(async {
+            let root = tempfile::tempdir().expect("temporary directory should exist");
+            for allowed in [
+                AllowedDevices::default(),
+                AllowedDevices::from_entries([root.path()]).await,
+                AllowedDevices::from_entries([root.path().join("missing")]).await,
+            ] {
+                assert!(
+                    device("/dev/null")
+                        .resolve_allowed_source(&allowed)
+                        .await
+                        .is_err()
+                );
+            }
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn devices_resolve_symlinks_before_checking_the_allowlist() {
+        tokio_test::block_on(async {
+            let root = tempfile::tempdir().expect("temporary directory should exist");
+            let alias = root.path().join("device");
+            std::os::unix::fs::symlink("/dev/null", &alias).expect("symlink should be created");
+            let allowed = AllowedDevices::from_entries([root.path()]).await;
+            assert!(
+                device(&alias)
+                    .resolve_allowed_source(&allowed)
+                    .await
+                    .is_err()
+            );
+
+            let allowed = AllowedDevices::from_entries([&alias]).await;
+            assert_eq!(
+                device(&alias)
+                    .resolve_allowed_source(&allowed)
+                    .await
+                    .expect("explicitly allowed alias should resolve"),
+                std::fs::canonicalize("/dev/null").expect("device should exist")
+            );
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn devices_reject_regular_files_directories_and_missing_sources() {
+        tokio_test::block_on(async {
+            let root = tempfile::tempdir().expect("temporary directory should exist");
+            let file = root.path().join("file");
+            std::fs::write(&file, "data").expect("file should be created");
+            let allowed = AllowedDevices::from_entries([root.path()]).await;
+            for source in [root.path().to_path_buf(), file, root.path().join("missing")] {
+                assert!(
+                    device(source)
+                        .resolve_allowed_source(&allowed)
+                        .await
+                        .is_err()
+                );
+            }
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn devices_reject_relative_and_traversing_paths() {
+        tokio_test::block_on(async {
+            let allowed = AllowedDevices::from_entries(["/dev"]).await;
+            for path in ["dev/null", "/dev/../dev/null"] {
+                assert!(device(path).resolve_allowed_source(&allowed).await.is_err());
+                let mut binding = device("/dev/null");
+                binding.target = path.into();
+                assert!(binding.resolve_allowed_source(&allowed).await.is_err());
+            }
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn devices_validate_cgroup_permissions() {
+        tokio_test::block_on(async {
+            let allowed = AllowedDevices::from_entries(["/dev/null"]).await;
+            for permissions in ["r", "w", "m", "rw", "rwm", "mr"] {
+                let mut binding = device("/dev/null");
+                binding.permissions = permissions.into();
+                assert!(binding.resolve_allowed_source(&allowed).await.is_ok());
+            }
+            for permissions in ["", "rwx", "R", "rw "] {
+                let mut binding = device("/dev/null");
+                binding.permissions = permissions.into();
+                assert!(binding.resolve_allowed_source(&allowed).await.is_err());
+            }
+        });
+    }
+
     fn resources(memory_limit: i64, swap: i64) -> bollard::models::Resources {
         let config = tokio_test::block_on(async { crate::config::Config::mock() });
 
@@ -1003,7 +1219,6 @@ mod tests {
 
             let allowed = AllowedMounts::from_entries(Vec::<PathBuf>::new()).await;
 
-            assert!(allowed.is_empty());
             assert!(
                 mount(&source)
                     .resolve_allowed_source(&allowed)

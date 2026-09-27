@@ -290,7 +290,11 @@ trait DockerServerConfigurationExt {
     ) -> Vec<bollard::plugin::Mount>;
 
     #[cfg(unix)]
-    fn convert_devices(&self) -> Vec<bollard::models::DeviceMapping>;
+    async fn convert_devices(
+        &self,
+        config: &crate::config::Config,
+        host_mounts: Option<&host_mounts::HostMountTable>,
+    ) -> Vec<bollard::models::DeviceMapping>;
 
     fn convert_allocations_bindings(&self) -> bollard::models::PortMap;
     fn convert_allocations_docker_bindings(
@@ -340,7 +344,11 @@ impl DockerServerConfigurationExt for crate::server::configuration::ServerConfig
     }
 
     #[cfg(unix)]
-    fn convert_devices(&self) -> Vec<bollard::models::DeviceMapping> {
+    async fn convert_devices(
+        &self,
+        config: &crate::config::Config,
+        host_mounts: Option<&host_mounts::HostMountTable>,
+    ) -> Vec<bollard::models::DeviceMapping> {
         let mut devices = Vec::new();
 
         if self.container.kvm_passthrough_enabled {
@@ -349,6 +357,36 @@ impl DockerServerConfigurationExt for crate::server::configuration::ServerConfig
                 path_in_container: Some("/dev/kvm".into()),
                 cgroup_permissions: Some("rwm".into()),
             });
+        }
+
+        if !self.devices.is_empty() {
+            let allowed = crate::server::configuration::AllowedDevices::load(config).await;
+
+            for device in &self.devices {
+                let source = match device.resolve_allowed_source(&allowed).await {
+                    Ok(source) => source,
+                    Err(err) => {
+                        tracing::warn!(
+                            server = %self.uuid,
+                            "not binding device {} -> {}: {:#}",
+                            device.source,
+                            device.target,
+                            err
+                        );
+
+                        continue;
+                    }
+                };
+
+                devices.push(bollard::models::DeviceMapping {
+                    path_on_host: Some(host_mounts::translate_source(
+                        host_mounts,
+                        &source.to_string_lossy(),
+                    )),
+                    path_in_container: Some(device.target.to_string()),
+                    cgroup_permissions: Some(device.permissions.to_string()),
+                });
+            }
         }
 
         devices
@@ -580,7 +618,7 @@ impl DockerServerConfigurationExt for crate::server::configuration::ServerConfig
                 mounts: Some(mounts),
                 binds,
                 #[cfg(unix)]
-                devices: Some(self.convert_devices()),
+                devices: Some(self.convert_devices(config, host_mounts).await),
                 network_mode: Some(network_mode),
                 dns: Some(config.load().docker.network.dns.clone()),
                 dns_options: Some(config.load().docker.network.dns_options.clone()),
@@ -3388,6 +3426,70 @@ impl super::ServerExecutor for DockerExecutor {
 mod tests {
     use super::*;
     use crate::server::configuration::ServerConfiguration;
+
+    #[cfg(unix)]
+    #[test]
+    fn device_conversion_preserves_bindings_and_skips_invalid_entries() {
+        tokio_test::block_on(async {
+            let config = crate::config::Config::mock();
+            config.mutate_in_place_for_testing().allowed_devices = vec!["/dev/null".into()];
+            let mut configuration = ServerConfiguration::mock(uuid::Uuid::new_v4());
+            for (source, permissions) in
+                [("/dev/null", "rw"), ("/dev/zero", "rw"), ("/dev/null", "x")]
+            {
+                configuration
+                    .devices
+                    .push(crate::server::configuration::Device {
+                        source: source.into(),
+                        target: "/dev/custom".into(),
+                        permissions: permissions.into(),
+                    });
+            }
+
+            let devices = configuration.convert_devices(&config, None).await;
+            assert_eq!(
+                devices,
+                vec![bollard::models::DeviceMapping {
+                    path_on_host: Some("/dev/null".into()),
+                    path_in_container: Some("/dev/custom".into()),
+                    cgroup_permissions: Some("rw".into()),
+                }]
+            );
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn device_conversion_keeps_kvm_independent_of_the_allowlist() {
+        tokio_test::block_on(async {
+            let config = crate::config::Config::mock();
+            let mut configuration = ServerConfiguration::mock(uuid::Uuid::new_v4());
+            configuration
+                .devices
+                .push(crate::server::configuration::Device {
+                    source: "/dev/null".into(),
+                    target: "/dev/custom".into(),
+                    permissions: "rwm".into(),
+                });
+            assert!(
+                configuration
+                    .convert_devices(&config, None)
+                    .await
+                    .is_empty()
+            );
+
+            configuration.container.kvm_passthrough_enabled = true;
+            let devices = configuration.convert_devices(&config, None).await;
+            assert_eq!(
+                devices,
+                vec![bollard::models::DeviceMapping {
+                    path_on_host: Some("/dev/kvm".into()),
+                    path_in_container: Some("/dev/kvm".into()),
+                    cgroup_permissions: Some("rwm".into()),
+                }]
+            );
+        });
+    }
 
     // cpu period scaling
 

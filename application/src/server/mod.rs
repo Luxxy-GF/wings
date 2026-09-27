@@ -755,6 +755,7 @@ impl Server {
                     || old_configuration.environment != configuration_lock.environment
                     || old_configuration.allocations != configuration_lock.allocations
                     || old_configuration.mounts != configuration_lock.mounts
+                    || old_configuration.devices != configuration_lock.devices
                     || old_configuration.container != configuration_lock.container
                     || old_configuration
                         .build
