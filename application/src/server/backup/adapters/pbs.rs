@@ -492,7 +492,7 @@ impl BackupExt for PbsBackup {
                 crate::spawn_blocking_signalled(signal, move || -> Result<(), anyhow::Error> {
                     let mut zip = zip::ZipWriter::new_stream(writer.into_sync());
                     let mut decoder = Decoder::from_std(SyncIoBridge::new(pxar_reader))?;
-                    let mut read_buffer = vec![0; crate::BUFFER_SIZE];
+                    let mut read_buffer = crate::io::mem_buffer(crate::BUFFER_SIZE);
 
                     while let Some(entry) = decoder.next() {
                         let entry = entry?;
@@ -1815,7 +1815,7 @@ impl VirtualReadableFilesystem for PbsVirtualFilesystem {
                                 progress.increment_files();
                                 let mut reader =
                                     archive.open_reader_blocking(&entry.archive_path, None)?;
-                                let mut buffer = vec![0; crate::BUFFER_SIZE];
+                                let mut buffer = crate::io::mem_buffer(crate::BUFFER_SIZE);
                                 loop {
                                     let read = reader.read(&mut buffer)?;
                                     if read == 0 {

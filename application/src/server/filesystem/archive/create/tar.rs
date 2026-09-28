@@ -134,6 +134,7 @@ pub async fn create_tar<W: Write + Send + 'static>(
                         let reader = progress.counting_reader(file);
                         let reader =
                             FixedReader::new_with_fixed_bytes(reader, metadata.len() as usize);
+                        let reader = std::io::BufReader::with_capacity(crate::BUFFER_SIZE, reader);
 
                         header.set_size(metadata.len());
                         header.set_entry_type(tar::EntryType::Regular);

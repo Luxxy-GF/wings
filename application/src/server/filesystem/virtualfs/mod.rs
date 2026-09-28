@@ -136,6 +136,50 @@ pub struct DirectoryListing {
     pub entries: Vec<DirectoryEntry>,
 }
 
+fn file_read_headers(size: u64, total_size: u64, reader_range: Option<ByteRange>) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+
+    headers.insert(axum::http::header::CONTENT_LENGTH, size.into());
+
+    if let Some(reader_range) = &reader_range {
+        headers.insert(
+            axum::http::header::ACCEPT_RANGES,
+            HeaderValue::from_static("bytes"),
+        );
+        headers.insert(
+            axum::http::header::CONTENT_RANGE,
+            reader_range.get_header_value(total_size),
+        );
+    }
+
+    headers
+}
+
+pub enum CheckedDirectoryListing {
+    Listing(DirectoryListing),
+    NotFound,
+    NotDirectory,
+}
+
+pub async fn read_dir_checked(
+    filesystem: &(impl VirtualReadableFilesystem + ?Sized),
+    path: &(dyn AsRef<Path> + Send + Sync),
+    per_page: Option<usize>,
+    page: usize,
+    is_ignored: IsIgnoredFn,
+    sort: crate::models::DirectorySortingMode,
+) -> Result<CheckedDirectoryListing, anyhow::Error> {
+    match filesystem.async_metadata(path).await {
+        Ok(metadata) if metadata.file_type.is_dir() => Ok(CheckedDirectoryListing::Listing(
+            filesystem
+                .async_read_dir(path, per_page, page, is_ignored, sort)
+                .await?,
+        )),
+        Ok(_) => Ok(CheckedDirectoryListing::NotDirectory),
+        Err(_) => Ok(CheckedDirectoryListing::NotFound),
+    }
+}
+
 pub struct FileRead {
     pub size: u64,
     pub total_size: u64,
@@ -167,6 +211,10 @@ impl FileRead {
                 reader: Box::new(file),
             })
         }
+    }
+
+    pub fn headers(&self) -> HeaderMap {
+        file_read_headers(self.size, self.total_size, self.reader_range)
     }
 }
 
@@ -204,22 +252,7 @@ impl AsyncFileRead {
     }
 
     pub fn headers(&self) -> HeaderMap {
-        let mut headers = HeaderMap::new();
-
-        headers.insert(axum::http::header::CONTENT_LENGTH, self.size.into());
-
-        if let Some(reader_range) = &self.reader_range {
-            headers.insert(
-                axum::http::header::ACCEPT_RANGES,
-                HeaderValue::from_static("bytes"),
-            );
-            headers.insert(
-                axum::http::header::CONTENT_RANGE,
-                reader_range.get_header_value(self.total_size),
-            );
-        }
-
-        headers
+        file_read_headers(self.size, self.total_size, self.reader_range)
     }
 }
 
@@ -626,6 +659,16 @@ pub trait VirtualReadableFilesystem: Send + Sync {
         is_ignored: IsIgnoredFn,
         sort: crate::models::DirectorySortingMode,
     ) -> Result<DirectoryListing, anyhow::Error>;
+    async fn async_read_dir_checked(
+        &self,
+        path: &(dyn AsRef<Path> + Send + Sync),
+        per_page: Option<usize>,
+        page: usize,
+        is_ignored: IsIgnoredFn,
+        sort: crate::models::DirectorySortingMode,
+    ) -> Result<CheckedDirectoryListing, anyhow::Error> {
+        read_dir_checked(self, path, per_page, page, is_ignored, sort).await
+    }
     fn walk_dir<'a>(
         &'a self,
         path: &(dyn AsRef<Path> + Send + Sync),

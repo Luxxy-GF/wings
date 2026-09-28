@@ -691,7 +691,7 @@ impl BackupExt for KopiaBackup {
                     let mut subtar = tar::Archive::new(stdout);
                     let entries = subtar.entries()?;
 
-                    let mut read_buffer = vec![0; crate::BUFFER_SIZE];
+                    let mut read_buffer = crate::io::mem_buffer(crate::BUFFER_SIZE);
                     for entry in entries {
                         let mut entry = entry?;
                         let header = entry.header().clone();
@@ -1844,7 +1844,7 @@ impl VirtualReadableFilesystem for VirtualKopiaBackup {
                     let mut subtar = tar::Archive::new(stdout);
                     let entries = subtar.entries()?;
 
-                    let mut read_buffer = vec![0; crate::BUFFER_SIZE];
+                    let mut read_buffer = crate::io::mem_buffer(crate::BUFFER_SIZE);
                     for entry in entries {
                         let mut entry = entry?;
                         let header = entry.header().clone();

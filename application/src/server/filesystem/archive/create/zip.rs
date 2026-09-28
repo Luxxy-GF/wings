@@ -298,7 +298,7 @@ impl EntryWriter {
     fn compress_batch(&self, batch: Vec<Entry>, bytes: u64) -> Result<BatchArchive, anyhow::Error> {
         let capacity = bytes as usize + batch.len() * 128;
         let mut archive = zip::ZipWriter::new(Cursor::new(Vec::with_capacity(capacity)));
-        let mut read_buffer = vec![0; crate::BUFFER_SIZE];
+        let mut read_buffer = crate::io::mem_buffer(crate::BUFFER_SIZE);
 
         for entry in batch {
             if self.listener.is_aborted() {
@@ -367,7 +367,7 @@ impl<Z: Write + Seek> Pipeline<Z> {
             merged: 0,
             in_flight: 0,
             window: window_bytes(threads),
-            read_buffer: vec![0; crate::BUFFER_SIZE],
+            read_buffer: crate::io::mem_buffer(crate::BUFFER_SIZE),
         })
     }
 
@@ -952,7 +952,7 @@ mod tests {
         let temp = tempfile::tempdir()?;
         let path = temp.path().join("probe.bin");
 
-        let mut read_buffer = vec![0; crate::BUFFER_SIZE];
+        let mut read_buffer = crate::io::mem_buffer(crate::BUFFER_SIZE);
 
         std::fs::write(&path, random(1024 * 1024))?;
         let mut file = std::fs::File::open(&path)?;
@@ -1025,7 +1025,7 @@ mod tests {
             };
 
             let mut archive = zip::ZipWriter::new(Cursor::new(Vec::new()));
-            let mut read_buffer = vec![0; crate::BUFFER_SIZE];
+            let mut read_buffer = crate::io::mem_buffer(crate::BUFFER_SIZE);
 
             writer.write_file(&mut archive, &entry, &mut read_buffer)?;
 

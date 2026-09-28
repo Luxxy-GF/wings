@@ -1145,7 +1145,7 @@ impl BackupExt for ResticBackup {
                     let mut subtar = tar::Archive::new(child.into_stdout()?);
                     let entries = subtar.entries()?;
 
-                    let mut read_buffer = vec![0; crate::BUFFER_SIZE];
+                    let mut read_buffer = crate::io::mem_buffer(crate::BUFFER_SIZE);
                     for entry in entries {
                         let mut entry = entry?;
                         let header = entry.header().clone();
@@ -2348,7 +2348,7 @@ impl VirtualReadableFilesystem for VirtualResticBackup {
                     let mut restic_tar = tar::Archive::new(child.take_stdout()?);
                     let entries = restic_tar.entries()?;
 
-                    let mut read_buffer = vec![0; crate::BUFFER_SIZE];
+                    let mut read_buffer = crate::io::mem_buffer(crate::BUFFER_SIZE);
                     for entry in entries {
                         let mut entry = entry?;
                         let header = entry.header().clone();
@@ -2709,7 +2709,7 @@ impl VirtualReadableFilesystem for VirtualResticBackup {
                     let writer = writer.into_sync();
                     let mut zip = zip::ZipWriter::new_stream(writer);
 
-                    let mut read_buffer = vec![0; crate::BUFFER_SIZE];
+                    let mut read_buffer = crate::io::mem_buffer(crate::BUFFER_SIZE);
 
                     for resolved_entry in resolved {
                         match resolved_entry {

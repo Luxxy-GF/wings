@@ -39,7 +39,7 @@ impl MultiReader {
             file,
             file_size,
             offset: 0,
-            window: vec![0; READAHEAD_SEQUENTIAL],
+            window: crate::io::mem_buffer(READAHEAD_SEQUENTIAL),
             window_start: 0,
             window_len: 0,
         })
@@ -74,7 +74,7 @@ impl Clone for MultiReader {
             file: Arc::clone(&self.file),
             file_size: self.file_size,
             offset: self.offset,
-            window: vec![0; READAHEAD_SEQUENTIAL],
+            window: crate::io::mem_buffer(READAHEAD_SEQUENTIAL),
             window_start: 0,
             window_len: 0,
         }

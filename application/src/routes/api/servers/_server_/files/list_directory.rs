@@ -7,6 +7,7 @@ mod get {
     use crate::{
         response::{ApiResponse, ApiResponseResult},
         routes::{ApiError, GetState, api::servers::_server_::GetServer},
+        server::filesystem::virtualfs::CheckedDirectoryListing,
     };
     use axum::{extract::Query, http::StatusCode};
     use serde::Deserialize;
@@ -46,34 +47,34 @@ mod get {
             .resolve_readable_fs(&server, Path::new(&data.root))
             .await;
 
-        let metadata = filesystem.async_metadata(&root).await;
-        if let Ok(metadata) = metadata {
-            if !metadata.file_type.is_dir() {
-                return ApiResponse::error("path not a directory")
-                    .with_status(StatusCode::EXPECTATION_FAILED)
-                    .ok();
-            }
-        } else {
-            return ApiResponse::error("path not found")
-                .with_status(StatusCode::NOT_FOUND)
-                .ok();
-        }
-
         let is_ignored = if filesystem.is_primary_server_fs() {
             server.filesystem.symlink_name_filter()
         } else {
             Default::default()
         };
 
-        let entries = filesystem
-            .async_read_dir(
+        let entries = match filesystem
+            .async_read_dir_checked(
                 &root,
                 Some(state.config.load().api.directory_entry_limit),
                 1,
                 is_ignored,
                 crate::models::DirectorySortingMode::NameAsc,
             )
-            .await?;
+            .await?
+        {
+            CheckedDirectoryListing::Listing(entries) => entries,
+            CheckedDirectoryListing::NotDirectory => {
+                return ApiResponse::error("path not a directory")
+                    .with_status(StatusCode::EXPECTATION_FAILED)
+                    .ok();
+            }
+            CheckedDirectoryListing::NotFound => {
+                return ApiResponse::error("path not found")
+                    .with_status(StatusCode::NOT_FOUND)
+                    .ok();
+            }
+        };
 
         let capacity = entries.entries.len().saturating_mul(320).saturating_add(64);
 

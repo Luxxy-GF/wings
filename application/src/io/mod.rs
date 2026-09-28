@@ -16,15 +16,26 @@ pub mod limited_writer;
 pub mod line_buffer;
 pub mod pipe;
 pub mod range_reader;
+pub mod read_stream;
 pub mod tail;
 
 const KERNEL_COPY_BUFFER_SIZE: usize = 64 * 1024 * 1024; // 64 MiB
+
+/// Allocates a zero-filled buffer of `len` bytes.
+#[inline]
+pub fn mem_buffer(len: usize) -> Vec<u8> {
+    #[allow(clippy::slow_vector_initialization)]
+    let mut buffer = Vec::with_capacity(len);
+    buffer.resize(len, 0);
+
+    buffer
+}
 
 pub fn copy(
     reader: &mut (impl ?Sized + Read),
     writer: &mut (impl ?Sized + Write),
 ) -> std::io::Result<()> {
-    let mut buffer = vec![0; crate::BUFFER_SIZE];
+    let mut buffer = mem_buffer(crate::BUFFER_SIZE);
 
     copy_shared(&mut buffer, reader, writer)
 }
@@ -102,7 +113,7 @@ pub fn copy_file_progress(
             Err(err) => match err.kind() {
                 std::io::ErrorKind::Interrupted => continue,
                 std::io::ErrorKind::CrossesDevices | std::io::ErrorKind::Unsupported => {
-                    let mut buffer = vec![0; crate::BUFFER_SIZE];
+                    let mut buffer = mem_buffer(crate::BUFFER_SIZE);
 
                     loop {
                         if listener.is_aborted() {
@@ -138,7 +149,7 @@ pub fn copy_file_progress(
     listener: abort::AbortListener,
 ) -> Result<u64, std::io::Error> {
     let mut total_copied = 0;
-    let mut buffer = vec![0; crate::BUFFER_SIZE];
+    let mut buffer = mem_buffer(crate::BUFFER_SIZE);
 
     loop {
         if listener.is_aborted() {

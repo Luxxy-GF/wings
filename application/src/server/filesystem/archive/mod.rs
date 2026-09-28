@@ -1031,7 +1031,7 @@ impl Archive {
 
                         scope.spawn_broadcast(move |_, _| {
                             let mut archive = archive.clone();
-                            let mut buffer = vec![0; ZIP_COPY_BUFFER];
+                            let mut buffer = crate::io::mem_buffer(ZIP_COPY_BUFFER);
 
                             let mut run = || -> Result<(), anyhow::Error> {
                                 loop {
@@ -1330,7 +1330,7 @@ impl Archive {
                                     &mut reader,
                                 );
 
-                                let mut read_buffer = vec![0; crate::BUFFER_SIZE];
+                                let mut read_buffer = crate::io::mem_buffer(crate::BUFFER_SIZE);
                                 let mut last_parent = None;
                                 if let Err(err) = folder.for_each_entries(&mut |entry, reader| {
                                     let path = entry.name();
@@ -1692,7 +1692,7 @@ impl Archive {
 
                     let mut decoder = pbs_client::pxar::decoder::Decoder::from_std(reader)?;
                     let mut directory_entries = chunked_vec::ChunkedVec::new();
-                    let mut read_buffer = vec![0; crate::BUFFER_SIZE];
+                    let mut read_buffer = crate::io::mem_buffer(crate::BUFFER_SIZE);
                     let mut last_parent = None;
 
                     while let Some(entry) = decoder.next() {
@@ -2249,6 +2249,69 @@ mod tests {
                     .expect("mtime before the epoch")
                     .as_secs(),
                 1_500_000_000
+            );
+
+            Ok(())
+        })
+    }
+
+    #[test]
+    #[ignore = "requires filesystem syscalls the ci containers deny (eperm)"]
+    fn file_modes_ignore_the_umask() -> Result<(), anyhow::Error> {
+        tokio_test::block_on(async {
+            use std::os::unix::fs::PermissionsExt;
+
+            let fixture = ExtractFixture::new(2).await?;
+
+            fixture.build(|builder| {
+                for (name, mode) in [("shared.txt", 0o664), ("run.sh", 0o775)] {
+                    let mut header = file_header(5, mode, 1_500_000_000);
+                    builder
+                        .append_data(&mut header, name, b"hello".as_slice())
+                        .expect("append file");
+                }
+            })?;
+
+            let out = fixture.extract().await?;
+
+            for (name, mode) in [("shared.txt", 0o664), ("run.sh", 0o775)] {
+                assert_eq!(
+                    std::fs::metadata(out.join(name))?.permissions().mode() & 0o777,
+                    mode,
+                    "{name} mode was masked"
+                );
+            }
+
+            Ok(())
+        })
+    }
+
+    #[test]
+    #[ignore = "requires filesystem syscalls the ci containers deny (eperm)"]
+    fn extracting_over_an_existing_file_replaces_content_and_mode() -> Result<(), anyhow::Error> {
+        tokio_test::block_on(async {
+            use std::os::unix::fs::PermissionsExt;
+
+            let fixture = ExtractFixture::new(2).await?;
+            let existing = fixture.root.join("out").join("config.yml");
+            std::fs::create_dir_all(fixture.root.join("out"))?;
+            std::fs::write(&existing, b"a much longer previous config body")?;
+            std::fs::set_permissions(&existing, std::fs::Permissions::from_mode(0o600))?;
+
+            fixture.build(|builder| {
+                let mut header = file_header(3, 0o664, 1_500_000_000);
+                builder
+                    .append_data(&mut header, "config.yml", b"new".as_slice())
+                    .expect("append file");
+            })?;
+
+            let out = fixture.extract().await?;
+            let path = out.join("config.yml");
+
+            assert_eq!(std::fs::read(&path)?, b"new");
+            assert_eq!(
+                std::fs::metadata(&path)?.permissions().mode() & 0o777,
+                0o664
             );
 
             Ok(())

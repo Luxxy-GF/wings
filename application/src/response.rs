@@ -51,6 +51,13 @@ impl ApiResponse {
         }
     }
 
+    #[inline]
+    pub fn new_read_stream(reader: impl std::io::Read + Send + Unpin + 'static, len: u64) -> Self {
+        Self::new(axum::body::Body::from_stream(
+            crate::io::read_stream::ReadStream::new(reader, len, crate::FILE_STREAM_BUFFER_SIZE),
+        ))
+    }
+
     pub fn new_serialized(body: impl serde::Serialize) -> Self {
         Self::new_serialized_with_capacity(body, 128)
     }

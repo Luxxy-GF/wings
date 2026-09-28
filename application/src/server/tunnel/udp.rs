@@ -48,7 +48,7 @@ pub async fn tunnel(socket: WebSocket, target: SocketAddr) {
     };
 
     let udp_to_ws = async {
-        let mut buffer = vec![0; RECV_BUFFER_SIZE];
+        let mut buffer = crate::io::mem_buffer(RECV_BUFFER_SIZE);
         let mut ping = tokio::time::interval(PING_INTERVAL);
         ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 

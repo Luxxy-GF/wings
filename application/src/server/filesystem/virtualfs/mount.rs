@@ -1,6 +1,7 @@
 use super::{
-    AsyncDirectoryStreamWalk, AsyncDirectoryWalk, AsyncFileRead, ByteRange, DirectoryListing,
-    FileMetadata, FileRead, IsIgnoredFn, VirtualReadableFilesystem, cap::VirtualCapFilesystem,
+    AsyncDirectoryStreamWalk, AsyncDirectoryWalk, AsyncFileRead, ByteRange,
+    CheckedDirectoryListing, DirectoryListing, FileMetadata, FileRead, IsIgnoredFn,
+    VirtualReadableFilesystem, cap::VirtualCapFilesystem, read_dir_checked,
 };
 use crate::{
     io::compression::CompressionLevel,
@@ -40,6 +41,20 @@ impl VirtualMountFilesystem {
                 .mounts
                 .iter()
                 .any(|m| m.relative_target.starts_with(path))
+    }
+
+    fn projects_virtual_dir(&self, listing_path: &Path) -> bool {
+        self.mounts.iter().any(|mount| {
+            let remaining = if listing_path == Path::new("") {
+                Some(mount.relative_target.as_path())
+            } else if mount.relative_target.starts_with(listing_path) {
+                mount.relative_target.strip_prefix(listing_path).ok()
+            } else {
+                None
+            };
+
+            remaining.is_some_and(|remaining| remaining.components().next().is_some())
+        })
     }
 
     fn virtual_dir_entry(path: &Path) -> DirectoryEntry {
@@ -216,19 +231,7 @@ impl VirtualReadableFilesystem for VirtualMountFilesystem {
     ) -> Result<DirectoryListing, anyhow::Error> {
         let listing_path = path.as_ref();
 
-        let projects_virtual_dir = self.mounts.iter().any(|mount| {
-            let remaining = if listing_path == Path::new("") {
-                Some(mount.relative_target.as_path())
-            } else if mount.relative_target.starts_with(listing_path) {
-                mount.relative_target.strip_prefix(listing_path).ok()
-            } else {
-                None
-            };
-
-            remaining.is_some_and(|remaining| remaining.components().next().is_some())
-        });
-
-        if !projects_virtual_dir {
+        if !self.projects_virtual_dir(listing_path) {
             return self
                 .inner
                 .async_read_dir(path, per_page, page, is_ignored, sort)
@@ -343,6 +346,23 @@ impl VirtualReadableFilesystem for VirtualMountFilesystem {
                 entries: all_entries,
             })
         }
+    }
+
+    async fn async_read_dir_checked(
+        &self,
+        path: &(dyn AsRef<Path> + Send + Sync),
+        per_page: Option<usize>,
+        page: usize,
+        is_ignored: IsIgnoredFn,
+        sort: DirectorySortingMode,
+    ) -> Result<CheckedDirectoryListing, anyhow::Error> {
+        if self.is_gateway(path.as_ref()) || self.projects_virtual_dir(path.as_ref()) {
+            return read_dir_checked(self, path, per_page, page, is_ignored, sort).await;
+        }
+
+        self.inner
+            .async_read_dir_checked(path, per_page, page, is_ignored, sort)
+            .await
     }
 
     fn walk_dir<'a>(

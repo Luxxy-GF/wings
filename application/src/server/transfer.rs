@@ -453,7 +453,7 @@ impl OutgoingServerTransfer {
                 async move {
                     let mut hasher = sha2::Sha256::new();
 
-                    let mut buffer = vec![0; crate::TRANSFER_BUFFER_SIZE];
+                    let mut buffer = crate::io::mem_buffer(crate::TRANSFER_BUFFER_SIZE);
                     loop {
                         let bytes_read = checksummed_reader.read(&mut buffer).await?;
                         if crate::unlikely(bytes_read == 0) {
@@ -808,7 +808,7 @@ impl OutgoingServerTransfer {
                     async move {
                         let mut hasher = sha2::Sha256::new();
 
-                        let mut buffer = vec![0; crate::TRANSFER_BUFFER_SIZE];
+                        let mut buffer = crate::io::mem_buffer(crate::TRANSFER_BUFFER_SIZE);
                         loop {
                             let bytes_read = checksummed_reader.read(&mut buffer).await?;
                             if crate::unlikely(bytes_read == 0) {

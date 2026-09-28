@@ -202,7 +202,7 @@ mod post {
                                             let entries = archive.entries();
 
                                             let mut read_buffer =
-                                                vec![0; crate::TRANSFER_BUFFER_SIZE];
+                                                crate::io::mem_buffer(crate::TRANSFER_BUFFER_SIZE);
                                             for entry in entries {
                                                 let mut entry = entry?;
                                                 let rel = entry.enclosed_path();
@@ -299,7 +299,7 @@ mod post {
                                             archive.set_ignore_zeros(true);
                                             let entries = archive.entries()?;
 
-                                            let mut read_buffer = vec![0; crate::TRANSFER_BUFFER_SIZE];
+                                            let mut read_buffer = crate::io::mem_buffer(crate::TRANSFER_BUFFER_SIZE);
                                             for entry in entries {
                                                 let mut entry = entry?;
                                                 let path = entry.path()?;

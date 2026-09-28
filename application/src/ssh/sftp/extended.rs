@@ -119,7 +119,7 @@ pub async fn handle_extended(
                 }
 
                 let mut run_hash = async || -> Result<Vec<u8>, std::io::Error> {
-                    let mut buffer = vec![0; crate::BUFFER_SIZE];
+                    let mut buffer = crate::io::mem_buffer(crate::BUFFER_SIZE);
 
                     Ok(match hash_algorithm {
                         "md5" => {

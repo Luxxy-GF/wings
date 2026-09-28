@@ -22,7 +22,7 @@ pub fn copy_and_shutdown(
     reader: &mut (impl ?Sized + Read),
     writer: &mut SyncPipeWriter,
 ) -> std::io::Result<bool> {
-    let mut buffer = vec![0; crate::BUFFER_SIZE];
+    let mut buffer = crate::io::mem_buffer(crate::BUFFER_SIZE);
 
     loop {
         let bytes_read = reader.read_uninterrupted(&mut buffer)?;

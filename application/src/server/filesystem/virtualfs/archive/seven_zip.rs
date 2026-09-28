@@ -987,7 +987,7 @@ impl VirtualReadableFilesystem for VirtualSevenZipArchive {
                         return Ok(true);
                     }
 
-                    let mut buffer = vec![0; crate::BUFFER_SIZE];
+                    let mut buffer = crate::io::mem_buffer(crate::BUFFER_SIZE);
                     loop {
                         match reader.read_uninterrupted(&mut buffer) {
                             Ok(0) => break,
@@ -1107,7 +1107,7 @@ impl VirtualReadableFilesystem for VirtualSevenZipArchive {
                     let writer = writer.into_sync();
                     let mut zip = zip::ZipWriter::new_stream(writer);
 
-                    let mut read_buffer = vec![0; crate::BUFFER_SIZE];
+                    let mut read_buffer = crate::io::mem_buffer(crate::BUFFER_SIZE);
                     for (i, entry) in archive.files.iter().enumerate() {
                         let name = match Path::new(entry.name()).strip_prefix(&path) {
                             Ok(name) => name,

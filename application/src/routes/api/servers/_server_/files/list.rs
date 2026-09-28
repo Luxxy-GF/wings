@@ -11,7 +11,7 @@ mod get {
             cap::FileType,
             ignore_list::IgnoreList,
             uploads::{UploadEntry, target_name},
-            virtualfs::IsIgnoredFn,
+            virtualfs::{CheckedDirectoryListing, IsIgnoredFn},
         },
     };
     use axum::http::StatusCode;
@@ -154,19 +154,6 @@ mod get {
             .resolve_readable_fs(&server, Path::new(&data.root))
             .await;
 
-        let metadata = filesystem.async_metadata(&root).await;
-        if let Ok(metadata) = metadata {
-            if !metadata.file_type.is_dir() {
-                return ApiResponse::error("path not a directory")
-                    .with_status(StatusCode::EXPECTATION_FAILED)
-                    .ok();
-            }
-        } else {
-            return ApiResponse::error("path not found")
-                .with_status(StatusCode::NOT_FOUND)
-                .ok();
-        }
-
         let is_ignored: IsIgnoredFn = if filesystem.is_primary_server_fs()
             && let Some(ignore) = ignore
         {
@@ -177,9 +164,22 @@ mod get {
             Default::default()
         };
 
-        let entries = filesystem
-            .async_read_dir(&root, per_page, page, is_ignored.clone(), data.sort)
-            .await?;
+        let entries = match filesystem
+            .async_read_dir_checked(&root, per_page, page, is_ignored.clone(), data.sort)
+            .await?
+        {
+            CheckedDirectoryListing::Listing(entries) => entries,
+            CheckedDirectoryListing::NotDirectory => {
+                return ApiResponse::error("path not a directory")
+                    .with_status(StatusCode::EXPECTATION_FAILED)
+                    .ok();
+            }
+            CheckedDirectoryListing::NotFound => {
+                return ApiResponse::error("path not found")
+                    .with_status(StatusCode::NOT_FOUND)
+                    .ok();
+            }
+        };
 
         let uploads = if filesystem.is_primary_server_fs() {
             upload_entries(&server, &root, &entries.entries, &is_ignored).await

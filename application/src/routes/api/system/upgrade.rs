@@ -105,7 +105,7 @@ mod post {
         file.seek(std::io::SeekFrom::Start(0)).await?;
 
         let mut hasher = sha2::Sha256::new();
-        let mut buffer = vec![0; crate::BUFFER_SIZE];
+        let mut buffer = crate::io::mem_buffer(crate::BUFFER_SIZE);
 
         loop {
             match file.read(&mut buffer).await? {

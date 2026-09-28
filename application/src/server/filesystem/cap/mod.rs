@@ -19,7 +19,7 @@ use std::{
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 mod utils;
-pub use utils::{AsyncReadDir, AsyncWalkDir, FileType, ReadDir, WalkDir, WalkEntry, name_and_type};
+pub use utils::{AsyncReadDir, AsyncWalkDir, FileType, ListingDir, ReadDir, WalkDir, WalkEntry};
 
 #[derive(Debug, Clone)]
 pub struct CapFilesystem {
@@ -232,7 +232,7 @@ impl CapFilesystem {
             inner.open_dir(&path)?
         };
 
-        pool.in_place_scope(|scope| Self::remove_dir_contents(scope, dir, &state));
+        pool.in_place_scope(|scope| Self::remove_dir_contents(scope, Arc::new(dir), &state));
 
         let mut state = state.lock();
 
@@ -262,10 +262,12 @@ impl CapFilesystem {
     /// Removes everything inside `dir`. One task owns one directory and unlinks
     /// through that directory's own handle, so no two threads work on the same
     /// directory and nothing is resolved from the sandbox root again; a directory
-    /// is removed once the tasks for its subdirectories are done.
+    /// is removed once the tasks for its subdirectories are done. A subdirectory
+    /// is only opened once its task runs, so queued tasks hold no descriptors and
+    /// wide trees cannot run the process out of them.
     fn remove_dir_contents<'scope>(
         scope: &rayon::Scope<'scope>,
-        dir: cap_std::fs::Dir,
+        dir: Arc<cap_std::fs::Dir>,
         state: &'scope Arc<parking_lot::Mutex<RemoveDirAllState>>,
     ) {
         let entries = match dir.entries() {
@@ -295,22 +297,17 @@ impl CapFilesystem {
             }
 
             if file_type.is_dir() {
-                let sub = match entry.open_dir() {
-                    Ok(sub) => sub,
-                    Err(err) => {
-                        state.lock().record(err);
-                        continue;
-                    }
-                };
-                let parent = match dir.try_clone() {
-                    Ok(parent) => parent,
-                    Err(err) => {
-                        state.lock().record(err);
-                        continue;
-                    }
-                };
+                let parent = Arc::clone(&dir);
 
                 scope.spawn(move |_| {
+                    let sub = match entry.open_dir() {
+                        Ok(sub) => Arc::new(sub),
+                        Err(err) => {
+                            state.lock().record(err);
+                            return;
+                        }
+                    };
+
                     rayon::scope(|scope| Self::remove_dir_contents(scope, sub, state));
 
                     if let Err(err) = entry.remove_dir()
@@ -685,7 +682,7 @@ impl CapFilesystem {
         let mut file = self.async_open(path).await?;
         let mut content = Vec::new();
 
-        let mut buffer = vec![0; crate::BUFFER_SIZE];
+        let mut buffer = crate::io::mem_buffer(crate::BUFFER_SIZE);
         loop {
             let bytes_read = file.read(&mut buffer).await?;
 
@@ -1338,6 +1335,35 @@ impl CapFilesystem {
         } else {
             inner.read_dir(path)?
         }))
+    }
+
+    pub fn open_listing_dir(&self, path: impl AsRef<Path>) -> Result<ListingDir, std::io::Error> {
+        let path = self.relative_path(path.as_ref());
+        let path = if path.components().next().is_none() {
+            Path::new(".")
+        } else {
+            &path
+        };
+
+        let inner = self.get_inner()?;
+
+        #[cfg(target_os = "linux")]
+        let dir = {
+            use cap_std::fs::OpenOptionsExt;
+
+            let file = inner.open_with(
+                path,
+                OpenOptions::new()
+                    .read(true)
+                    .custom_flags(rustix::fs::OFlags::DIRECTORY.bits() as i32),
+            )?;
+
+            cap_std::fs::Dir::from_std_file(file.into_std())
+        };
+        #[cfg(not(target_os = "linux"))]
+        let dir = inner.open_dir(path)?;
+
+        Ok(ListingDir(dir))
     }
 
     pub async fn async_walk_dir(
@@ -2261,5 +2287,207 @@ mod tests {
         let (_d, filesystem) = temp_filesystem();
 
         assert_eq!(filesystem.canonicalize("").unwrap(), PathBuf::from(""));
+    }
+
+    // ListingDir
+
+    fn listing_entries(listing: &ListingDir) -> Vec<(FileType, String)> {
+        let mut entries = Vec::new();
+        listing
+            .for_each_entry(|file_type, name| {
+                entries.push((file_type, name));
+                Ok::<_, std::io::Error>(())
+            })
+            .unwrap();
+        entries.sort_by(|a, b| a.1.cmp(&b.1));
+
+        entries
+    }
+
+    fn entry_names(listing: &ListingDir) -> Vec<String> {
+        listing_entries(listing)
+            .into_iter()
+            .map(|(_, name)| name)
+            .collect()
+    }
+
+    #[test]
+    fn listing_dir_root_lists_every_entry_once_without_dot_entries() {
+        let (dir, filesystem) = temp_filesystem();
+        std::fs::create_dir(dir.path().join("plugins")).unwrap();
+        for index in 0..300 {
+            std::fs::write(dir.path().join(format!("file-{index}")), "x").unwrap();
+        }
+
+        let mut expected: Vec<String> = (0..300).map(|index| format!("file-{index}")).collect();
+        expected.push("plugins".to_string());
+        expected.sort();
+
+        for root in ["", "/"] {
+            let listing = filesystem.open_listing_dir(root).unwrap();
+            assert_eq!(entry_names(&listing), expected, "{root:?}");
+        }
+    }
+
+    #[test]
+    fn listing_dir_rejects_files_and_missing_paths() {
+        let (dir, filesystem) = temp_filesystem();
+        std::fs::write(dir.path().join("file.txt"), "x").unwrap();
+
+        assert!(filesystem.open_listing_dir("file.txt").is_err());
+        assert!(filesystem.open_listing_dir("missing").is_err());
+        assert!(filesystem.open_listing_dir("missing/nested").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn listing_dir_cannot_escape_the_root() {
+        let (dir, filesystem) = temp_filesystem();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret"), "x").unwrap();
+        std::fs::write(dir.path().join("inside"), "x").unwrap();
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("absolute")).unwrap();
+        let relative = Path::new("..").join(outside.path().file_name().unwrap());
+        std::os::unix::fs::symlink(&relative, dir.path().join("relative")).unwrap();
+
+        for path in [
+            PathBuf::from(".."),
+            PathBuf::from("../.."),
+            relative.clone(),
+            PathBuf::from("absolute"),
+            PathBuf::from("relative"),
+        ] {
+            if let Ok(listing) = filesystem.open_listing_dir(&path) {
+                assert!(
+                    !entry_names(&listing).contains(&"secret".to_string()),
+                    "{path:?} escaped the root"
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn listing_dir_reports_entry_types_without_following_symlinks() {
+        let (dir, filesystem) = temp_filesystem();
+        std::fs::create_dir(dir.path().join("dir")).unwrap();
+        std::fs::write(dir.path().join("file"), "x").unwrap();
+        std::os::unix::fs::symlink("dir", dir.path().join("dir_link")).unwrap();
+        std::os::unix::fs::symlink("file", dir.path().join("file_link")).unwrap();
+        std::os::unix::fs::symlink("missing", dir.path().join("dangling_link")).unwrap();
+        rustix::fs::mknodat(
+            rustix::fs::CWD,
+            dir.path().join("fifo"),
+            rustix::fs::FileType::Fifo,
+            rustix::fs::Mode::from_raw_mode(0o644),
+            0,
+        )
+        .unwrap();
+
+        let listing = filesystem.open_listing_dir("").unwrap();
+        let entries = listing_entries(&listing);
+
+        let names: Vec<&str> = entries.iter().map(|(_, name)| name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "dangling_link",
+                "dir",
+                "dir_link",
+                "fifo",
+                "file",
+                "file_link"
+            ]
+        );
+        for (file_type, name) in &entries {
+            let expected = match name.as_str() {
+                "dir" => matches!(file_type, FileType::Dir),
+                "file" => matches!(file_type, FileType::File),
+                "fifo" => matches!(file_type, FileType::Unknown),
+                _ => matches!(file_type, FileType::Symlink),
+            };
+            assert!(expected, "{name}: {file_type:?}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn listing_dir_converts_non_utf8_names_lossily() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let (dir, filesystem) = temp_filesystem();
+        let raw = b"bad-\xff\xfe.txt";
+        std::fs::write(dir.path().join(std::ffi::OsStr::from_bytes(raw)), "x").unwrap();
+
+        let listing = filesystem.open_listing_dir("").unwrap();
+        let entries = listing_entries(&listing);
+
+        assert_eq!(entries.len(), 1);
+        assert!(matches!(entries[0].0, FileType::File));
+        assert_eq!(entries[0].1, String::from_utf8_lossy(raw));
+    }
+
+    #[test]
+    fn listing_dir_stops_at_the_first_visitor_error() {
+        let (dir, filesystem) = temp_filesystem();
+        for index in 0..10 {
+            std::fs::write(dir.path().join(format!("file-{index}")), "x").unwrap();
+        }
+
+        let listing = filesystem.open_listing_dir("").unwrap();
+        let mut visited = 0;
+        let result = listing.for_each_entry(|_, name| {
+            visited += 1;
+            if visited == 3 {
+                Err(anyhow::anyhow!("stop at {name}"))
+            } else {
+                Ok(())
+            }
+        });
+
+        assert_eq!(visited, 3);
+        assert!(result.unwrap_err().to_string().starts_with("stop at file-"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn listing_dir_symlink_metadata_does_not_follow_symlinks() {
+        let (dir, filesystem) = temp_filesystem();
+        std::fs::create_dir(dir.path().join("dir")).unwrap();
+        std::fs::write(dir.path().join("dir/file"), "hello").unwrap();
+        std::os::unix::fs::symlink("file", dir.path().join("dir/link")).unwrap();
+        std::os::unix::fs::symlink("missing", dir.path().join("dir/dangling")).unwrap();
+
+        let listing = filesystem.open_listing_dir("dir").unwrap();
+
+        let file = listing.symlink_metadata("file").unwrap();
+        assert!(file.is_file());
+        assert_eq!(file.len(), 5);
+        assert!(listing.symlink_metadata("link").unwrap().is_symlink());
+        assert!(listing.symlink_metadata("dangling").unwrap().is_symlink());
+        assert!(listing.symlink_metadata("missing").is_err());
+    }
+
+    #[test]
+    fn listing_dir_keeps_resolving_after_the_directory_is_renamed() {
+        use std::io::Read;
+
+        let (dir, filesystem) = temp_filesystem();
+        std::fs::create_dir(dir.path().join("before")).unwrap();
+        std::fs::write(dir.path().join("before/file"), "hello").unwrap();
+
+        let listing = filesystem.open_listing_dir("before").unwrap();
+        std::fs::rename(dir.path().join("before"), dir.path().join("after")).unwrap();
+        std::fs::create_dir(dir.path().join("before")).unwrap();
+
+        assert_eq!(listing.symlink_metadata("file").unwrap().len(), 5);
+
+        let mut content = String::new();
+        listing
+            .open(std::ffi::OsStr::new("file"))
+            .unwrap()
+            .read_to_string(&mut content)
+            .unwrap();
+        assert_eq!(content, "hello");
     }
 }

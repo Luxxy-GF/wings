@@ -1064,7 +1064,7 @@ impl Server {
             LogsState {
                 reader,
                 line_buffer: crate::io::line_buffer::LineBuffer::new(),
-                read_buffer: vec![0; crate::BUFFER_SIZE],
+                read_buffer: crate::io::mem_buffer(crate::BUFFER_SIZE),
                 eof: false,
             },
             |mut state| async move {

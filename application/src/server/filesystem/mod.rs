@@ -313,6 +313,10 @@ impl Filesystem {
         IsIgnoredFn::new(
             move |file_type, path: PathBuf| {
                 let matcher = sync_server.filesystem.disk_ignored.load();
+                if matcher.is_empty() {
+                    return IgnoreVerdict::Keep(path);
+                }
+
                 let match_path = sync_server.filesystem.rematched(&path, file_type);
 
                 Self::judge(&matcher, file_type, match_path, path)
@@ -322,6 +326,10 @@ impl Filesystem {
 
                 async move {
                     let matcher = server.filesystem.disk_ignored.load();
+                    if matcher.is_empty() {
+                        return IgnoreVerdict::Keep(path);
+                    }
+
                     let match_path = server.filesystem.async_rematched(&path, file_type).await;
 
                     Self::judge(&matcher, file_type, match_path, path)
@@ -2086,7 +2094,7 @@ impl Filesystem {
             metadata,
             symlink_destination,
             symlink_destination_metadata,
-            directory_entry: None,
+            parent: None,
         }
     }
 
@@ -2117,7 +2125,7 @@ impl Filesystem {
             metadata,
             symlink_destination,
             symlink_destination_metadata,
-            directory_entry: None,
+            parent: None,
         }
     }
 
@@ -2255,14 +2263,14 @@ pub struct PreparedDirectoryEntry {
     pub metadata: Metadata,
     pub symlink_destination: Option<PathBuf>,
     pub symlink_destination_metadata: Option<Metadata>,
-    directory_entry: Option<cap_std::fs::DirEntry>,
+    parent: Option<Arc<cap::ListingDir>>,
 }
 
 impl PreparedDirectoryEntry {
     fn open(&self, filesystem: &cap::CapFilesystem) -> std::io::Result<std::fs::File> {
-        match &self.directory_entry {
-            Some(entry) => entry.open().map(cap_std::fs::File::into_std),
-            None => filesystem.open(self.symlink_destination.as_ref().unwrap_or(&self.path)),
+        match (&self.parent, self.path.file_name()) {
+            (Some(parent), Some(name)) => parent.open(name),
+            _ => filesystem.open(self.symlink_destination.as_ref().unwrap_or(&self.path)),
         }
     }
 
@@ -2381,7 +2389,7 @@ mod tests {
                     metadata: metadata.clone(),
                     symlink_destination: None,
                     symlink_destination_metadata: None,
-                    directory_entry: None,
+                    parent: None,
                 };
 
                 let (cache, start, opens, release, started, filesystem) =

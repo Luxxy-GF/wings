@@ -117,19 +117,45 @@ mod get {
                 .ok();
         }
 
-        let file_read = match filesystem
-            .async_read_file(&path, ByteRange::from_headers(&headers))
-            .await
-        {
-            Ok(file) => file,
-            Err(_) => {
-                return ApiResponse::error("file not found")
-                    .with_status(StatusCode::NOT_FOUND)
-                    .ok();
-            }
-        };
+        let range = ByteRange::from_headers(&headers);
+        let (mut headers, response) = if filesystem.is_fast() {
+            let file_read =
+                match tokio::task::spawn_blocking(move || filesystem.read_file(&path, range))
+                    .await
+                    .map_err(anyhow::Error::from)?
+                {
+                    Ok(file) => file,
+                    Err(_) => {
+                        return ApiResponse::error("file not found")
+                            .with_status(StatusCode::NOT_FOUND)
+                            .ok();
+                    }
+                };
 
-        let mut headers = file_read.headers();
+            (
+                file_read.headers(),
+                ApiResponse::new_read_stream(file_read.reader, file_read.size),
+            )
+        } else {
+            let file_read = match filesystem.async_read_file(&path, range).await {
+                Ok(file) => file,
+                Err(_) => {
+                    return ApiResponse::error("file not found")
+                        .with_status(StatusCode::NOT_FOUND)
+                        .ok();
+                }
+            };
+            let headers = file_read.headers();
+            let reader =
+                AsyncFixedReader::new_with_fixed_bytes(file_read.reader, file_read.size as usize);
+
+            (
+                headers,
+                ApiResponse::new_stream_with_capacity(reader, crate::FILE_STREAM_BUFFER_SIZE),
+            )
+        };
+        let is_range = headers.contains_key(axum::http::header::CONTENT_RANGE);
+
         headers.insert(
             "Content-Disposition",
             format!(
@@ -153,18 +179,12 @@ mod get {
             headers.insert("Last-Modified", modified.to_rfc2822().parse()?);
         }
 
-        let reader =
-            AsyncFixedReader::new_with_fixed_bytes(file_read.reader, file_read.size as usize);
+        let response = response.with_headers(headers);
 
-        if file_read.reader_range.is_some() {
-            ApiResponse::new_stream_with_capacity(reader, crate::FILE_STREAM_BUFFER_SIZE)
-                .with_headers(headers)
-                .with_status(StatusCode::PARTIAL_CONTENT)
-                .ok()
+        if is_range {
+            response.with_status(StatusCode::PARTIAL_CONTENT).ok()
         } else {
-            ApiResponse::new_stream_with_capacity(reader, crate::FILE_STREAM_BUFFER_SIZE)
-                .with_headers(headers)
-                .ok()
+            response.ok()
         }
     }
 }

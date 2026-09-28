@@ -48,6 +48,10 @@ opt-level = 3
 [profile.release.package.zstd-sys]
 opt-level = 3
 
+# flate2 takes its gzip crc32 from zlib-rs, which runs at half speed when built for size
+[profile.release.package.zlib-rs]
+opt-level = 3
+
 [profile.release]
 opt-level = "s"
 lto = "fat"

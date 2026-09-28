@@ -2,25 +2,41 @@ use super::State;
 use utoipa_axum::{router::OpenApiRouter, routes};
 
 mod get {
-    use std::{io::Read, path::Path};
-
     use crate::{
-        io::{compression::reader::AsyncCompressionReader, fixed_reader::AsyncFixedReader},
+        io::{
+            SafeSliceExt,
+            compression::reader::AsyncCompressionReader,
+            fixed_reader::AsyncFixedReader,
+            read_stream::{ReadStream, read_chunk},
+        },
         response::{ApiErrorExt, ApiResponse, ApiResponseResult},
         routes::{ApiError, api::servers::_server_::GetServer},
+        server::filesystem::virtualfs::{
+            AsyncReadableFileStream, FileMetadata, ReadableFileStream,
+        },
     };
     use axum::http::{HeaderMap, StatusCode};
     use axum_extra::extract::Query;
+    use futures::StreamExt;
     use serde::Deserialize;
+    use std::{io::Read, path::Path};
     use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
     use utoipa::ToSchema;
 
     const INLINE_READ_LIMIT: u64 = 4 * crate::BUFFER_SIZE as u64;
+    const DETECT_HEADER_SIZE: usize = 8 * 1024;
 
     enum FileHead {
         Missing,
-        Inline(crate::server::filesystem::virtualfs::FileMetadata, Vec<u8>),
-        Stream(crate::server::filesystem::virtualfs::FileMetadata),
+        TooLarge,
+        Inline(FileMetadata, Vec<u8>),
+        Stream(FileMetadata, ReadableFileStream, Vec<u8>),
+        AsyncStream(FileMetadata),
+    }
+
+    enum StreamSource {
+        Blocking(ReadableFileStream, Vec<u8>),
+        Async(BufReader<AsyncReadableFileStream>),
     }
 
     #[derive(ToSchema, Deserialize)]
@@ -95,32 +111,48 @@ mod get {
         let path = root.join(file_name);
 
         let head = {
-            let filesystem = filesystem.clone();
             let path = path.clone();
             let max_size = data.max_size;
 
-            tokio::task::spawn_blocking(move || -> Result<FileHead, anyhow::Error> {
-                let metadata = match filesystem.metadata(&path) {
-                    Ok(metadata) if metadata.file_type.is_file() => metadata,
-                    _ => return Ok(FileHead::Missing),
-                };
+            tokio::task::spawn_blocking({
+                let filesystem = filesystem.clone();
 
-                if max_size.is_some_and(|s| metadata.size > s) || metadata.size > INLINE_READ_LIMIT
-                {
-                    return Ok(FileHead::Stream(metadata));
+                move || -> Result<FileHead, anyhow::Error> {
+                    let metadata = match filesystem.metadata(&path) {
+                        Ok(metadata) if metadata.file_type.is_file() => metadata,
+                        _ => return Ok(FileHead::Missing),
+                    };
+
+                    if max_size.is_some_and(|s| metadata.size > s) {
+                        return Ok(FileHead::TooLarge);
+                    }
+
+                    if metadata.size > INLINE_READ_LIMIT && !filesystem.is_fast() {
+                        return Ok(FileHead::AsyncStream(metadata));
+                    }
+
+                    let mut file_read = filesystem.read_file(&path, None)?;
+
+                    if metadata.size > INLINE_READ_LIMIT {
+                        let first = read_chunk(
+                            &mut file_read.reader,
+                            metadata.size.min(crate::FILE_STREAM_BUFFER_SIZE as u64) as usize,
+                        )?;
+
+                        return Ok(FileHead::Stream(metadata, file_read.reader, first));
+                    }
+
+                    let mut buffer = Vec::with_capacity(file_read.size as usize);
+                    file_read.reader.read_to_end(&mut buffer)?;
+
+                    Ok(FileHead::Inline(metadata, buffer))
                 }
-
-                let mut file_read = filesystem.read_file(&path, None)?;
-                let mut buffer = Vec::with_capacity(file_read.size as usize);
-                file_read.reader.read_to_end(&mut buffer)?;
-
-                Ok(FileHead::Inline(metadata, buffer))
             })
             .await
             .map_err(anyhow::Error::from)??
         };
 
-        let metadata = match head {
+        let (metadata, source) = match head {
             FileHead::Missing => {
                 return ApiResponse::error("file not found")
                     .with_status(StatusCode::NOT_FOUND)
@@ -175,21 +207,31 @@ mod get {
 
                 return ApiResponse::new_stream(reader).with_headers(headers).ok();
             }
-            FileHead::Stream(metadata) => metadata,
+            FileHead::TooLarge => {
+                return ApiResponse::error("file size exceeds maximum allowed size")
+                    .with_status(StatusCode::PAYLOAD_TOO_LARGE)
+                    .ok();
+            }
+            FileHead::Stream(metadata, reader, first) => {
+                (metadata, StreamSource::Blocking(reader, first))
+            }
+            FileHead::AsyncStream(metadata) => {
+                let file_read = filesystem.async_read_file(&path, None).await?;
+                let mut reader = BufReader::new(file_read.reader);
+                reader.fill_buf().await?;
+
+                (metadata, StreamSource::Async(reader))
+            }
         };
 
-        if data.max_size.is_some_and(|s| metadata.size > s) {
-            return ApiResponse::error("file size exceeds maximum allowed size")
-                .with_status(StatusCode::PAYLOAD_TOO_LARGE)
-                .ok();
-        }
-
-        let file_read = filesystem.async_read_file(&path, None).await?;
-        let mut reader = BufReader::new(file_read.reader);
-
-        let header = reader.fill_buf().await?;
+        let header = match &source {
+            StreamSource::Blocking(_, first) => {
+                first.get_slice(..first.len().min(DETECT_HEADER_SIZE))?
+            }
+            StreamSource::Async(reader) => reader.buffer(),
+        };
         let (compression_type, archive_type) =
-            crate::server::filesystem::archive::Archive::detect(path, header);
+            crate::server::filesystem::archive::Archive::detect(&path, header);
         if !matches!(
             archive_type,
             crate::server::filesystem::archive::ArchiveType::None
@@ -199,16 +241,7 @@ mod get {
                 .ok();
         }
 
-        let reader = AsyncCompressionReader::new_with_async_reader(reader, compression_type);
-
         let mut headers = HeaderMap::new();
-
-        if matches!(
-            compression_type,
-            crate::io::compression::CompressionType::None
-        ) {
-            headers.insert("Content-Length", metadata.size.into());
-        }
 
         if data.download {
             headers.insert(
@@ -222,18 +255,41 @@ mod get {
             headers.insert("Content-Type", "application/octet-stream".parse()?);
         }
 
-        let reader: Box<dyn tokio::io::AsyncRead + Unpin + Send> = if matches!(
+        let uncompressed = matches!(
             compression_type,
             crate::io::compression::CompressionType::None
-        ) {
-            Box::new(AsyncFixedReader::new_with_fixed_bytes(
+        );
+        if uncompressed {
+            headers.insert("Content-Length", metadata.size.into());
+        }
+
+        let reader: Box<dyn tokio::io::AsyncRead + Unpin + Send> = match source {
+            StreamSource::Blocking(reader, first) if uncompressed => {
+                let remaining = metadata.size - first.len() as u64;
+                let body =
+                    futures::stream::once(std::future::ready(Ok(bytes::Bytes::from(first)))).chain(
+                        ReadStream::new(reader, remaining, crate::FILE_STREAM_BUFFER_SIZE),
+                    );
+
+                return ApiResponse::new(axum::body::Body::from_stream(body))
+                    .with_headers(headers)
+                    .ok();
+            }
+            StreamSource::Async(reader) if uncompressed => Box::new(
+                AsyncFixedReader::new_with_fixed_bytes(reader, metadata.size as usize),
+            ),
+            StreamSource::Blocking(reader, first) => Box::new(AsyncCompressionReader::new(
+                Read::chain(std::io::Cursor::new(first), reader),
+                compression_type,
+            )),
+            StreamSource::Async(reader) => Box::new(AsyncCompressionReader::new_with_async_reader(
                 reader,
-                metadata.size as usize,
-            ))
-        } else if let Some(max_size) = data.max_size {
-            Box::new(reader.take(max_size))
-        } else {
-            Box::new(reader)
+                compression_type,
+            )),
+        };
+        let reader: Box<dyn tokio::io::AsyncRead + Unpin + Send> = match data.max_size {
+            Some(max_size) if !uncompressed => Box::new(reader.take(max_size)),
+            _ => reader,
         };
 
         ApiResponse::new_stream_with_capacity(reader, crate::FILE_STREAM_BUFFER_SIZE)

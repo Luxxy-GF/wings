@@ -110,6 +110,64 @@ impl AsyncReadDir {
     }
 }
 
+/// A directory opened once for a listing
+pub struct ListingDir(pub(super) cap_std::fs::Dir);
+
+impl ListingDir {
+    /// Visits every entry except `.` and `..` in enumeration order. Like the
+    /// cap-std iterator the listing used before, an enumeration error ends the walk.
+    pub fn for_each_entry<E: From<std::io::Error>>(
+        &self,
+        mut visit: impl FnMut(FileType, String) -> Result<(), E>,
+    ) -> Result<(), E> {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::AsFd;
+
+            let mut buffer = vec![std::mem::MaybeUninit::<u8>::uninit(); 32 * 1024];
+            let mut entries = rustix::fs::RawDir::new(self.0.as_fd(), &mut buffer);
+
+            while let Some(entry) = entries.next() {
+                let Ok(entry) = entry else { break };
+                let name = entry.file_name().to_bytes();
+                if name == b"." || name == b".." {
+                    continue;
+                }
+
+                let name = String::from_utf8_lossy(name).into_owned();
+                let file_type = match entry.file_type() {
+                    rustix::fs::FileType::RegularFile => FileType::File,
+                    rustix::fs::FileType::Directory => FileType::Dir,
+                    rustix::fs::FileType::Symlink => FileType::Symlink,
+                    _ => FileType::Unknown,
+                };
+
+                visit(file_type, name)?;
+            }
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        for entry in self.0.entries()? {
+            let Ok(entry) = entry else { break };
+            let (file_type, name) = name_and_type(&entry);
+
+            visit(file_type, name)?;
+        }
+
+        Ok(())
+    }
+
+    #[inline]
+    pub fn symlink_metadata(&self, name: &str) -> Result<cap_std::fs::Metadata, std::io::Error> {
+        self.0.symlink_metadata(name)
+    }
+
+    #[inline]
+    pub fn open(&self, name: &std::ffi::OsStr) -> Result<std::fs::File, std::io::Error> {
+        Ok(self.0.open(name)?.into_std())
+    }
+}
+
 pub struct ReadDir(pub cap_std::fs::ReadDir);
 
 impl ReadDir {

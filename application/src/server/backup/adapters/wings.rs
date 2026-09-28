@@ -294,7 +294,7 @@ impl BackupStreamCreateExt for WingsBackup {
 
         let mut checksum_writer = sha2::Sha256::new();
         let mut file = tokio::fs::File::open(&file_name).await?;
-        let mut buffer = vec![0; crate::BUFFER_SIZE];
+        let mut buffer = crate::io::mem_buffer(crate::BUFFER_SIZE);
 
         loop {
             match file.read(&mut buffer).await? {
@@ -552,7 +552,7 @@ impl BackupCreateExt for WingsBackup {
 
         let mut checksum_writer = sha2::Sha256::new();
         let mut file = tokio::fs::File::open(&file_name).await?;
-        let mut buffer = vec![0; crate::BUFFER_SIZE];
+        let mut buffer = crate::io::mem_buffer(crate::BUFFER_SIZE);
 
         loop {
             match file.read(&mut buffer).await? {
@@ -716,7 +716,7 @@ impl BackupExt for WingsBackup {
                     let mut directory_entries = Vec::new();
                     let entries = archive.entries()?;
 
-                    let mut read_buffer = vec![0; crate::BUFFER_SIZE];
+                    let mut read_buffer = crate::io::mem_buffer(crate::BUFFER_SIZE);
                     for entry in entries {
                         let mut entry = entry?;
                         let path = server.filesystem.relative_path(&entry.path()?);
@@ -852,7 +852,7 @@ impl BackupExt for WingsBackup {
                             let server = server.clone();
 
                             let mut run = move || -> Result<(), anyhow::Error> {
-                                let mut read_buffer = vec![0; crate::BUFFER_SIZE];
+                                let mut read_buffer = crate::io::mem_buffer(crate::BUFFER_SIZE);
 
                                 loop {
                                     if error_clone2.stopped() {
@@ -1019,7 +1019,7 @@ impl BackupExt for WingsBackup {
                                     &mut reader,
                                 );
 
-                                let mut read_buffer = vec![0; crate::BUFFER_SIZE];
+                                let mut read_buffer = crate::io::mem_buffer(crate::BUFFER_SIZE);
                                 if let Err(err) = folder.for_each_entries(&mut |entry, reader| {
                                     let path = entry.name();
                                     if path.starts_with('/') || path.starts_with('\\') {

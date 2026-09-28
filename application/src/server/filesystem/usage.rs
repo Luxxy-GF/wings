@@ -284,7 +284,7 @@ impl DiskUsage {
         }
     }
 
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(level = "trace", skip(self))]
     pub fn update_size_iterator(
         &mut self,
         path: impl IntoIterator<Item = impl AsRef<str> + Debug> + Debug,
@@ -322,7 +322,7 @@ impl DiskUsage {
         }
     }
 
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(level = "trace", skip(self))]
     pub fn remove_path(&mut self, path: &Path) -> Option<DiskUsage> {
         if crate::unlikely(path == Path::new("") || path == Path::new("/")) {
             return None;

@@ -71,7 +71,7 @@ pub async fn handle_ws(
                     let socket = Arc::clone(&socket);
 
                     async move {
-                        let mut buf = vec![0; crate::BUFFER_SIZE];
+                        let mut buf = crate::io::mem_buffer(crate::BUFFER_SIZE);
                         let mut line_buffer = LineBuffer::new();
 
                         if !matches!(compression_type, CompressionType::None) {

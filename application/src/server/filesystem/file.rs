@@ -23,6 +23,18 @@ pub struct ServerFile {
     highest_position: u64,
 }
 
+#[cfg(unix)]
+fn has_mode(metadata: &std::fs::Metadata, permissions: PortablePermissions) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+
+    metadata.permissions().mode() & 0o7777 == u32::from(permissions.mode())
+}
+
+#[cfg(not(unix))]
+fn has_mode(_metadata: &std::fs::Metadata, _permissions: PortablePermissions) -> bool {
+    false
+}
+
 fn open_destination(
     server: &crate::server::Server,
     destination: &Path,
@@ -30,18 +42,26 @@ fn open_destination(
 ) -> Result<(std::fs::File, u64), anyhow::Error> {
     let mut options = cap_std::fs::OpenOptions::new();
     options.write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    if let Some(permissions) = permissions {
+        cap_std::fs::OpenOptionsExt::mode(&mut options, permissions.mode().into());
+    }
 
     let file = server.filesystem.open_with(destination, options)?;
-    let previous_size = file
-        .metadata()
-        .ok()
+    let metadata = file.metadata().ok();
+    let previous_size = metadata
+        .as_ref()
         .filter(|metadata| metadata.is_file())
         .map_or(0, |metadata| metadata.len());
     if previous_size > 0 {
         file.set_len(0)?;
     }
 
-    if let Some(permissions) = permissions {
+    if let Some(permissions) = permissions
+        && !metadata
+            .as_ref()
+            .is_some_and(|metadata| has_mode(metadata, permissions))
+    {
         file.apply_permissions(permissions)?;
     }
 

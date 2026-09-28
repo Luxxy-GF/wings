@@ -58,6 +58,7 @@ mod post {
         };
 
         let mut deleted_count = 0;
+        let mut failed_count = 0;
         for file in data.files {
             let (source, filesystem) = server
                 .filesystem
@@ -72,7 +73,7 @@ mod post {
                 Err(_) => continue,
             };
 
-            if if filesystem.is_primary_server_fs() {
+            let result = if filesystem.is_primary_server_fs() {
                 if metadata.file_type.is_file() {
                     let path = server.filesystem.diff_key(&source).await;
 
@@ -81,14 +82,35 @@ mod post {
                     }
                 }
 
-                server.filesystem.truncate_path(&source).await.is_ok()
+                server.filesystem.truncate_path(&source).await
             } else if metadata.file_type.is_dir() {
-                filesystem.async_remove_dir_all(&source).await.is_ok()
+                filesystem.async_remove_dir_all(&source).await
             } else {
-                filesystem.async_remove_file(&source).await.is_ok()
-            } {
-                deleted_count += 1;
+                filesystem.async_remove_file(&source).await
+            };
+
+            match result {
+                Ok(()) => deleted_count += 1,
+                Err(err) => {
+                    tracing::error!(
+                        server = %server.uuid,
+                        path = %source.display(),
+                        "failed to delete file: {:#?}",
+                        err,
+                    );
+
+                    failed_count += 1;
+                }
             }
+        }
+
+        if failed_count > 0 {
+            return ApiResponse::error(&format!(
+                "failed to delete {failed_count} file{}",
+                if failed_count == 1 { "" } else { "s" }
+            ))
+            .with_status(StatusCode::EXPECTATION_FAILED)
+            .ok();
         }
 
         ApiResponse::new_serialized(Response {

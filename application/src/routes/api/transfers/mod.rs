@@ -230,7 +230,7 @@ mod post {
                                     let mut last_parent = None;
                                     let entries = archive.entries();
 
-                                    let mut read_buffer = vec![0; crate::TRANSFER_BUFFER_SIZE];
+                                    let mut read_buffer = crate::io::mem_buffer(crate::TRANSFER_BUFFER_SIZE);
                                     for entry in entries {
                                         let mut entry = entry?;
                                         let destination_path = entry.enclosed_path();
@@ -366,7 +366,7 @@ mod post {
                                     let mut last_parent = None;
                                     let entries = archive.entries()?;
 
-                                    let mut read_buffer = vec![0; crate::TRANSFER_BUFFER_SIZE];
+                                    let mut read_buffer = crate::io::mem_buffer(crate::TRANSFER_BUFFER_SIZE);
                                     for entry in entries {
                                         let mut entry = entry?;
                                         let path = server.filesystem.relative_path(&entry.path()?);

@@ -26,7 +26,7 @@ pub async fn async_tail<R: AsyncRead + AsyncSeek + Unpin>(
 
     let mut current_pos = file_size;
     let mut lines_found = 0;
-    let mut buf = vec![0; crate::BUFFER_SIZE];
+    let mut buf = crate::io::mem_buffer(crate::BUFFER_SIZE);
 
     while current_pos > 0 {
         let read_size = std::cmp::min(crate::BUFFER_SIZE as u64, current_pos);

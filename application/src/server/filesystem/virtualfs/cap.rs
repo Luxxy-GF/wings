@@ -1,8 +1,8 @@
 use super::{
     AsyncDirectoryStreamWalk, AsyncDirectoryWalk, AsyncFileRead, AsyncReadableFileStream,
-    AsyncWritableSeekableFileStream, ByteRange, DirectoryListing, DirectoryWalkFilterFn,
-    DirectoryWalkFn, FileMetadata, FileRead, FileType, IsIgnoredFn, VirtualWalkEntry,
-    WritableSeekableFileStream,
+    AsyncWritableSeekableFileStream, ByteRange, CheckedDirectoryListing, DirectoryListing,
+    DirectoryWalkFilterFn, DirectoryWalkFn, FileMetadata, FileRead, FileType, IsIgnoredFn,
+    VirtualWalkEntry, WritableSeekableFileStream, read_dir_checked,
 };
 use crate::{
     io::{abort::AbortListener, compression::CompressionLevel},
@@ -10,7 +10,7 @@ use crate::{
     server::filesystem::{
         DirectoryEntryOptions, PreparedDirectoryEntry,
         archive::StreamableArchiveFormat,
-        cap::name_and_type,
+        cap::ListingDir,
         listing::{ListingWork, check_aborted},
         virtualfs::{
             AsyncReadableWritableSeekableFileStream, DirectoryWalk,
@@ -59,7 +59,7 @@ fn sort_window<T>(items: &mut [T], window: Range<usize>, cmp: impl Fn(&T, &T) ->
 
 struct StattedDirectoryEntry {
     path: PathBuf,
-    entry: Option<cap_std::fs::DirEntry>,
+    parent: Option<Arc<ListingDir>>,
     metadata: cap_std::fs::Metadata,
 }
 
@@ -90,11 +90,12 @@ impl Drop for ModifiedOnClose {
     }
 }
 
-enum ListingResult<T> {
+enum ListingResult<T, D = ()> {
     Complete(DirectoryListing),
     Pending {
         total_entries: usize,
         entries: Vec<T>,
+        dir: D,
     },
 }
 
@@ -215,27 +216,34 @@ impl VirtualCapFilesystem {
 
     fn stat_directory_entry(
         &self,
-        path: PathBuf,
-        entry: cap_std::fs::DirEntry,
+        dir: &Arc<ListingDir>,
+        directory: &Path,
+        name: String,
     ) -> Result<StattedDirectoryEntry, anyhow::Error> {
-        let entry = if !cfg!(windows) && path.file_name() == Some(entry.file_name().as_os_str()) {
-            Some(entry)
-        } else {
-            None
-        };
+        let mut path = PathBuf::with_capacity(directory.as_os_str().len() + name.len() + 1);
+        path.push(directory);
+        path.push(&name);
 
-        let metadata = match &entry {
-            Some(entry) => entry.metadata()?,
-            None => self.inner.symlink_metadata(&path)?,
-        };
+        if cfg!(windows) {
+            let metadata = self.inner.symlink_metadata(&path)?;
+
+            return Ok(StattedDirectoryEntry {
+                path,
+                parent: None,
+                metadata,
+            });
+        }
+
+        let metadata = dir.symlink_metadata(&name)?;
 
         Ok(StattedDirectoryEntry {
             path,
-            entry,
+            parent: metadata.is_file().then(|| Arc::clone(dir)),
             metadata,
         })
     }
 
+    #[cfg(test)]
     fn prepare_statted_directory_entry(
         &self,
         statted: StattedDirectoryEntry,
@@ -243,19 +251,9 @@ impl VirtualCapFilesystem {
         let checked_path =
             self.check_ignored(statted.metadata.file_type().into(), &statted.path)?;
 
-        Ok(self.prepare_filtered_statted_directory_entry(statted, checked_path))
-    }
-
-    /// For entries the listing scan loop already passed through the merged ignore
-    /// filter, so the per-entry path resolution does not run a second time.
-    fn prepare_filtered_statted_directory_entry(
-        &self,
-        statted: StattedDirectoryEntry,
-        checked_path: PathBuf,
-    ) -> PreparedDirectoryEntry {
         let StattedDirectoryEntry {
             path,
-            entry,
+            parent,
             metadata,
         } = statted;
 
@@ -266,18 +264,48 @@ impl VirtualCapFilesystem {
         );
 
         if prepared.metadata.is_file() && prepared.path == path {
-            prepared.directory_entry = entry;
+            prepared.parent = parent;
+        }
+
+        Ok(prepared)
+    }
+
+    /// For entries the listing scan loop already passed through the merged ignore
+    /// filter, keeping the path they were listed under.
+    fn prepare_listed_directory_entry(
+        &self,
+        statted: StattedDirectoryEntry,
+    ) -> PreparedDirectoryEntry {
+        let StattedDirectoryEntry {
+            path,
+            parent,
+            metadata,
+        } = statted;
+
+        let mut prepared =
+            self.server
+                .filesystem
+                .prepare_api_entry_cap_blocking(&self.inner, path, metadata);
+
+        if prepared.metadata.is_file() {
+            prepared.parent = parent;
         }
 
         prepared
     }
 
+    #[cfg(test)]
     fn prepare_directory_entry(
         &self,
-        path: PathBuf,
-        entry: cap_std::fs::DirEntry,
+        dir: &Arc<ListingDir>,
+        directory: &Path,
+        name: &str,
     ) -> Result<PreparedDirectoryEntry, anyhow::Error> {
-        self.prepare_statted_directory_entry(self.stat_directory_entry(path, entry)?)
+        self.prepare_statted_directory_entry(self.stat_directory_entry(
+            dir,
+            directory,
+            name.to_string(),
+        )?)
     }
 
     fn select_prepared_entries(
@@ -377,12 +405,230 @@ impl VirtualCapFilesystem {
             return Ok(ListingResult::Pending {
                 total_entries,
                 entries: prepared,
+                dir: (),
             });
         }
 
         Ok(ListingResult::Complete(DirectoryListing {
             total_entries,
             entries: self.finish_prepared_entries(prepared, listener)?,
+        }))
+    }
+
+    /// With `checked`, a directory that cannot be opened or is not reachable
+    /// yields `None` instead of an error, so the caller can classify it the way
+    /// [`read_dir_checked`] does.
+    async fn read_dir(
+        &self,
+        path: &Path,
+        per_page: Option<usize>,
+        page: usize,
+        is_ignored: IsIgnoredFn,
+        sort: crate::models::DirectorySortingMode,
+        checked: bool,
+    ) -> Result<Option<DirectoryListing>, anyhow::Error> {
+        let path = self.inner.relative_path(path);
+        let is_ignored = match &self.is_ignored {
+            Some(existing) => existing.clone().merge(is_ignored),
+            None => is_ignored,
+        };
+        let work = Arc::clone(&self.server.filesystem.app_state.listing_work);
+
+        let initial = work
+            .run({
+                let this = self.clone();
+                let path = path.clone();
+
+                move |listener| {
+                    use crate::models::DirectorySortingMode::*;
+
+                    let mut directory_entries = Vec::new();
+                    let mut other_entries = Vec::new();
+                    let mut scratch = PathBuf::new();
+                    let dir = match this.inner.open_listing_dir(&path) {
+                        Ok(dir) => Arc::new(dir),
+                        Err(_) if checked => return Ok(None),
+                        Err(err) => return Err(err.into()),
+                    };
+                    if checked && this.check_reachable(FileType::Dir, &path).is_err() {
+                        return Ok(None);
+                    }
+
+                    dir.for_each_entry(|file_type, name| -> Result<(), anyhow::Error> {
+                        check_aborted(listener)?;
+
+                        scratch.clear();
+                        scratch.push(&path);
+                        scratch.push(&name);
+                        match is_ignored(file_type, std::mem::take(&mut scratch))
+                            .reachable(file_type)
+                        {
+                            Some(kept) => scratch = kept,
+                            None => return Ok(()),
+                        }
+
+                        if file_type.is_dir() {
+                            directory_entries.push(name);
+                        } else {
+                            other_entries.push(name);
+                        }
+
+                        Ok(())
+                    })?;
+
+                    check_aborted(listener)?;
+
+                    let total_entries = directory_entries.len() + other_entries.len();
+                    let (directory_window, other_window) = if matches!(sort, NameAsc | NameDesc) {
+                        let descending = matches!(sort, NameDesc);
+                        let cmp = |a: &String, b: &String| {
+                            let ordering = a.cmp_ascii_case_insensitive(b).then_with(|| a.cmp(b));
+                            if descending {
+                                ordering.reverse()
+                            } else {
+                                ordering
+                            }
+                        };
+
+                        let start = per_page.map_or(0, |per_page| {
+                            page.saturating_sub(1).saturating_mul(per_page)
+                        });
+                        let end =
+                            per_page.map_or(usize::MAX, |per_page| start.saturating_add(per_page));
+
+                        let directory_window = group_window(start, end, directory_entries.len());
+                        if let Some(window) = directory_window.clone() {
+                            sort_window(&mut directory_entries, window, cmp);
+                        }
+
+                        let other_window = group_window(
+                            start.saturating_sub(directory_entries.len()),
+                            end.saturating_sub(directory_entries.len()),
+                            other_entries.len(),
+                        );
+                        if let Some(window) = other_window.clone() {
+                            sort_window(&mut other_entries, window, cmp);
+                        }
+
+                        (
+                            directory_window.unwrap_or(0..0),
+                            other_window.unwrap_or(0..0),
+                        )
+                    } else {
+                        (0..directory_entries.len(), 0..other_entries.len())
+                    };
+
+                    let candidates: Vec<_> = directory_entries
+                        .into_iter()
+                        .skip(directory_window.start)
+                        .take(directory_window.len())
+                        .map(|name| (true, name))
+                        .chain(
+                            other_entries
+                                .into_iter()
+                                .skip(other_window.start)
+                                .take(other_window.len())
+                                .map(|name| (false, name)),
+                        )
+                        .collect();
+
+                    if candidates.len() > ListingWork::SMALL_LIMIT {
+                        return Ok(Some(ListingResult::Pending {
+                            total_entries,
+                            entries: candidates,
+                            dir,
+                        }));
+                    }
+
+                    let mut prepared = Vec::with_capacity(candidates.len());
+                    for (directory, name) in candidates {
+                        check_aborted(listener)?;
+
+                        if let Ok(statted) = this.stat_directory_entry(&dir, &path, name) {
+                            prepared
+                                .push((directory, this.prepare_listed_directory_entry(statted)));
+                        }
+                    }
+
+                    let prepared =
+                        this.select_prepared_entries(prepared, sort, per_page, page, listener)?;
+
+                    Ok(Some(ListingResult::Complete(DirectoryListing {
+                        total_entries,
+                        entries: this.finish_prepared_entries(prepared, listener)?,
+                    })))
+                }
+            })
+            .await?;
+
+        let Some(initial) = initial else {
+            return Ok(None);
+        };
+        let (total_entries, candidates, dir) = match initial {
+            ListingResult::Complete(listing) => return Ok(Some(listing)),
+            ListingResult::Pending {
+                total_entries,
+                entries,
+                dir,
+            } => (total_entries, entries, dir),
+        };
+
+        let statted = work
+            .map_ordered(candidates, {
+                let this = self.clone();
+
+                move |(directory, name)| (directory, this.stat_directory_entry(&dir, &path, name))
+            })
+            .await?;
+
+        let selected = work
+            .run({
+                let this = self.clone();
+
+                move |listener| {
+                    let mut prepared = Vec::with_capacity(statted.len());
+
+                    for (directory, statted) in statted {
+                        check_aborted(listener)?;
+
+                        let Ok(statted) = statted else { continue };
+                        prepared.push((directory, this.prepare_listed_directory_entry(statted)));
+                    }
+
+                    let prepared =
+                        this.select_prepared_entries(prepared, sort, per_page, page, listener)?;
+                    this.finish_small_listing(total_entries, prepared, listener)
+                }
+            })
+            .await?;
+
+        let (total_entries, selected) = match selected {
+            ListingResult::Complete(listing) => return Ok(Some(listing)),
+            ListingResult::Pending {
+                total_entries,
+                entries,
+                ..
+            } => (total_entries, entries),
+        };
+
+        let entries = work
+            .map_ordered(selected, {
+                let this = self.clone();
+                let options = DirectoryEntryOptions::server_fs(this.is_primary_server_fs);
+
+                move |prepared| {
+                    this.server.filesystem.finish_api_entry_cap_blocking(
+                        &this.inner,
+                        prepared,
+                        options,
+                    )
+                }
+            })
+            .await?;
+
+        Ok(Some(DirectoryListing {
+            total_entries,
+            entries,
         }))
     }
 }
@@ -527,212 +773,39 @@ impl super::VirtualReadableFilesystem for VirtualCapFilesystem {
         is_ignored: IsIgnoredFn,
         sort: crate::models::DirectorySortingMode,
     ) -> Result<DirectoryListing, anyhow::Error> {
-        let path = self.inner.relative_path(path.as_ref());
-        let is_ignored = match &self.is_ignored {
-            Some(existing) => existing.clone().merge(is_ignored),
-            None => is_ignored,
-        };
-        let work = Arc::clone(&self.server.filesystem.app_state.listing_work);
+        self.read_dir(path.as_ref(), per_page, page, is_ignored, sort, false)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("directory could not be listed"))
+    }
 
-        let initial = work
-            .run({
-                let this = self.clone();
-                let path = path.clone();
+    async fn async_read_dir_checked(
+        &self,
+        path: &(dyn AsRef<Path> + Send + Sync),
+        per_page: Option<usize>,
+        page: usize,
+        is_ignored: IsIgnoredFn,
+        sort: crate::models::DirectorySortingMode,
+    ) -> Result<CheckedDirectoryListing, anyhow::Error> {
+        if !self
+            .inner
+            .relative_path_cow(path.as_ref())
+            .as_os_str()
+            .is_empty()
+            && let Some(listing) = self
+                .read_dir(
+                    path.as_ref(),
+                    per_page,
+                    page,
+                    is_ignored.clone(),
+                    sort,
+                    true,
+                )
+                .await?
+        {
+            return Ok(CheckedDirectoryListing::Listing(listing));
+        }
 
-                move |listener| {
-                    use crate::models::DirectorySortingMode::*;
-
-                    let mut directory_entries = Vec::new();
-                    let mut other_entries = Vec::new();
-                    let mut scratch = PathBuf::new();
-                    let mut dir = this.inner.read_dir(&path)?;
-
-                    while let Some(item) = dir.next() {
-                        check_aborted(listener)?;
-
-                        let Ok(entry) = item else { break };
-                        let (file_type, name) = name_and_type(&entry);
-
-                        scratch.clear();
-                        scratch.push(&path);
-                        scratch.push(&name);
-                        match is_ignored(file_type, std::mem::take(&mut scratch))
-                            .reachable(file_type)
-                        {
-                            Some(kept) => scratch = kept,
-                            None => continue,
-                        }
-
-                        if file_type.is_dir() {
-                            directory_entries.push((name, entry));
-                        } else {
-                            other_entries.push((name, entry));
-                        }
-                    }
-
-                    check_aborted(listener)?;
-
-                    let total_entries = directory_entries.len() + other_entries.len();
-                    let (directory_window, other_window) = if matches!(sort, NameAsc | NameDesc) {
-                        let descending = matches!(sort, NameDesc);
-                        let cmp =
-                            |(a, _): &(String, cap_std::fs::DirEntry),
-                             (b, _): &(String, cap_std::fs::DirEntry)| {
-                                let ordering =
-                                    a.cmp_ascii_case_insensitive(b).then_with(|| a.cmp(b));
-                                if descending {
-                                    ordering.reverse()
-                                } else {
-                                    ordering
-                                }
-                            };
-
-                        let start = per_page.map_or(0, |per_page| {
-                            page.saturating_sub(1).saturating_mul(per_page)
-                        });
-                        let end =
-                            per_page.map_or(usize::MAX, |per_page| start.saturating_add(per_page));
-
-                        let directory_window = group_window(start, end, directory_entries.len());
-                        if let Some(window) = directory_window.clone() {
-                            sort_window(&mut directory_entries, window, cmp);
-                        }
-
-                        let other_window = group_window(
-                            start.saturating_sub(directory_entries.len()),
-                            end.saturating_sub(directory_entries.len()),
-                            other_entries.len(),
-                        );
-                        if let Some(window) = other_window.clone() {
-                            sort_window(&mut other_entries, window, cmp);
-                        }
-
-                        (
-                            directory_window.unwrap_or(0..0),
-                            other_window.unwrap_or(0..0),
-                        )
-                    } else {
-                        (0..directory_entries.len(), 0..other_entries.len())
-                    };
-
-                    let candidates: Vec<_> = directory_entries
-                        .into_iter()
-                        .skip(directory_window.start)
-                        .take(directory_window.len())
-                        .map(|(name, entry)| (true, name, entry))
-                        .chain(
-                            other_entries
-                                .into_iter()
-                                .skip(other_window.start)
-                                .take(other_window.len())
-                                .map(|(name, entry)| (false, name, entry)),
-                        )
-                        .collect();
-
-                    if candidates.len() > ListingWork::SMALL_LIMIT {
-                        return Ok(ListingResult::Pending {
-                            total_entries,
-                            entries: candidates,
-                        });
-                    }
-
-                    let mut prepared = Vec::with_capacity(candidates.len());
-                    for (directory, name, entry) in candidates {
-                        check_aborted(listener)?;
-
-                        if let Ok(statted) = this.stat_directory_entry(path.join(name), entry) {
-                            let checked_path = statted.path.clone();
-                            prepared.push((
-                                directory,
-                                this.prepare_filtered_statted_directory_entry(
-                                    statted,
-                                    checked_path,
-                                ),
-                            ));
-                        }
-                    }
-
-                    let prepared =
-                        this.select_prepared_entries(prepared, sort, per_page, page, listener)?;
-
-                    Ok(ListingResult::Complete(DirectoryListing {
-                        total_entries,
-                        entries: this.finish_prepared_entries(prepared, listener)?,
-                    }))
-                }
-            })
-            .await?;
-
-        let (total_entries, candidates) = match initial {
-            ListingResult::Complete(listing) => return Ok(listing),
-            ListingResult::Pending {
-                total_entries,
-                entries,
-            } => (total_entries, entries),
-        };
-
-        let statted = work
-            .map_ordered(candidates, {
-                let this = self.clone();
-
-                move |(directory, name, entry)| {
-                    (directory, this.stat_directory_entry(path.join(name), entry))
-                }
-            })
-            .await?;
-
-        let selected = work
-            .run({
-                let this = self.clone();
-
-                move |listener| {
-                    let mut prepared = Vec::with_capacity(statted.len());
-
-                    for (directory, statted) in statted {
-                        check_aborted(listener)?;
-
-                        let Ok(statted) = statted else { continue };
-                        let checked_path = statted.path.clone();
-                        prepared.push((
-                            directory,
-                            this.prepare_filtered_statted_directory_entry(statted, checked_path),
-                        ));
-                    }
-
-                    let prepared =
-                        this.select_prepared_entries(prepared, sort, per_page, page, listener)?;
-                    this.finish_small_listing(total_entries, prepared, listener)
-                }
-            })
-            .await?;
-
-        let (total_entries, selected) = match selected {
-            ListingResult::Complete(listing) => return Ok(listing),
-            ListingResult::Pending {
-                total_entries,
-                entries,
-            } => (total_entries, entries),
-        };
-
-        let entries = work
-            .map_ordered(selected, {
-                let this = self.clone();
-                let options = DirectoryEntryOptions::server_fs(this.is_primary_server_fs);
-
-                move |prepared| {
-                    this.server.filesystem.finish_api_entry_cap_blocking(
-                        &this.inner,
-                        prepared,
-                        options,
-                    )
-                }
-            })
-            .await?;
-
-        Ok(DirectoryListing {
-            total_entries,
-            entries,
-        })
+        read_dir_checked(self, path, per_page, page, is_ignored, sort).await
     }
 
     fn walk_dir<'a>(
@@ -2047,15 +2120,13 @@ mod tests {
 
             let cap = CapFilesystem::new(temp.path()).await?;
             let fs = cap.get_virtual(server);
-            let mut directory = cap.read_dir("nested")?;
-            let entry = directory
-                .next()
-                .ok_or_else(|| anyhow::anyhow!("missing entry"))??;
+            let directory = Arc::new(cap.open_listing_dir("nested")?);
 
             std::fs::rename(temp.path().join("nested"), temp.path().join("moved"))?;
 
-            let prepared = fs.prepare_directory_entry(PathBuf::from("nested/data.bin"), entry)?;
-            assert!(prepared.directory_entry.is_some());
+            let prepared =
+                fs.prepare_directory_entry(&directory, Path::new("nested"), "data.bin")?;
+            assert!(prepared.parent.is_some());
 
             let entry = fs
                 .server
@@ -2071,13 +2142,10 @@ mod tests {
                 |_, _| Some(PathBuf::from("other.bin")),
                 |_, _| async { Some(PathBuf::from("other.bin")) },
             ));
-            let mut directory = cap.read_dir("moved")?;
-            let entry = directory
-                .next()
-                .ok_or_else(|| anyhow::anyhow!("missing entry"))??;
-
-            let prepared = fs.prepare_directory_entry(PathBuf::from("moved/data.bin"), entry)?;
-            assert!(prepared.directory_entry.is_none());
+            let directory = Arc::new(cap.open_listing_dir("moved")?);
+            let prepared =
+                fs.prepare_directory_entry(&directory, Path::new("moved"), "data.bin")?;
+            assert!(prepared.parent.is_none());
 
             let entry = fs
                 .server
@@ -2138,6 +2206,87 @@ mod tests {
 
             assert!(fs.async_metadata(&"top.txt").await.is_err());
             assert!(fs.async_create_dir_all(&"game/newdir").await.is_err());
+
+            Ok(())
+        });
+    }
+
+    // VirtualCapFilesystem::async_read_dir_checked
+    #[test]
+    fn checked_listing_matches_metadata_then_listing() {
+        fn describe(checked: CheckedDirectoryListing) -> Result<String, anyhow::Error> {
+            Ok(match checked {
+                CheckedDirectoryListing::Listing(listing) => format!(
+                    "listing {} {}",
+                    listing.total_entries,
+                    serde_json::to_string(&listing.entries)?
+                ),
+                CheckedDirectoryListing::NotFound => "not found".into(),
+                CheckedDirectoryListing::NotDirectory => "not directory".into(),
+            })
+        }
+
+        with_one_blocking_worker(|| async {
+            for extra_files in EXTRA_FILES {
+                let fixture = ListingFixture::new(extra_files).await?;
+                let root = &fixture.server.filesystem.base_path;
+                std::fs::create_dir(root.join("nested/nested"))?;
+                std::fs::write(root.join("nested/nested/inner.txt"), b"inner")?;
+                std::fs::create_dir(root.join("denied-dir"))?;
+                std::fs::write(root.join("denied-dir/inside.txt"), b"hidden")?;
+                std::fs::create_dir(root.join("nested/request-denied.txt"))?;
+                std::fs::write(root.join("nested/request-denied.txt/inside.txt"), b"hidden")?;
+                fixture
+                    .server
+                    .filesystem
+                    .update_ignored(&["denied.txt", "denied-dir", "denied-dir/**"])
+                    .await;
+
+                for path in [
+                    "",
+                    "nested",
+                    "nested/nested",
+                    "a.txt",
+                    "missing",
+                    "nested/missing/deeper",
+                    "dir-link",
+                    "file-link",
+                    "broken-link",
+                    "denied-link",
+                    "nested/parent-link",
+                    "denied.txt",
+                    "denied-dir",
+                    "nested/request-denied.txt",
+                ] {
+                    for (per_page, page, sort) in [(None, 1, NameAsc), (Some(3), 2, SizeDesc)] {
+                        let fast = fixture
+                            .fs
+                            .async_read_dir_checked(
+                                &path,
+                                per_page,
+                                page,
+                                fixture.ignored.clone(),
+                                sort,
+                            )
+                            .await?;
+                        let reference = crate::server::filesystem::virtualfs::read_dir_checked(
+                            &fixture.fs,
+                            &path,
+                            per_page,
+                            page,
+                            fixture.ignored.clone(),
+                            sort,
+                        )
+                        .await?;
+
+                        assert_eq!(
+                            describe(fast)?,
+                            describe(reference)?,
+                            "path {path:?}, per_page {per_page:?}, page {page}, extra_files {extra_files}"
+                        );
+                    }
+                }
+            }
 
             Ok(())
         });
