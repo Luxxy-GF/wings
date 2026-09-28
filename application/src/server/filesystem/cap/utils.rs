@@ -114,8 +114,8 @@ impl AsyncReadDir {
 pub struct ListingDir(pub(super) cap_std::fs::Dir);
 
 impl ListingDir {
-    /// Visits every entry except `.` and `..` in enumeration order. Like the
-    /// cap-std iterator the listing used before, an enumeration error ends the walk.
+    /// Visits every entry except `.` and `..` in enumeration order. An
+    /// enumeration error ends the walk and is returned.
     pub fn for_each_entry<E: From<std::io::Error>>(
         &self,
         mut visit: impl FnMut(FileType, String) -> Result<(), E>,
@@ -128,7 +128,7 @@ impl ListingDir {
             let mut entries = rustix::fs::RawDir::new(self.0.as_fd(), &mut buffer);
 
             while let Some(entry) = entries.next() {
-                let Ok(entry) = entry else { break };
+                let entry = entry.map_err(std::io::Error::from)?;
                 let name = entry.file_name().to_bytes();
                 if name == b"." || name == b".." {
                     continue;
@@ -148,7 +148,7 @@ impl ListingDir {
 
         #[cfg(not(target_os = "linux"))]
         for entry in self.0.entries()? {
-            let Ok(entry) = entry else { break };
+            let entry = entry?;
             let (file_type, name) = name_and_type(&entry);
 
             visit(file_type, name)?;

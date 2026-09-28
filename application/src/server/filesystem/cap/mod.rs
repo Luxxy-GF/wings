@@ -1338,12 +1338,13 @@ impl CapFilesystem {
     }
 
     pub fn open_listing_dir(&self, path: impl AsRef<Path>) -> Result<ListingDir, std::io::Error> {
-        let path = self.relative_path(path.as_ref());
-        let path = if path.components().next().is_none() {
-            Path::new(".")
-        } else {
-            &path
-        };
+        // Without openat2, cap-std resolves paths itself: a trailing slash would
+        // make it an O_PATH open getdents cannot read, and our O_DIRECTORY
+        // flag hides a final symlink from it. Ending in `/.` makes the last
+        // real component an intermediate one, which cap-std follows safely,
+        // before `.` is opened with the proper flags.
+        let mut path = self.relative_path(path.as_ref());
+        path.push(".");
 
         let inner = self.get_inner()?;
 
@@ -1352,7 +1353,7 @@ impl CapFilesystem {
             use cap_std::fs::OpenOptionsExt;
 
             let file = inner.open_with(
-                path,
+                &path,
                 OpenOptions::new()
                     .read(true)
                     .custom_flags(rustix::fs::OFlags::DIRECTORY.bits() as i32),
@@ -1361,7 +1362,7 @@ impl CapFilesystem {
             cap_std::fs::Dir::from_std_file(file.into_std())
         };
         #[cfg(not(target_os = "linux"))]
-        let dir = inner.open_dir(path)?;
+        let dir = inner.open_dir(&path)?;
 
         Ok(ListingDir(dir))
     }
