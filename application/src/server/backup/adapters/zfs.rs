@@ -4,7 +4,7 @@ use crate::{
     server::{
         backup::{
             Backup, BackupCleanExt, BackupCreateExt, BackupExt, BackupFindExt, BackupStream,
-            BackupStreamCreateExt, BackupStreamExt, DumpReader,
+            BackupStreamCreateExt, BackupStreamExt, BackupTestExt, DumpReader,
         },
         filesystem::{
             archive::StreamableArchiveFormat,
@@ -603,6 +603,27 @@ impl BackupStreamExt for ZfsBackup {
         _download_url: Option<compact_str::CompactString>,
     ) -> Result<BackupStream, anyhow::Error> {
         Err(anyhow::anyhow!("zfs backups do not store database dumps"))
+    }
+}
+
+#[async_trait::async_trait]
+impl BackupTestExt for ZfsBackup {
+    type Configuration = ();
+
+    async fn test(
+        state: &crate::routes::State,
+        _configuration: Option<Self::Configuration>,
+    ) -> Result<(), anyhow::Error> {
+        super::probe_backup_directory(&state.config).await?;
+
+        let mut command = Command::new("zfs");
+        command.arg("list").arg("-H").arg("-o").arg("name").arg(
+            state
+                .config
+                .resolve_as_path(|cfg| &cfg.system.data_directory),
+        );
+
+        super::probe_command(command).await
     }
 }
 

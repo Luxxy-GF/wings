@@ -83,6 +83,27 @@ impl PbsBackupConfiguration {
 }
 
 #[derive(Debug, Clone, ToSchema, Deserialize)]
+pub struct PbsRepositoryConfiguration {
+    pub url: String,
+    pub datastore: String,
+    pub namespace: Option<String>,
+    pub token_id: String,
+    pub token_secret: String,
+    #[serde(default)]
+    pub fingerprint: Option<String>,
+}
+
+impl PbsRepositoryConfiguration {
+    #[inline]
+    pub fn fingerprint(&self) -> Option<&str> {
+        self.fingerprint
+            .as_deref()
+            .map(str::trim)
+            .filter(|fingerprint| !fingerprint.is_empty())
+    }
+}
+
+#[derive(Debug, Clone, ToSchema, Deserialize)]
 pub struct KopiaBackupConfiguration {
     pub url: String,
     pub username: String,

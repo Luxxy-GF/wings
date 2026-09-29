@@ -1,6 +1,7 @@
 use super::State;
 use utoipa_axum::{router::OpenApiRouter, routes};
 
+mod backups;
 mod config;
 mod ips;
 mod logs;
@@ -51,5 +52,6 @@ pub fn router(state: &State) -> OpenApiRouter<State> {
         .nest("/config", config::router(state))
         .nest("/stats", stats::router(state))
         .nest("/restic", restic::router(state))
+        .nest("/backups", backups::router(state))
         .with_state(state.clone())
 }

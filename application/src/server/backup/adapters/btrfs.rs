@@ -4,7 +4,7 @@ use crate::{
     server::{
         backup::{
             Backup, BackupCleanExt, BackupCreateExt, BackupExt, BackupFindExt, BackupStream,
-            BackupStreamCreateExt, BackupStreamExt, DumpReader,
+            BackupStreamCreateExt, BackupStreamExt, BackupTestExt, DumpReader,
         },
         filesystem::{
             archive::StreamableArchiveFormat,
@@ -727,6 +727,34 @@ impl BackupStreamExt for BtrfsBackup {
         _download_url: Option<compact_str::CompactString>,
     ) -> Result<BackupStream, anyhow::Error> {
         Err(anyhow::anyhow!("btrfs backups do not store database dumps"))
+    }
+}
+
+#[async_trait::async_trait]
+impl BackupTestExt for BtrfsBackup {
+    type Configuration = ();
+
+    async fn test(
+        state: &crate::routes::State,
+        _configuration: Option<Self::Configuration>,
+    ) -> Result<(), anyhow::Error> {
+        super::probe_backup_directory(&state.config).await?;
+
+        for path in [
+            state
+                .config
+                .resolve_as_path(|cfg| &cfg.system.backup_directory),
+            state
+                .config
+                .resolve_as_path(|cfg| &cfg.system.data_directory),
+        ] {
+            let mut command = Command::new("btrfs");
+            command.arg("filesystem").arg("df").arg(path);
+
+            super::probe_command(command).await?;
+        }
+
+        Ok(())
     }
 }
 

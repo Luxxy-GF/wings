@@ -167,6 +167,35 @@ macro_rules! backup_adapters {
                 }
             }
         }
+
+        mod test_configurations {
+            use super::*;
+
+            $(pub type $variant = <$backup as BackupTestExt>::Configuration;)*
+        }
+
+        #[derive(ToSchema, Deserialize)]
+        #[serde(tag = "adapter")]
+        pub enum BackupTestTarget {
+            $(
+                #[serde(rename = $name)]
+                #[schema(rename = $name)]
+                $variant {
+                    #[serde(default)]
+                    configuration: Option<test_configurations::$variant>,
+                },
+            )*
+        }
+
+        impl BackupTestTarget {
+            pub async fn test(self, state: &crate::routes::State) -> Result<(), anyhow::Error> {
+                match self {
+                    $(Self::$variant { configuration } => {
+                        <$backup as BackupTestExt>::test(state, configuration).await
+                    })*
+                }
+            }
+        }
     };
 }
 
@@ -336,6 +365,16 @@ pub trait BackupExt {
 #[async_trait::async_trait]
 pub trait BackupCleanExt {
     async fn clean(server: &crate::server::Server, uuid: uuid::Uuid) -> Result<(), anyhow::Error>;
+}
+
+#[async_trait::async_trait]
+pub trait BackupTestExt {
+    type Configuration: for<'de> Deserialize<'de> + ToSchema + Send;
+
+    async fn test(
+        state: &crate::routes::State,
+        configuration: Option<Self::Configuration>,
+    ) -> Result<(), anyhow::Error>;
 }
 
 #[cfg(test)]

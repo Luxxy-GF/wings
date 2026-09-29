@@ -7,13 +7,13 @@ use crate::{
         limited_writer::LimitedWriter,
     },
     models::{DirectoryEntry, DirectorySortingMode},
-    remote::backups::{PbsBackupConfiguration, RawServerBackup},
+    remote::backups::{PbsBackupConfiguration, PbsRepositoryConfiguration, RawServerBackup},
     response::ApiResponse,
     routes::MimeCacheValue,
     server::{
         backup::{
             Backup, BackupCleanExt, BackupCreateExt, BackupExt, BackupFindExt, BackupStream,
-            BackupStreamCreateExt, BackupStreamExt, DumpReader,
+            BackupStreamCreateExt, BackupStreamExt, BackupTestExt, DumpReader,
         },
         filesystem::{
             archive::{Archive, StreamableArchiveFormat, create::CreatePxarOptions},
@@ -2001,6 +2001,34 @@ impl VirtualReadableFilesystem for PbsVirtualFilesystem {
 
     async fn close(&self) -> Result<(), anyhow::Error> {
         self.archive.close().await;
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl BackupTestExt for PbsBackup {
+    type Configuration = PbsRepositoryConfiguration;
+
+    async fn test(
+        _state: &crate::routes::State,
+        configuration: Option<Self::Configuration>,
+    ) -> Result<(), anyhow::Error> {
+        let remote = configuration.ok_or_else(|| {
+            anyhow::anyhow!("no proxmox backup server configuration was provided")
+        })?;
+        let fingerprint = remote.fingerprint().map(Into::into);
+
+        let client = PbsClient::new(PbsConfig {
+            url: remote.url.into(),
+            datastore: remote.datastore.into(),
+            namespace: remote.namespace.map(Into::into),
+            token_id: remote.token_id.into(),
+            token_secret: remote.token_secret.into(),
+            fingerprint,
+            backup_id_prefix: None,
+        })?;
+        client.check_access().await?;
+
         Ok(())
     }
 }

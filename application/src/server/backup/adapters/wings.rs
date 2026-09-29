@@ -15,7 +15,7 @@ use crate::{
     server::{
         backup::{
             Backup, BackupCleanExt, BackupCreateExt, BackupExt, BackupFindExt, BackupStream,
-            BackupStreamCreateExt, BackupStreamExt, DumpReader,
+            BackupStreamCreateExt, BackupStreamExt, BackupTestExt, DumpReader,
         },
         filesystem::{
             archive::{
@@ -1191,6 +1191,18 @@ impl BackupExt for WingsBackup {
                 "this backup adapter does not support browsing files"
             )),
         }
+    }
+}
+
+#[async_trait::async_trait]
+impl BackupTestExt for WingsBackup {
+    type Configuration = ();
+
+    async fn test(
+        state: &crate::routes::State,
+        _configuration: Option<Self::Configuration>,
+    ) -> Result<(), anyhow::Error> {
+        super::probe_backup_directory(&state.config).await
     }
 }
 

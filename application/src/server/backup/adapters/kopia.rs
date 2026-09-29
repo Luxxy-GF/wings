@@ -10,7 +10,7 @@ use crate::{
     server::{
         backup::{
             Backup, BackupCleanExt, BackupCreateExt, BackupExt, BackupFindExt, BackupStream,
-            BackupStreamCreateExt, BackupStreamExt, DumpReader,
+            BackupStreamCreateExt, BackupStreamExt, BackupTestExt, DumpReader,
         },
         filesystem::{
             archive::StreamableArchiveFormat,
@@ -205,6 +205,14 @@ impl KopiaBackup {
             return Ok(());
         }
 
+        Self::connect(config_file, cache_dir, remote).await
+    }
+
+    async fn connect(
+        config_file: &Path,
+        cache_dir: &Path,
+        remote: &KopiaBackupConfiguration,
+    ) -> Result<(), anyhow::Error> {
         if let Some(parent) = config_file.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
@@ -879,6 +887,33 @@ impl BackupExt for KopiaBackup {
             root_size: self.total_size,
             dir_cache: moka::sync::Cache::builder().max_capacity(8192).build(),
         }))
+    }
+}
+
+#[async_trait::async_trait]
+impl BackupTestExt for KopiaBackup {
+    type Configuration = KopiaBackupConfiguration;
+
+    async fn test(
+        state: &crate::routes::State,
+        configuration: Option<Self::Configuration>,
+    ) -> Result<(), anyhow::Error> {
+        let remote =
+            configuration.ok_or_else(|| anyhow::anyhow!("no kopia configuration was provided"))?;
+
+        // a scratch config, so stored credentials can't mask a wrong password
+        let directory = tempfile::TempDir::new_in(
+            state
+                .config
+                .resolve_as_path(|cfg| &cfg.system.tmp_directory),
+        )?;
+
+        Self::connect(
+            &directory.path().join("repository.config"),
+            &directory.path().join("cache"),
+            &remote,
+        )
+        .await
     }
 }
 

@@ -9,7 +9,7 @@ use crate::{
     server::{
         backup::{
             Backup, BackupCleanExt, BackupCreateExt, BackupExt, BackupFindExt, BackupStream,
-            BackupStreamCreateExt, BackupStreamExt, DumpReader,
+            BackupStreamCreateExt, BackupStreamExt, BackupTestExt, DumpReader,
         },
         filesystem::{
             archive::StreamableArchiveFormat,
@@ -946,6 +946,18 @@ impl BackupExt for DdupBakBackup {
                 .map_or_else(|_| Default::default(), |dt| dt.into()),
             Some(get_repository(&server.app_state.config).await?),
         )))
+    }
+}
+
+#[async_trait::async_trait]
+impl BackupTestExt for DdupBakBackup {
+    type Configuration = ();
+
+    async fn test(
+        state: &crate::routes::State,
+        _configuration: Option<Self::Configuration>,
+    ) -> Result<(), anyhow::Error> {
+        super::probe_backup_directory(&state.config).await
     }
 }
 

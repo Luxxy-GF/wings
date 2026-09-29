@@ -75,6 +75,20 @@ impl PbsClient {
         Ok(())
     }
 
+    pub async fn check_access(&self) -> Result<(), PbsError> {
+        let response = self
+            .client
+            .get(self.datastore_path("groups"))
+            .query(&self.ns_query())
+            .send()
+            .await
+            .map_err(|err| self.map_transport(err))?;
+
+        self.check_status(response).await?;
+
+        Ok(())
+    }
+
     async fn check_status(
         &self,
         response: reqwest::Response,

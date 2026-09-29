@@ -43,6 +43,56 @@ async fn prepare_dump_reader(mut reader: DumpReader) -> Result<DumpReader, anyho
     Ok(Box::new(std::io::Cursor::new(first_byte).chain(reader)))
 }
 
+async fn probe_backup_directory(config: &crate::config::Config) -> Result<(), anyhow::Error> {
+    let path = config.resolve_as_path(|cfg| &cfg.system.backup_directory);
+
+    let metadata = tokio::fs::metadata(&path).await.map_err(|err| {
+        anyhow::anyhow!(
+            "backup directory {} is not accessible: {err}",
+            path.display()
+        )
+    })?;
+    if !metadata.is_dir() {
+        return Err(anyhow::anyhow!(
+            "backup directory {} is not a directory",
+            path.display()
+        ));
+    }
+
+    let probe = path.join(format!(".calagopus-test-{}", uuid::Uuid::new_v4()));
+    tokio::fs::write(&probe, b"calagopus")
+        .await
+        .map_err(|err| {
+            anyhow::anyhow!("backup directory {} is not writable: {err}", path.display())
+        })?;
+    tokio::fs::remove_file(&probe).await?;
+
+    Ok(())
+}
+
+async fn probe_command(mut command: tokio::process::Command) -> Result<(), anyhow::Error> {
+    let program = command
+        .as_std()
+        .get_program()
+        .to_string_lossy()
+        .into_owned();
+    let output = command
+        .env("LC_ALL", "C")
+        .output()
+        .await
+        .map_err(|err| anyhow::anyhow!("failed to run {program}: {err}"))?;
+
+    if !output.status.success() {
+        return Err(anyhow::anyhow!(
+            "{program} exited with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+
+    Ok(())
+}
+
 impl BackupAdapter {
     pub async fn find_all(
         state: &crate::routes::State,
