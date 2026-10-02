@@ -81,6 +81,7 @@ pub struct InnerServer {
 
     pub user_permissions: permissions::UserPermissionsMap,
     pub filesystem: filesystem::Filesystem,
+    pub sqlite_memory: filesystem::sqlite::QueryMemory,
 }
 
 impl Drop for InnerServer {
@@ -243,6 +244,7 @@ impl Server {
 
             user_permissions: permissions::UserPermissionsMap::default(),
             filesystem,
+            sqlite_memory: filesystem::sqlite::QueryMemory::default(),
         }));
 
         server.spawn_stats_forwarder();
@@ -287,6 +289,40 @@ impl Server {
             configuration::process::ProcessConfiguration::mock(),
             app_state,
         )
+    }
+
+    #[cfg(test)]
+    pub async fn mock_in_tempdir() -> (tempfile::TempDir, Self) {
+        let temp = tempfile::tempdir().expect("failed to create temp dir");
+        let state = crate::routes::AppState::mock();
+        {
+            let config = state.config.mutate_in_place_for_testing();
+            config.system.data_directory =
+                crate::config::SystemPath::new(temp.path().to_string_lossy().into_owned());
+            config.system.disk_check_use_inotify = false;
+        }
+
+        let server = Self::mock(uuid::Uuid::new_v4(), state);
+        server.filesystem.disk_checker.abort();
+
+        std::fs::create_dir_all(&server.filesystem.base_path)
+            .expect("failed to create server root");
+        server.filesystem.attach().await;
+        assert!(
+            !server.filesystem.is_uninitialized(),
+            "failed to open server root"
+        );
+
+        (temp, server)
+    }
+
+    #[cfg(test)]
+    pub fn with_mock<F: FnOnce(Self) -> Fut, Fut: Future<Output = ()>>(f: F) {
+        tokio_test::block_on(async {
+            let (_temp, server) = Self::mock_in_tempdir().await;
+
+            f(server).await;
+        });
     }
 
     pub async fn initialize_schedules(&self) {
@@ -1675,30 +1711,7 @@ impl Deref for Server {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::routes::AppState;
     use filesystem::operations::FilesystemOperation;
-
-    fn with_server<F, Fut>(f: F)
-    where
-        F: FnOnce(Server) -> Fut,
-        Fut: Future<Output = ()>,
-    {
-        tokio_test::block_on(async {
-            let temp = tempfile::tempdir().expect("failed to create temp dir");
-            let state = AppState::mock();
-            state
-                .config
-                .mutate_in_place_for_testing()
-                .system
-                .data_directory =
-                crate::config::SystemPath::new(temp.path().to_string_lossy().into_owned());
-
-            let server = Server::mock(uuid::Uuid::new_v4(), Arc::clone(&state));
-            server.filesystem.disk_checker.abort();
-
-            f(server).await;
-        });
-    }
 
     fn copy() -> FilesystemOperation {
         FilesystemOperation::Copy {
@@ -1725,7 +1738,7 @@ mod tests {
     // Server lock setters
     #[test]
     fn setters_return_previous_value_and_report_state() {
-        with_server(|server| async move {
+        Server::with_mock(|server| async move {
             assert!(!server.set_suspended(true).await);
             assert!(server.set_suspended(true).await);
             assert_eq!(server.locked_state(), Some("suspended"));
@@ -1751,7 +1764,7 @@ mod tests {
 
     #[test]
     fn rising_edge_signals_stamps_and_aborts_operations() {
-        with_server(|server| async move {
+        Server::with_mock(|server| async move {
             assert_eq!(server.last_locked_at(), 0);
             let signal = server.locked_signal();
             let (_, handle) = server
@@ -1774,7 +1787,7 @@ mod tests {
 
     #[test]
     fn only_new_rising_edges_signal_and_abort() {
-        with_server(|server| async move {
+        Server::with_mock(|server| async move {
             server.set_suspended(true).await;
 
             let signal = server.locked_signal();
@@ -1802,7 +1815,7 @@ mod tests {
 
     #[test]
     fn unlocking_does_not_signal_or_abort() {
-        with_server(|server| async move {
+        Server::with_mock(|server| async move {
             server.set_transferring(true).await;
             let signal = server.locked_signal();
             let (_, handle) = server
@@ -1833,7 +1846,7 @@ mod tests {
             }
         }
 
-        with_server(|server| async move {
+        Server::with_mock(|server| async move {
             assert_eq!(server.state.get_state(), state::ServerState::Offline);
             user_error(&server, ServerPowerAction::Stop).await;
             user_error(&server, ServerPowerAction::Kill).await;

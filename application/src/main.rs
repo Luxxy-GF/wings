@@ -810,6 +810,7 @@ async fn main_rt() {
                     maximum_packet_size: 32 * 1024,
                     keepalive_interval: Some(std::time::Duration::from_secs(60)),
                     max_auth_attempts: 6,
+                    methods: crate::ssh::auth_methods(&state.config.load()),
                     channel_buffer_size: 1024,
                     event_buffer_size: 1024,
                     keys: vec![key],
