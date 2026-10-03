@@ -38,12 +38,12 @@ jobs:
             os: ubuntu-24.04
             target: riscv64gc-unknown-linux-gnu
             jemalloc_lg_page: 12
-            link_flags: ""
+            link_flags: -C relocation-model=static
           - build: ppc64le-linux
             os: ubuntu-24.04
             target: powerpc64le-unknown-linux-gnu
             jemalloc_lg_page: 16
-            link_flags: ""
+            link_flags: -C relocation-model=static
 
     steps:
       - name: Checkout sources
