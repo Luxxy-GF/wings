@@ -593,6 +593,9 @@ async fn main_rt() {
         start_time: Instant::now(),
         container_type: match std::env::var("OCI_CONTAINER").as_deref() {
             Ok("official") => crate::routes::AppContainerType::Official,
+            Ok("official-aio") => crate::routes::AppContainerType::OfficialAIO,
+            Ok("official-heavy") => crate::routes::AppContainerType::OfficialHeavy,
+            Ok("official-heavy-aio") => crate::routes::AppContainerType::OfficialHeavyAIO,
             Ok(_) => crate::routes::AppContainerType::Unknown,
             Err(_) => crate::routes::AppContainerType::None,
         },
