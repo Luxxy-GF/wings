@@ -1,0 +1,480 @@
+//! OCI template imports through the official Incus 7.0 client conversion path.
+use super::client::{Client, segment};
+use anyhow::{Context, ensure};
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
+use std::{
+    collections::{BTreeMap, HashMap},
+    path::PathBuf,
+    process::Stdio,
+    sync::Arc,
+    time::Duration,
+};
+use tokio::{
+    io::AsyncReadExt,
+    sync::{Mutex, Semaphore},
+};
+
+/// Drain subprocess output without allowing a build to consume unlimited RAM.
+async fn tail(
+    mut stream: impl tokio::io::AsyncRead + Unpin,
+    keep_tail: bool,
+) -> std::io::Result<Vec<u8>> {
+    let mut output = Vec::new();
+    let mut buffer = [0; 8192];
+    loop {
+        let count = stream.read(&mut buffer).await?;
+        if count == 0 {
+            break;
+        }
+        output.extend_from_slice(buffer.get(..count).unwrap_or_default());
+        if output.len() > 65536 {
+            if !keep_tail {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "subprocess stdout exceeded 64 KiB",
+                ));
+            }
+            output.drain(..output.len() - 65536);
+        }
+    }
+    Ok(output)
+}
+
+struct ProcessGroup(Option<rustix::process::Pid>);
+impl Drop for ProcessGroup {
+    fn drop(&mut self) {
+        if let Some(pid) = self.0 {
+            let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
+        }
+    }
+}
+
+pub async fn run(
+    executable: &str,
+    args: &[String],
+    timeout: Duration,
+    env: Option<&BTreeMap<String, String>>,
+) -> anyhow::Result<Vec<u8>> {
+    let mut command = tokio::process::Command::new(executable);
+    command
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .process_group(0);
+    if let Some(env) = env {
+        command.envs(env);
+    }
+    let mut child = command
+        .spawn()
+        .with_context(|| format!("starting {executable}"))?;
+    let mut group = ProcessGroup(
+        child
+            .id()
+            .and_then(|id| rustix::process::Pid::from_raw(id as i32)),
+    );
+    let stdout = child.stdout.take().context("subprocess stdout missing")?;
+    let stderr = child.stderr.take().context("subprocess stderr missing")?;
+    let result = tokio::time::timeout(timeout, async {
+        tokio::try_join!(child.wait(), tail(stdout, false), tail(stderr, true))
+    })
+    .await;
+    let (status, stdout, stderr) = match result {
+        Ok(result) => result?,
+        Err(_) => {
+            let _ = child.kill().await;
+            anyhow::bail!("{executable} timed out");
+        }
+    };
+    ensure!(
+        status.success(),
+        "{executable} failed: {}",
+        String::from_utf8_lossy(&stderr)
+    );
+    group.0 = None;
+    Ok(stdout)
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct Image {
+    pub fingerprint: String,
+    pub digest: String,
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub cmd: Vec<String>,
+    pub environment: BTreeMap<String, String>,
+    pub uid: u32,
+    pub gid: u32,
+}
+
+fn converted_user(archive: &std::path::Path) -> anyhow::Result<(u32, u32)> {
+    use std::io::Read;
+    let decoder = flate2::read::GzDecoder::new(std::fs::File::open(archive)?);
+    let mut archive = tar::Archive::new(decoder.take(4 * 1024 * 1024));
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        if entry.path()?.as_ref() != std::path::Path::new("config.json") {
+            continue;
+        }
+        ensure!(
+            entry.header().entry_type().is_file() && entry.size() <= 65536,
+            "converted OCI process configuration is not a bounded regular file"
+        );
+        let mut content = Vec::new();
+        entry.read_to_end(&mut content)?;
+        let config: Value = serde_json::from_slice(&content)?;
+        let user = config
+            .get("process")
+            .and_then(|process| process.get("user"))
+            .context("converted OCI process user missing")?;
+        let uid = u32::try_from(
+            user.get("uid")
+                .and_then(Value::as_u64)
+                .context("OCI UID missing")?,
+        )?;
+        let gid = u32::try_from(
+            user.get("gid")
+                .and_then(Value::as_u64)
+                .context("OCI GID missing")?,
+        )?;
+        return Ok((uid, gid));
+    }
+    anyhow::bail!("Incus export did not contain an OCI process configuration")
+}
+#[derive(Deserialize)]
+struct ImageConfig {
+    #[serde(default, rename = "Entrypoint")]
+    entrypoint: Option<Vec<String>>,
+    #[serde(default, rename = "Cmd")]
+    cmd: Option<Vec<String>>,
+    #[serde(default, rename = "Env")]
+    environment: Option<Vec<String>>,
+}
+
+pub struct Images {
+    config: Arc<crate::config::Config>,
+    client: Client,
+    concurrency: Semaphore,
+    locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+}
+impl Images {
+    pub fn new(config: Arc<crate::config::Config>, client: Client) -> Self {
+        let concurrency = Semaphore::new(config.load().runtime.incus.max_concurrent_imports);
+        Self {
+            config,
+            client,
+            concurrency,
+            locks: Mutex::new(HashMap::new()),
+        }
+    }
+    fn root(&self) -> PathBuf {
+        self.config
+            .resolve_as_path(|cfg| &cfg.system.root_directory)
+            .join("incus-images")
+    }
+    pub async fn boot(&self) -> anyhow::Result<()> {
+        let cfg = self.config.load().runtime.incus.clone();
+        for path in [&cfg.incus_path, &cfg.skopeo_path] {
+            run(path, &["--version".into()], Duration::from_secs(10), None).await?;
+        }
+        tokio::fs::create_dir_all(self.root()).await?;
+        Ok(())
+    }
+    pub async fn ensure(&self, source: &str) -> anyhow::Result<Image> {
+        let cfg = self.config.load().runtime.incus.clone();
+        let reference = source.trim_end_matches('~').to_string();
+        let key = format!("pull:{reference}");
+        let lock = self
+            .locks
+            .lock()
+            .await
+            .entry(key)
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone();
+        let _guard = lock.lock().await;
+        let _permit = self.concurrency.acquire().await?;
+        let timeout = Duration::from_secs(cfg.image_import_timeout_seconds);
+        let (registry, repository) = parse_reference(&reference)?;
+        let architecture = match std::env::consts::ARCH {
+            "x86_64" => "amd64",
+            "aarch64" => "arm64",
+            other => other,
+        };
+        let inspect: Value = serde_json::from_slice(
+            &run(
+                &cfg.skopeo_path,
+                &[
+                    "inspect".into(),
+                    "--no-tags".into(),
+                    "--override-os".into(),
+                    "linux".into(),
+                    "--override-arch".into(),
+                    architecture.into(),
+                    format!("docker://{reference}"),
+                ],
+                timeout,
+                None,
+            )
+            .await?,
+        )
+        .context("decoding OCI registry inspection")?;
+        let digest = inspect
+            .get("Digest")
+            .and_then(Value::as_str)
+            .context("OCI image has no manifest digest")?
+            .to_owned();
+        ensure!(
+            digest.starts_with("sha256:")
+                && digest.len() == 71
+                && digest
+                    .trim_start_matches("sha256:")
+                    .bytes()
+                    .all(|b| b.is_ascii_hexdigit()),
+            "invalid OCI digest"
+        );
+        let base = repository
+            .split('@')
+            .next()
+            .context("OCI repository missing")?;
+        let base = match base.rsplit_once(':') {
+            Some((base, _)) => base,
+            None => base,
+        };
+        let pinned = format!("{registry}/{base}@{digest}");
+        let cache_key = hex::encode(Sha256::digest(
+            format!("{pinned}:{architecture}").as_bytes(),
+        ));
+        let artifact_lock = self
+            .locks
+            .lock()
+            .await
+            .entry(format!("import:{cache_key}"))
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone();
+        let _artifact_guard = artifact_lock.lock().await;
+        let path = self.root().join(format!("{cache_key}.json"));
+        if let Ok(data) = tokio::fs::read(&path).await
+            && let Ok(image) = serde_json::from_slice::<Image>(&data)
+            && self
+                .client
+                .optional::<Value>(&format!("/1.0/images/{}", segment(&image.fingerprint)))
+                .await?
+                .is_some()
+        {
+            return Ok(image);
+        }
+        let spec: Value = serde_json::from_slice(
+            &run(
+                &cfg.skopeo_path,
+                &[
+                    "inspect".into(),
+                    "--config".into(),
+                    format!("docker://{pinned}"),
+                ],
+                timeout,
+                None,
+            )
+            .await?,
+        )
+        .context("decoding OCI image configuration")?;
+        let process: ImageConfig = serde_json::from_value(
+            spec.get("config")
+                .cloned()
+                .context("OCI image config missing")?,
+        )?;
+        let mut environment = BTreeMap::new();
+        for entry in process.environment.unwrap_or_default() {
+            let (key, value) = entry
+                .split_once('=')
+                .context("invalid OCI environment entry")?;
+            environment.insert(key.to_owned(), value.to_owned());
+        }
+        let cmd = process.cmd.unwrap_or_default();
+        let mut args = process.entrypoint.unwrap_or_default();
+        args.extend(cmd.clone());
+        ensure!(!args.is_empty(), "OCI image has no entrypoint or command");
+        // Private per-import config avoids modifying the operator's Incus CLI remotes.
+        let directory = tempfile::tempdir_in(self.root())?;
+        let client_config = json!({"default-remote": "local", "remotes": {
+            "local": {"addr": "unix://", "protocol": "incus", "project": cfg.project},
+            "oci": {"addr": format!("https://{registry}"), "protocol": "oci", "public": true}
+        }});
+        tokio::fs::write(
+            directory.path().join("config.yml"),
+            serde_norway::to_string(&client_config)?,
+        )
+        .await?;
+        let env = BTreeMap::from([
+            ("INCUS_CONF".into(), directory.path().display().to_string()),
+            ("INCUS_SOCKET".into(), cfg.socket.clone()),
+        ]);
+        // Incus limits image alias names to 64 characters, including our prefix.
+        let alias = format!("wings-{}", cache_key.get(..58).context("image cache key")?);
+        // Incus 7.0.1's `image copy --mode=relay` replaces the resolved OCI
+        // fingerprint with its alias, then fails to find it in the OCI cache.
+        // Export/import retains the official conversion path without that bug.
+        let archive = directory.path().join("image.tar.gz");
+        run(
+            &cfg.incus_path,
+            &[
+                "--quiet".into(),
+                "image".into(),
+                "export".into(),
+                format!("oci:{base}@{digest}"),
+                archive.display().to_string(),
+            ],
+            timeout,
+            Some(&env),
+        )
+        .await?;
+        // Incus uses this converted OCI spec at start; it does not populate
+        // oci.uid/oci.gid in the instance API when those overrides are absent.
+        let user_archive = archive.clone();
+        let (uid, gid) =
+            tokio::task::spawn_blocking(move || converted_user(&user_archive)).await??;
+        run(
+            &cfg.incus_path,
+            &[
+                "--quiet".into(),
+                "image".into(),
+                "import".into(),
+                archive.display().to_string(),
+                format!("{}.root", archive.display()),
+                "local:".into(),
+                "--alias".into(),
+                alias.clone(),
+                "--project".into(),
+                cfg.project.clone(),
+            ],
+            timeout,
+            Some(&env),
+        )
+        .await?;
+        let alias: Value = self
+            .client
+            .get(&format!("/1.0/images/aliases/{}", segment(&alias)))
+            .await?;
+        let fingerprint = alias
+            .get("target")
+            .and_then(Value::as_str)
+            .context("Incus import did not create image alias")?
+            .to_owned();
+        let image = Image {
+            fingerprint,
+            digest,
+            args,
+            cmd,
+            environment,
+            uid,
+            gid,
+        };
+        let temporary = path.with_extension(format!("{}.tmp", uuid::Uuid::new_v4()));
+        tokio::fs::write(&temporary, serde_json::to_vec(&image)?).await?;
+        tokio::fs::rename(temporary, path).await?;
+        Ok(image)
+    }
+}
+
+pub fn parse_reference(value: &str) -> anyhow::Result<(String, String)> {
+    ensure!(
+        !value.contains("://") && !value.chars().any(char::is_whitespace),
+        "OCI reference must be a registry reference, not a URL"
+    );
+    let (first, remainder) = value.split_once('/').unwrap_or((value, ""));
+    let explicit = !remainder.is_empty()
+        && (first.contains('.') || first.contains(':') || first == "localhost");
+    let (registry, repository) = if explicit {
+        (first.to_string(), remainder.to_string())
+    } else {
+        (
+            "docker.io".into(),
+            if remainder.is_empty() {
+                format!("library/{value}")
+            } else {
+                value.into()
+            },
+        )
+    };
+    ensure!(
+        !repository.is_empty() && !repository.starts_with('-') && !registry.contains('@'),
+        "invalid OCI repository"
+    );
+    Ok((registry, repository))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn reads_converted_user_and_rejects_invalid_numeric_ids() -> anyhow::Result<()> {
+        for (config, expected) in [
+            (
+                json!({"process": {"user": {"uid": 1000, "gid": 1001}}}),
+                Some((1000, 1001)),
+            ),
+            (
+                json!({"process": {"user": {"uid": 0, "gid": 0}}}),
+                Some((0, 0)),
+            ),
+            (json!({"process": {"user": {"uid": -1, "gid": 0}}}), None),
+            (
+                json!({"process": {"user": {"uid": 4294967296_u64, "gid": 0}}}),
+                None,
+            ),
+            (json!({"process": {"user": {"uid": 1000}}}), None),
+        ] {
+            let archive = tempfile::NamedTempFile::new()?;
+            let encoder =
+                flate2::write::GzEncoder::new(archive.reopen()?, flate2::Compression::fast());
+            let mut tar = tar::Builder::new(encoder);
+            let content = serde_json::to_vec(&config)?;
+            let mut header = tar::Header::new_gnu();
+            header.set_mode(0o600);
+            header.set_size(content.len() as u64);
+            header.set_cksum();
+            tar.append_data(&mut header, "config.json", content.as_slice())?;
+            tar.into_inner()?.finish()?;
+            let result = converted_user(archive.path());
+            if let Some(expected) = expected {
+                assert_eq!(result?, expected);
+            } else {
+                assert!(result.is_err());
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bounded_output_rejects_truncated_stdout_and_retains_stderr_tail() {
+        let oversized = vec![b'x'; 65537];
+        let error = tail(std::io::Cursor::new(&oversized), false)
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(
+            tail(std::io::Cursor::new(&oversized), true).await.unwrap(),
+            vec![b'x'; 65536]
+        );
+        assert_eq!(
+            tail(std::io::Cursor::new(b"{}"), false).await.unwrap(),
+            b"{}"
+        );
+    }
+
+    #[test]
+    fn normalizes_registry_ports_and_digests() -> anyhow::Result<()> {
+        assert_eq!(
+            parse_reference("alpine:3")?,
+            ("docker.io".into(), "library/alpine:3".into())
+        );
+        assert_eq!(
+            parse_reference("localhost:5443/game/runtime@sha256:abc")?,
+            ("localhost:5443".into(), "game/runtime@sha256:abc".into())
+        );
+        assert!(parse_reference("https://registry/image").is_err());
+        Ok(())
+    }
+}

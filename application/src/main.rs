@@ -1,4 +1,4 @@
-use crate::{response::ApiResponse, routes::GetState, server::executor::ServerExecutor};
+use crate::{response::ApiResponse, routes::GetState};
 use anyhow::Context;
 use axum::{
     body::Body,
@@ -493,44 +493,11 @@ async fn main_rt() {
         Ok::<_, anyhow::Error>(())
     });
 
-    tracing::info!("connecting to docker");
-    let (executor, docker) = {
-        let config_ref = config.load();
-        let docker = Arc::new(
-            match if config_ref.docker.socket.starts_with("http://")
-                || config_ref.docker.socket.starts_with("tcp://")
-            {
-                bollard::Docker::connect_with_http(
-                    &config_ref.docker.socket,
-                    120,
-                    bollard::API_DEFAULT_VERSION,
-                )
-            } else {
-                bollard::Docker::connect_with_local(
-                    &config_ref.docker.socket,
-                    120,
-                    bollard::API_DEFAULT_VERSION,
-                )
-            } {
-                Ok(docker) => docker,
-                Err(err) => exit_error!("failed to connect to docker: {:?}", err),
-            },
-        );
-
-        let own_container =
-            crate::server::executor::docker::DockerExecutor::own_container(&docker).await;
-        let firewall =
-            crate::server::firewall::create(&config, &docker, own_container.as_ref()).await;
-
-        (
-            Arc::new(crate::server::executor::docker::DockerExecutor::new(
-                Arc::clone(&docker),
-                config.clone(),
-                firewall,
-            )),
-            docker,
-        )
-    };
+    let crate::server::executor::Runtime { executor, docker } =
+        match crate::server::executor::create_runtime(Arc::clone(&config)).await {
+            Ok(runtime) => runtime,
+            Err(err) => exit_error!("failed to initialize server runtime: {:#}", err),
+        };
 
     tracing::info!("running server executor boot tasks");
     if let Err(err) = executor.boot().await {
@@ -579,7 +546,11 @@ async fn main_rt() {
 
     #[cfg(unix)]
     let tundra = if config.load().tundra.enabled {
-        match crate::tundra::TundraManager::create(&config, Arc::clone(&docker)) {
+        let docker = match docker.as_ref() {
+            Some(docker) => Arc::clone(docker),
+            None => exit_error!("Tundra requires a compatible runtime daemon provider"),
+        };
+        match crate::tundra::TundraManager::create(&config, docker) {
             Ok(tundra) => Some(tundra),
             Err(err) => exit_error!("failed to set up the tundra control plane: {:?}", err),
         }

@@ -1673,13 +1673,12 @@ impl Server {
             let server = self.clone();
 
             async move {
-                server.diff.destroy().await;
-                server.filesystem.destroy().await;
-                server.filesystem.close();
-
                 if let Some(installer) = server.installer.read().await.as_ref() {
                     installer.abort();
                 }
+                server.diff.destroy().await;
+                server.filesystem.destroy().await;
+                server.filesystem.close();
             }
         });
     }
