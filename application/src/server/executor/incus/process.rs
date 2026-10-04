@@ -488,6 +488,11 @@ impl ProcessHandle for Handle {
     }
     async fn start(&self) -> anyhow::Result<()> {
         if !self.native || self.executor.instance(&self.name).await?.status != "Running" {
+            if self.native
+                && let Some(server) = self.server.upgrade()
+            {
+                self.executor.unmount_native_files(&server).await?;
+            }
             self.executor
                 .client
                 .state(&self.name, "start", false)
