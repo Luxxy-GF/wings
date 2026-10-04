@@ -5443,6 +5443,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "tundra-common"
+version = "1.0.1"
+source = "git+https://github.com/calagopus/tundra.git#ccb05e1406232f8c39f05a984133277026cd79d6"
+dependencies = [
+ "base64 0.23.1",
+ "bytes",
+ "compact_str",
+ "ed25519-dalek",
+ "hex",
+ "jsonwebtoken",
+ "postcard",
+ "serde",
+ "serde_json",
+ "sha2",
+ "uuid",
+]
+
+[[package]]
 name = "tundra-node"
 version = "1.0.1"
 source = "git+https://github.com/Luxxy-GF/tundra?rev=f045f5861da0cf9d3df5d3e11b0b384af325147a#f045f5861da0cf9d3df5d3e11b0b384af325147a"
@@ -5473,7 +5491,7 @@ dependencies = [
  "tokio-tungstenite 0.30.0",
  "tracing",
  "tracing-subscriber",
- "tundra-common",
+ "tundra-common 1.0.1 (git+https://github.com/Luxxy-GF/tundra?rev=f045f5861da0cf9d3df5d3e11b0b384af325147a)",
  "uuid",
 ]
 
@@ -6294,7 +6312,7 @@ dependencies = [
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
- "tundra-common",
+ "tundra-common 1.0.1 (git+https://github.com/calagopus/tundra.git)",
  "tundra-node",
  "unrar",
  "ureq",

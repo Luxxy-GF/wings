@@ -210,7 +210,7 @@ A real VM reboot test passed after verifying the kernel boot ID changed. Incus l
 
 The standalone Tundra workspace suite passed: **301 passed, 4 ignored**. The broader Wings suite on the cloud host reported **794 passed, 10 failed, 22 ignored**. The same ten failures reproduced in the baseline build: eight inotify tests fail when run with the full suite but pass in isolation, and two TCP congestion-control tests fail on the cloud host but pass on the VM's Linux kernel. All eight inotify tests also passed on that VM. The complete single-process cloud-host suite therefore remains failing; these baseline failures are separate from the successful Incus integration checks.
 
-Two-node private-network validation used the upstream Tundra test panel and verified TCP/UDP through QUIC, `.tunnel` names, ACL revocation/restoration, and adoption after a native Incus restart. The production panel UI was not exercised. Tundra's native runtime source is maintained separately in [Luxxy-GF/tundra](https://github.com/Luxxy-GF/tundra); Wings pins both Tundra crates to the same Git revision.
+Two-node private-network validation used the upstream Tundra test panel and verified TCP/UDP through QUIC, `.tunnel` names, ACL revocation/restoration, and adoption after a native Incus restart. The production panel UI was not exercised. Tundra's native runtime source is maintained separately in [Luxxy-GF/tundra](https://github.com/Luxxy-GF/tundra); Wings uses the original `calagopus/tundra.git` dependency for `tundra-common` and pins the Incus node crate to the fork revision.
 
 Run the local regression tests with:
 
