@@ -5427,6 +5427,7 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 [[package]]
 name = "tundra-common"
 version = "1.0.1"
+source = "git+https://github.com/Luxxy-GF/tundra?rev=f045f5861da0cf9d3df5d3e11b0b384af325147a#f045f5861da0cf9d3df5d3e11b0b384af325147a"
 dependencies = [
  "base64 0.23.1",
  "bytes",
@@ -5444,6 +5445,7 @@ dependencies = [
 [[package]]
 name = "tundra-node"
 version = "1.0.1"
+source = "git+https://github.com/Luxxy-GF/tundra?rev=f045f5861da0cf9d3df5d3e11b0b384af325147a#f045f5861da0cf9d3df5d3e11b0b384af325147a"
 dependencies = [
  "anyhow",
  "axum",

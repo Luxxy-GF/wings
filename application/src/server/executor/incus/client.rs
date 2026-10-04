@@ -1,4 +1,3 @@
-//! Incus 7.0 REST transport. Every mutation waits for its asynchronous operation.
 use anyhow::{Context, bail};
 use reqwest::{Method, StatusCode};
 use serde::{Deserialize, de::DeserializeOwned};
@@ -66,7 +65,6 @@ impl Client {
     }
 
     pub fn url(&self, path: &str, project: bool) -> anyhow::Result<url::Url> {
-        // Operation URLs returned by Incus must never redirect our privileged client.
         anyhow::ensure!(
             path.starts_with("/1.0") && !path.starts_with("//"),
             "invalid Incus API path"
@@ -235,7 +233,6 @@ impl Client {
             }
             .into());
         }
-        // Runtime status files are tiny. Do not permit a guest to grow one indefinitely.
         anyhow::ensure!(
             response.content_length().unwrap_or(0) <= limit as u64,
             "oversized Incus status file"

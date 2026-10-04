@@ -7,7 +7,6 @@ pub mod docker;
 pub mod incus;
 pub mod noop;
 
-/// Runtime factory shared by Docker and LXC-style executors, following PR #34.
 pub struct Runtime {
     pub executor: Arc<dyn ServerExecutor>,
     pub docker: Option<Arc<bollard::Docker>>,

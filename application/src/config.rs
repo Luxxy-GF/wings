@@ -723,7 +723,6 @@ impl From<String> for SystemPath {
     }
 }
 
-/// Runtime selection is explicit: installing another engine never migrates workloads.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum RuntimeBackend {
@@ -754,6 +753,7 @@ pub struct IncusRuntime {
     pub operation_timeout_seconds: u64,
     pub image_import_timeout_seconds: u64,
     pub max_concurrent_imports: usize,
+    pub image_cache_retention_days: u32,
     pub root_disk_size: String,
 }
 
@@ -771,6 +771,7 @@ impl Default for IncusRuntime {
             operation_timeout_seconds: 120,
             image_import_timeout_seconds: 1800,
             max_concurrent_imports: 2,
+            image_cache_retention_days: 30,
             root_disk_size: "10GiB".into(),
         }
     }
@@ -1304,7 +1305,7 @@ nestify::nest! {
             pub domainname: String,
             #[serde(default)]
             #[schema(inline)]
-            pub registries: HashMap<String, #[derive(ToSchema, Deserialize, Serialize)] pub struct DockerRegistryConfiguration {
+            pub registries: HashMap<String, #[derive(Clone, ToSchema, Deserialize, Serialize)] pub struct DockerRegistryConfiguration {
                 pub username: String,
                 pub password: String,
             }>,

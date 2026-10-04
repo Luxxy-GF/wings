@@ -1,5 +1,3 @@
-//! Incus uses the bundled Tundra node in the host PID/network namespaces.
-//! The node adopts only this Wings node's instances through the Incus API.
 use super::{TundraManager, daemon};
 use crate::routes::State;
 use anyhow::{Context, ensure};
@@ -81,14 +79,12 @@ pub async fn ensure(state: &State, manager: &TundraManager) -> anyhow::Result<()
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .kill_on_drop(true);
-    // SAFETY: this callback only makes async-signal-safe Linux system calls.
-    // Kill the child if Wings dies, including when Wings is killed with SIGKILL.
     let parent = rustix::process::getpid();
     unsafe {
         command.pre_exec(move || {
             rustix::process::set_parent_process_death_signal(Some(rustix::process::Signal::KILL))?;
             if rustix::process::getppid() != Some(parent) {
-                return Err(std::io::Error::from_raw_os_error(3)); // ESRCH, no allocation after fork.
+                return Err(std::io::Error::from_raw_os_error(3));
             }
             Ok(())
         });

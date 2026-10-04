@@ -1,4 +1,3 @@
-//! Incus root storage and private control volumes. Server data remains in Wings's host directory.
 use super::client::{Client, is_status, segment};
 use anyhow::ensure;
 use reqwest::{Method, StatusCode};

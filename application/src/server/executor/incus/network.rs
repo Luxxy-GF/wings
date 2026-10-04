@@ -77,7 +77,6 @@ pub fn allocations(
             "wildcard and concrete allocations overlap on the same port"
         );
     }
-    // IPv6 proxies require an IPv6-enabled bridge and matching target address.
     ensure!(
         result.keys().all(IpAddr::is_ipv4),
         "IPv6 allocations require an IPv6-enabled Incus network (not implemented yet)"
@@ -204,7 +203,6 @@ impl Network {
     }
     pub async fn boot(&self) -> anyhow::Result<()> {
         ipv4_pool(&self.cidr)?;
-        // With features.networks=false, managed bridges are owned by the default project.
         let mut global = self.client.clone();
         global.project = "default".into();
         if let Some(network) = global.optional::<Value>(&self.path()).await? {
@@ -300,7 +298,6 @@ impl Network {
             .await
     }
     async fn all_instances(&self) -> anyhow::Result<Vec<Instance>> {
-        // all-projects cannot be combined with the client's project query parameter.
         let (value, _) = self
             .client
             .request(
@@ -316,8 +313,6 @@ impl Network {
     async fn migrate_forwards(&self) -> anyhow::Result<()> {
         let prefix = format!("{}:", self.owner);
         let forwards = self.forwards().await?;
-        // Incus 7.0 rejects proxies on an IP with any existing forward. Never remove
-        // another operator's entries merely to make migration possible.
         for forward in &forwards {
             if forward
                 .ports
@@ -370,8 +365,6 @@ impl Network {
         let _guard = self.lock.lock().await;
         let name = format!("wgs-{server}");
         let path = format!("/1.0/instances/{}", segment(&name));
-        // NAT devices do not bind sockets, so Incus cannot detect all overlaps itself.
-        // Check proxies in all projects, including inherited profile devices.
         let instances = self.all_instances().await?;
         for instance in &instances {
             if instance.name == name
@@ -458,8 +451,6 @@ impl Network {
                             .contains("Instance is busy running a \"stop\" operation")
                     }) && tokio::time::Instant::now() < deadline =>
                 {
-                    // Native teardown can still hold the instance after Stopped is reported.
-                    // Re-read metadata/ETag once that asynchronous stop has released it.
                     tokio::time::sleep(Duration::from_millis(250)).await;
                 }
                 Err(err) => return Err(err),

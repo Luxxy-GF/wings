@@ -1,4 +1,4 @@
-//! Incus 7.0 LTS OCI/LXC runtime. Docker is not used by this backend.
+mod auth;
 mod client;
 mod image;
 mod network;
@@ -53,6 +53,8 @@ impl Instance {
 #[derive(Clone, Debug, Deserialize)]
 pub struct InstanceState {
     pub status: String,
+    #[serde(default)]
+    pub pid: u32,
     #[serde(default, deserialize_with = "crate::deserialize::deserialize_nullable")]
     pub cpu: BTreeMap<String, u64>,
     #[serde(default, deserialize_with = "crate::deserialize::deserialize_nullable")]
@@ -62,6 +64,15 @@ pub struct InstanceState {
     #[serde(default)]
     pub started_at: Option<String>,
 }
+
+#[derive(Debug)]
+pub(crate) struct RecoveryError(anyhow::Error);
+impl std::fmt::Display for RecoveryError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "Incus recovery failed: {:#}", self.0)
+    }
+}
+impl std::error::Error for RecoveryError {}
 
 #[derive(Clone)]
 pub struct IncusExecutor {
@@ -164,8 +175,6 @@ impl IncusExecutor {
                         })
                         && tokio::time::Instant::now() < deadline =>
                 {
-                    // A fast OCI job can report Stopped while its shutdown hook
-                    // still holds the native instance. Wait for deletion to be valid.
                     tokio::time::sleep(Duration::from_millis(250)).await;
                 }
                 Err(error) => return Err(error),
@@ -317,8 +326,6 @@ impl IncusExecutor {
             }
             .into(),
         );
-        // Read the user from Incus's converted OCI spec, preserving its resolution.
-        // Helpers run as container root, matching the installer/script role in PR #34.
         result.insert(
             "oci.uid".into(),
             if installer { 0 } else { image.uid }.to_string(),
@@ -416,16 +423,12 @@ impl IncusExecutor {
                 .filter(|mount| mount.target != "/home/container")
                 .enumerate()
             {
-                // All extra paths still pass Wings's existing administrator allowlist.
                 let source = std::path::Path::new(mount.source.as_str());
                 ensure!(
                     source.is_absolute() && source.exists(),
                     "Incus mount source is missing"
                 );
                 let target = if mount.target == "/etc/hosts" {
-                    // Incus 7.0 overlays /etc/hosts after disk devices. Stage the
-                    // file through Incus, then bind it last relative to the rootfs.
-                    // This also works with private host parent directories.
                     config.insert("raw.lxc".into(),
                         "lxc.mount.entry = opt/wings-private-hosts etc/hosts none bind,ro,relative,create=file 0 0\n".into());
                     "/opt/wings-private-hosts"
@@ -461,8 +464,6 @@ impl IncusExecutor {
             .get("oci.gid")
             .context("Incus did not resolve the OCI GID")?
             .parse()?;
-        // Incus has no PVE mpN per-mount ID-map syntax. Map the Wings data account
-        // into this unprivileged instance at the image's UID/GID instead.
         instance.config.insert(
             "raw.idmap".into(),
             format!(
@@ -472,8 +473,6 @@ impl IncusExecutor {
             ),
         );
         self.client.request(Method::PUT, &Self::instance_path(name), Some(&json!({"config": instance.config, "devices": instance.devices, "profiles": []})), etag.as_deref(), true).await?;
-        // Incus ignores ownership/mode for an existing directory, including the
-        // volume root. A new private child gets the image user and mode applied.
         self.client
             .directory(
                 &self.storage.file_path(&control, "process"),
@@ -525,7 +524,6 @@ impl IncusExecutor {
             .attach()
             .await
             .context("attaching the server disk limiter")?;
-        // Installation and script helpers need the same data quota as game processes.
         limiter
             .startup()
             .await
@@ -539,8 +537,6 @@ impl IncusExecutor {
                 Duration::from_secs(self.config.load().runtime.incus.operation_timeout_seconds),
                 async {
                     loop {
-                        // Do not bind the empty directory beneath a FUSE mount while
-                        // its daemon starts: that would bypass the game-data quota.
                         let mounted = rustix::fs::statfs(&source)
                             .is_ok_and(|stat| stat.f_type == 0x6573_5546);
                         if mounted && fuse.is_socket_functional().await {
@@ -677,8 +673,6 @@ impl IncusExecutor {
         script: &crate::server::installation::InstallationScript,
         installation: bool,
     ) -> anyhow::Result<(Arc<dyn ProcessHandle>, StatusReceiver)> {
-        // OCI root is mapped to the configured Wings account, not host root.
-        // Repair server-owned data before a helper tries to write /mnt/server.
         server.log_daemon_install("[Incus] Preparing server data permissions...".into());
         server
             .filesystem
@@ -692,8 +686,6 @@ impl IncusExecutor {
         let name = if installation {
             format!("wgi-{}", server.uuid)
         } else {
-            // Instance names are DNS labels (63 characters maximum); leave room
-            // for the associated control-volume prefix too.
             let identity = uuid::Uuid::new_v4().simple().to_string();
             format!(
                 "wgx-{}-{}",
@@ -707,8 +699,6 @@ impl IncusExecutor {
             self.state_root().join("scripts").join(&name)
         };
         tokio::fs::create_dir_all(&staging).await?;
-        // Existing installation monitoring reads these host-side paths. Stage through an ID-mapped
-        // disk device; the script is written into the staging directory before startup.
         if installation {
             for filename in [
                 crate::server::installation::INSTALL_STATUS_FILE_NAME,
@@ -953,18 +943,34 @@ impl ServerExecutor for IncusExecutor {
         server: &Server,
     ) -> anyhow::Result<(Arc<dyn ProcessHandle>, StatusReceiver)> {
         let name = Self::name(server.uuid);
-        let instance = self.instance(&name).await?;
+        let instance = self
+            .client
+            .optional::<Instance>(&Self::instance_path(&name))
+            .await
+            .map_err(RecoveryError)?
+            .context("Incus server does not exist")?;
         ensure!(
             instance.status == "Running" || instance.status == "Frozen",
             "Incus server is not running"
         );
-        self.sync_server(server, &name).await?;
-        process::Handle::connect(self.clone(), server, name, true, true).await
+        async {
+            use std::os::unix::fs::MetadataExt;
+            self.check_owner(&instance)?;
+            let source = self.prepare_data_mount(server).await?;
+            ensure!(instance.effective_devices().get("data").and_then(|device| device.get("source")) == Some(&source.display().to_string()),
+                "running Incus server uses a different data mount; stop it before changing filesystem configuration");
+            let state: InstanceState = self.client.get(&format!("{}/state", Self::instance_path(&name))).await?;
+            ensure!(state.pid > 0, "running Incus server has no host PID");
+            let host = tokio::fs::metadata(&source).await?;
+            let guest = tokio::fs::metadata(format!("/proc/{}/root/home/container", state.pid)).await?;
+            ensure!(host.dev() == guest.dev() && host.ino() == guest.ino(),
+                "running Incus server has a stale data mount; stop it before recovering the quota filesystem");
+            self.sync_server(server, &name).await?;
+            process::Handle::connect(self.clone(), server, name, true, true).await
+        }.await.map_err(|error| RecoveryError(error).into())
     }
     async fn cleanup_server_process(&self, server: &Server) -> anyhow::Result<()> {
         let _guard = self.provisioning.lock().await;
-        // Instance deletion removes its proxy definitions and NAT rules as one lifecycle
-        // operation; avoid a separate device PUT racing native stop completion.
         self.remove_instance(&Self::name(server.uuid)).await?;
         if server.suspended.load(std::sync::atomic::Ordering::SeqCst) {
             self.cleanup_owned_helpers(server.uuid).await?;
@@ -985,6 +991,7 @@ impl ServerExecutor for IncusExecutor {
     ) -> anyhow::Result<(Arc<dyn ProcessHandle>, StatusReceiver)> {
         let name = format!("wgi-{}", server.uuid);
         self.instance(&name).await?;
+        self.prepare_data_mount(server).await?;
         process::Handle::connect(self.clone(), server, name, true, false).await
     }
     async fn cleanup_installation_process(&self, server: &Server) -> anyhow::Result<()> {
@@ -1017,11 +1024,9 @@ impl ServerExecutor for IncusExecutor {
         )))
     }
     async fn resolve_published_address(&self, _server: &Server) -> Option<IpAddr> {
-        // Tundra dials the inspected private IP from the host, like Docker bridge mode.
         None
     }
     async fn container_refs(&self, servers: &[Server]) -> HashMap<uuid::Uuid, String> {
-        // Stable instance names allow Tundra to refresh the PID after recreation.
         servers
             .iter()
             .map(|server| (server.uuid, Self::name(server.uuid)))
@@ -1049,7 +1054,6 @@ impl ServerExecutor for IncusExecutor {
                 continue;
             };
             if !live.contains(&uuid) {
-                // Clear orphan publication without deleting its recoverable data or running process.
                 self.network.sync(uuid, "", &BTreeMap::new()).await?;
                 continue;
             }

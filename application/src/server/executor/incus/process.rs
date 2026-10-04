@@ -17,8 +17,6 @@ use tokio::{
 };
 use tokio_tungstenite::tungstenite::Message;
 
-// The real image entrypoint remains argv, never interpolated into a host shell.
-// Control files live in a separate Incus volume, outside panel-visible server data.
 pub const SUPERVISOR: &str = concat!(
     "rm -f /opt/wings-control/process/exit; exec 3<&0; ",
     r#""$@" <&3 3<&- & child=$!; exec 3<&-; "#,
@@ -44,8 +42,6 @@ pub fn encode_argv(args: &[String]) -> anyhow::Result<String> {
 }
 
 pub fn launch_script(args: &[String]) -> anyhow::Result<String> {
-    // StartExecute inherits Incus's fork log descriptors, rather than the console.
-    // Connect the game to the instance console explicitly before the supervisor starts.
     let script = format!(
         "#!/bin/sh\nexec </dev/console >/dev/console 2>&1\nexec {}\n",
         encode_argv(args)?
@@ -174,7 +170,6 @@ async fn console_task(
                 let _ = limited.send(line);
             }
         }
-        // A guest can output an endless line. Bound its pending line buffer too.
         if pending.len() > 65536 {
             pending.clear();
         }
@@ -190,7 +185,6 @@ async fn console_task(
                 .get("control")
                 .and_then(Value::as_str)
                 .context("console control descriptor missing")?;
-            // Match the official client: establish control before activating data.
             let mut control = executor
                 .client
                 .websocket(&operation, control_secret)
@@ -211,9 +205,6 @@ async fn console_task(
         match connection {
             Ok((mut data, mut control)) => {
                 tracing::debug!(instance = %name, "Incus console websockets connected");
-                // Incus acknowledges the WebSocket before its forkconsole child
-                // initializes the terminal (which can flush early input). Keep
-                // queued commands until that initial attachment has settled.
                 let input_ready = tokio::time::sleep(Duration::from_secs(5));
                 tokio::pin!(input_ready);
                 let mut accept_input = false;
@@ -251,7 +242,6 @@ async fn console_task(
                         }
                         message = data.next() => {
                             let chunk = match message { Some(Ok(Message::Binary(data))) => data, Some(Ok(Message::Text(data))) => data.as_bytes().to_vec().into(), Some(Ok(Message::Ping(ping))) => { let _ = data.send(Message::Pong(ping)).await; continue; }, Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break, _ => continue };
-                            // Keep a bounded local replay log. A rolling file reader is never a status signal.
                             if log.metadata().await.is_ok_and(|meta| meta.len() > 10 * 1024 * 1024) { let _ = log.set_len(0).await; }
                             let _ = log.write_all(&chunk).await;
                             emit(&chunk);
@@ -263,7 +253,6 @@ async fn console_task(
                 }
             }
             Err(err) if super::client::is_status(&err, reqwest::StatusCode::NOT_FOUND) => {
-                // Deleted helpers will never acquire another console.
                 return;
             }
             Err(err) => {
@@ -286,7 +275,6 @@ async fn monitor_task(
     let mut running_announced = false;
     let mut cpu = None::<(u64, std::time::Instant)>;
     loop {
-        // A stopped response requested before start completed is not an exit.
         let start_acknowledged = started.load(Ordering::SeqCst);
         let state = executor
             .client
@@ -364,8 +352,6 @@ async fn monitor_task(
                     previous = state.status.clone();
                 }
                 if state.status == "Stopped" && start_acknowledged {
-                    // A successful start can finish between polls. Installer consumers require
-                    // an acknowledged start before a final stop; do not lose fast jobs.
                     if !running_announced && status.send(ProcessStatus::Running).await.is_err() {
                         return;
                     }
@@ -383,8 +369,6 @@ async fn monitor_task(
                         .and_then(|data| String::from_utf8(data).ok())
                         .and_then(|s| s.trim().parse::<i32>().ok())
                         .unwrap_or(-1);
-                    // Finish automatic script cleanup before notifying consumers;
-                    // they may immediately drop this handle and abort its tasks.
                     if name.starts_with("wgx-")
                         && let Err(error) = executor.remove_instance(&name).await
                     {
@@ -396,7 +380,6 @@ async fn monitor_task(
                             oom_killed: false,
                         })
                         .await;
-                    // Incus has no durable Docker-equivalent per-exit OOM flag; do not infer it from code 137.
                     return;
                 }
             }
@@ -433,7 +416,6 @@ impl ProcessHandle for Handle {
     }
     async fn send_stdin(&self, data: Vec<u8>) -> anyhow::Result<()> {
         ensure!(data.len() <= 65536, "console input exceeds 64 KiB");
-        // The Incus console is a terminal; Enter is CR, as in its official CLI.
         self.stdin
             .send(console_input(&data))
             .await
@@ -577,7 +559,6 @@ mod tests {
                     "stale stopped snapshot was treated as an exit"
                 );
                 if index == 0 {
-                    // Complete start while the pre-start GET is still in flight.
                     acknowledged.store(true, Ordering::SeqCst);
                 }
                 stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await?;

@@ -15,7 +15,7 @@ mod deauthorize_user;
 mod ports;
 pub mod servers;
 mod system;
-mod transfers;
+pub(crate) mod transfers;
 mod tundra;
 mod update;
 

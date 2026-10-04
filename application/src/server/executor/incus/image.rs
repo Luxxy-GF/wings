@@ -1,4 +1,3 @@
-//! OCI template imports through the official Incus 7.0 client conversion path.
 use super::client::{Client, segment};
 use anyhow::{Context, ensure};
 use serde::{Deserialize, Serialize};
@@ -13,10 +12,9 @@ use std::{
 };
 use tokio::{
     io::AsyncReadExt,
-    sync::{Mutex, Semaphore},
+    sync::{Mutex, RwLock, Semaphore},
 };
 
-/// Drain subprocess output without allowing a build to consume unlimited RAM.
 async fn tail(
     mut stream: impl tokio::io::AsyncRead + Unpin,
     keep_tail: bool,
@@ -50,8 +48,6 @@ fn report_progress(server: &crate::server::Server, installation: bool, message: 
     }
 }
 
-/// Incus CLI progress consists of carriage-return updates rather than lines.
-/// Bound each update, drain all output, and never forward terminal control bytes.
 async fn read_stdout(
     mut stream: impl tokio::io::AsyncRead + Unpin,
     progress: Option<(&crate::server::Server, bool)>,
@@ -234,6 +230,7 @@ pub struct Images {
     client: Client,
     concurrency: Semaphore,
     locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    cache_gate: RwLock<()>,
 }
 impl Images {
     pub fn new(config: Arc<crate::config::Config>, client: Client) -> Self {
@@ -243,6 +240,7 @@ impl Images {
             client,
             concurrency,
             locks: Mutex::new(HashMap::new()),
+            cache_gate: RwLock::new(()),
         }
     }
     fn root(&self) -> PathBuf {
@@ -250,12 +248,27 @@ impl Images {
             .resolve_as_path(|cfg| &cfg.system.root_directory)
             .join("incus-images")
     }
-    pub async fn boot(&self) -> anyhow::Result<()> {
+    pub async fn boot(self: &Arc<Self>) -> anyhow::Result<()> {
         let cfg = self.config.load().runtime.incus.clone();
         for path in [&cfg.incus_path, &cfg.skopeo_path] {
             run(path, &["--version".into()], Duration::from_secs(10), None).await?;
         }
         tokio::fs::create_dir_all(self.root()).await?;
+        if let Err(error) = self.cleanup().await {
+            tracing::warn!(%error, "Incus image cleanup skipped");
+        }
+        let images = Arc::downgrade(self);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(3600)).await;
+                let Some(images) = images.upgrade() else {
+                    break;
+                };
+                if let Err(error) = images.cleanup().await {
+                    tracing::warn!(%error, "Incus image cleanup skipped");
+                }
+            }
+        });
         Ok(())
     }
     pub async fn ensure(
@@ -264,6 +277,7 @@ impl Images {
         server: &crate::server::Server,
         installation: bool,
     ) -> anyhow::Result<Image> {
+        let _cache_guard = self.cache_gate.read().await;
         report_progress(
             server,
             installation,
@@ -283,6 +297,10 @@ impl Images {
         let _permit = self.concurrency.acquire().await?;
         let timeout = Duration::from_secs(cfg.image_import_timeout_seconds);
         let (registry, repository) = parse_reference(&reference)?;
+        let registries = self.config.load().docker.registries.clone();
+        let pull =
+            super::auth::PullEnvironment::new(&self.root(), &cfg, &registries, &registry).await?;
+        let env = &pull.environment;
         let architecture = match std::env::consts::ARCH {
             "x86_64" => "amd64",
             "aarch64" => "arm64",
@@ -301,7 +319,7 @@ impl Images {
                     format!("docker://{reference}"),
                 ],
                 timeout,
-                None,
+                Some(env),
             )
             .await?,
         )
@@ -350,6 +368,7 @@ impl Images {
                 .is_some()
         {
             report_progress(server, installation, "Using cached Incus image.");
+            Self::save(&path, &image).await?;
             return Ok(image);
         }
         let spec: Value = serde_json::from_slice(
@@ -361,7 +380,7 @@ impl Images {
                     format!("docker://{pinned}"),
                 ],
                 timeout,
-                None,
+                Some(env),
             )
             .await?,
         )
@@ -382,26 +401,8 @@ impl Images {
         let mut args = process.entrypoint.unwrap_or_default();
         args.extend(cmd.clone());
         ensure!(!args.is_empty(), "OCI image has no entrypoint or command");
-        // Private per-import config avoids modifying the operator's Incus CLI remotes.
         let directory = tempfile::tempdir_in(self.root())?;
-        let client_config = json!({"default-remote": "local", "remotes": {
-            "local": {"addr": "unix://", "protocol": "incus", "project": cfg.project},
-            "oci": {"addr": format!("https://{registry}"), "protocol": "oci", "public": true}
-        }});
-        tokio::fs::write(
-            directory.path().join("config.yml"),
-            serde_norway::to_string(&client_config)?,
-        )
-        .await?;
-        let env = BTreeMap::from([
-            ("INCUS_CONF".into(), directory.path().display().to_string()),
-            ("INCUS_SOCKET".into(), cfg.socket.clone()),
-        ]);
-        // Incus limits image alias names to 64 characters, including our prefix.
         let alias = format!("wings-{}", cache_key.get(..58).context("image cache key")?);
-        // Incus 7.0.1's `image copy --mode=relay` replaces the resolved OCI
-        // fingerprint with its alias, then fails to find it in the OCI cache.
-        // Export/import retains the official conversion path without that bug.
         let archive = directory.path().join("image.tar.gz");
         report_progress(
             server,
@@ -417,12 +418,10 @@ impl Images {
                 archive.display().to_string(),
             ],
             timeout,
-            Some(&env),
+            Some(env),
             Some((server, installation)),
         )
         .await?;
-        // Incus uses this converted OCI spec at start; it does not populate
-        // oci.uid/oci.gid in the instance API when those overrides are absent.
         let user_archive = archive.clone();
         let (uid, gid) =
             tokio::task::spawn_blocking(move || converted_user(&user_archive)).await??;
@@ -431,6 +430,7 @@ impl Images {
             installation,
             "Importing converted image into Incus...",
         );
+        let existing: Vec<Value> = self.client.get("/1.0/images?recursion=1").await?;
         run_with_progress(
             &cfg.incus_path,
             &[
@@ -445,7 +445,7 @@ impl Images {
                 cfg.project.clone(),
             ],
             timeout,
-            Some(&env),
+            Some(env),
             Some((server, installation)),
         )
         .await?;
@@ -467,12 +467,134 @@ impl Images {
             uid,
             gid,
         };
-        let temporary = path.with_extension(format!("{}.tmp", uuid::Uuid::new_v4()));
-        tokio::fs::write(&temporary, serde_json::to_vec(&image)?).await?;
-        tokio::fs::rename(temporary, path).await?;
+        if !existing
+            .iter()
+            .any(|old| old.get("fingerprint").and_then(Value::as_str) == Some(&image.fingerprint))
+        {
+            let image_path = format!("/1.0/images/{}", segment(&image.fingerprint));
+            let (mut metadata, etag) = self
+                .client
+                .request(reqwest::Method::GET, &image_path, None, None, true)
+                .await?;
+            let properties = metadata
+                .get_mut("properties")
+                .and_then(Value::as_object_mut)
+                .context("Incus image properties missing")?;
+            properties.insert(
+                "user.wings.owner".into(),
+                json!(format!("wings:{}", self.config.load().uuid)),
+            );
+            properties.insert("user.wings.cache".into(), json!(cache_key));
+            self.client
+                .request(
+                    reqwest::Method::PUT,
+                    &image_path,
+                    Some(&metadata),
+                    etag.as_deref(),
+                    true,
+                )
+                .await?;
+        }
+        Self::save(&path, &image).await?;
         report_progress(server, installation, "Incus image is ready.");
         Ok(image)
     }
+
+    async fn save(path: &std::path::Path, image: &Image) -> anyhow::Result<()> {
+        let temporary = path.with_extension(format!("{}.tmp", uuid::Uuid::new_v4()));
+        tokio::fs::write(&temporary, serde_json::to_vec(image)?).await?;
+        tokio::fs::rename(temporary, path).await?;
+        Ok(())
+    }
+
+    pub(super) async fn cleanup(&self) -> anyhow::Result<usize> {
+        let days = self.config.load().runtime.incus.image_cache_retention_days;
+        if days == 0 {
+            return Ok(0);
+        }
+        let _guard = self.cache_gate.write().await;
+        let instances: Vec<super::Instance> = self.client.get("/1.0/instances?recursion=1").await?;
+        let images: Vec<Value> = self.client.get("/1.0/images?recursion=1").await?;
+        let owner = format!("wings:{}", self.config.load().uuid);
+        let retention = Duration::from_secs(u64::from(days) * 86400);
+        let mut entries = tokio::fs::read_dir(self.root()).await?;
+        let mut removed = 0;
+        while let Some(entry) = entries.next_entry().await? {
+            let path = entry.path();
+            let Some(key) = path.file_stem().and_then(|key| key.to_str()) else {
+                continue;
+            };
+            if path.extension().and_then(|ext| ext.to_str()) != Some("json")
+                || key.len() != 64
+                || !key.bytes().all(|byte| byte.is_ascii_hexdigit())
+            {
+                continue;
+            }
+            let metadata = entry.metadata().await?;
+            if !metadata.is_file() || metadata.modified()?.elapsed().unwrap_or_default() < retention
+            {
+                continue;
+            }
+            let Ok(image) = serde_json::from_slice::<Image>(&tokio::fs::read(&path).await?) else {
+                continue;
+            };
+            let Some(metadata) = images.iter().find(|metadata| {
+                metadata.get("fingerprint").and_then(Value::as_str) == Some(&image.fingerprint)
+            }) else {
+                tokio::fs::remove_file(&path).await?;
+                continue;
+            };
+            if !collectible(metadata, key, &owner, &instances) {
+                continue;
+            }
+            let current: Vec<super::Instance> =
+                self.client.get("/1.0/instances?recursion=1").await?;
+            let image_path = format!("/1.0/images/{}", segment(&image.fingerprint));
+            let metadata: Value = self.client.get(&image_path).await?;
+            if !collectible(&metadata, key, &owner, &current) {
+                continue;
+            }
+            self.client
+                .request(reqwest::Method::DELETE, &image_path, None, None, true)
+                .await?;
+            tokio::fs::remove_file(&path).await?;
+            removed += 1;
+            tracing::info!(fingerprint = %image.fingerprint, "removed unused Incus image");
+        }
+        Ok(removed)
+    }
+}
+
+fn collectible(image: &Value, key: &str, owner: &str, instances: &[super::Instance]) -> bool {
+    let Some(fingerprint) = image.get("fingerprint").and_then(Value::as_str) else {
+        return false;
+    };
+    let Some(prefix) = key.get(..58) else {
+        return false;
+    };
+    let expected = format!("wings-{prefix}");
+    image
+        .pointer("/properties/user.wings.owner")
+        .and_then(Value::as_str)
+        == Some(owner)
+        && image
+            .pointer("/properties/user.wings.cache")
+            .and_then(Value::as_str)
+            == Some(key)
+        && image
+            .get("aliases")
+            .and_then(Value::as_array)
+            .is_some_and(|aliases| {
+                aliases
+                    .iter()
+                    .all(|alias| alias.get("name").and_then(Value::as_str) == Some(&expected))
+            })
+        && !instances.iter().any(|instance| {
+            instance
+                .config
+                .get("volatile.base_image")
+                .is_none_or(|base| base == fingerprint)
+        })
 }
 
 pub fn parse_reference(value: &str) -> anyhow::Result<(String, String)> {
@@ -506,6 +628,27 @@ pub fn parse_reference(value: &str) -> anyhow::Result<(String, String)> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn cleanup_protects_stopped_instances_unknown_bases_and_admin_aliases() -> anyhow::Result<()> {
+        let key = "a".repeat(64);
+        let mut image = json!({"fingerprint": "image-one", "properties": {"user.wings.owner": "wings:node", "user.wings.cache": key}, "aliases": [{"name": format!("wings-{}", &key[..58])}]});
+        assert!(collectible(&image, &key, "wings:node", &[]));
+        let instance: super::super::Instance = serde_json::from_value(
+            json!({"name": "admin-instance", "status": "Stopped", "config": {"volatile.base_image": "image-one"}}),
+        )?;
+        assert!(!collectible(&image, &key, "wings:node", &[instance]));
+        let unknown: super::super::Instance =
+            serde_json::from_value(json!({"name": "unknown-instance", "config": {}}))?;
+        assert!(!collectible(&image, &key, "wings:node", &[unknown]));
+        assert!(!collectible(&image, &key, "wings:other", &[]));
+        image["aliases"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"name": "admin-keep"}));
+        assert!(!collectible(&image, &key, "wings:node", &[]));
+        Ok(())
+    }
+
     #[tokio::test]
     async fn cli_progress_is_bounded_and_reaches_the_install_console() -> anyhow::Result<()> {
         use tokio::io::AsyncWriteExt;
@@ -516,7 +659,6 @@ mod tests {
         let (mut writer, reader) = tokio::io::duplex(1024);
         let producer = async {
             writer.write_all(b"\rDownloading OCI image\r").await?;
-            // Progress output may exceed the JSON command's 64 KiB capture limit.
             writer.write_all(&vec![b'x'; 128 * 1024]).await?;
             writer.write_all(b"\r\x00Image import done").await?;
             writer.shutdown().await
