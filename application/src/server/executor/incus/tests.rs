@@ -22,6 +22,7 @@ fn requires_lts_and_capabilities() -> anyhow::Result<()> {
         "instance_oci_entrypoint",
         "oci_network_config",
         "network_forward",
+        "proxy_nat",
         "file_storage_volume",
     ]
     .map(str::to_owned);
@@ -186,18 +187,34 @@ async fn entrypoint_override_retains_image_command_arguments() -> anyhow::Result
 }
 
 #[test]
-fn wildcard_allocations_require_a_concrete_address() -> anyhow::Result<()> {
+fn wildcard_allocations_are_preserved_for_nat_proxies() -> anyhow::Result<()> {
     let mut server = ServerConfiguration::mock(uuid::Uuid::new_v4());
     server
         .allocations
         .mappings
         .insert("0.0.0.0".into(), vec![25565]);
-    assert!(network::allocations(&server, &[]).is_err());
-    let ip: IpAddr = "192.0.2.10".parse()?;
     assert_eq!(
-        network::allocations(&server, &[ip])?.get(&ip),
+        network::allocations(&server, &[])?.get(&"0.0.0.0".parse()?),
         Some(&BTreeSet::from([25565]))
     );
+    let ip: IpAddr = "192.0.2.10".parse()?;
+    assert_eq!(
+        network::allocations(&server, &[ip])?.get(&"0.0.0.0".parse()?),
+        Some(&BTreeSet::from([25565]))
+    );
+    let spec = firewall_spec(&server, "10.76.0.2".parse()?, &[ip])?;
+    assert!(spec.bindings.iter().all(|binding| binding.ip.is_none()));
+    server
+        .allocations
+        .mappings
+        .insert("192.0.2.20".into(), vec![25566]);
+    assert!(network::allocations(&server, &[ip])?.contains_key(&"192.0.2.20".parse()?));
+    server
+        .allocations
+        .mappings
+        .insert("192.0.2.20".into(), vec![25565]);
+    assert!(network::allocations(&server, &[ip]).is_err());
+    server.allocations.mappings.remove("192.0.2.20");
     server.allocations.mappings.insert("::".into(), vec![25565]);
     assert!(network::allocations(&server, &[ip]).is_err());
     Ok(())
@@ -248,6 +265,16 @@ async fn api_errors_keep_status_for_conditional_retries() -> anyhow::Result<()> 
 #[tokio::test]
 #[ignore = "requires an explicitly configured disposable Incus 7.0.x node"]
 async fn live_incus_lifecycle_volume_console_and_forwards() -> anyhow::Result<()> {
+    live_incus_lifecycle(true).await
+}
+
+#[tokio::test]
+#[ignore = "requires an explicitly configured disposable Incus 7.0.x node"]
+async fn live_incus_allocation_proxies_and_cleanup() -> anyhow::Result<()> {
+    live_incus_lifecycle(false).await
+}
+
+async fn live_incus_lifecycle(test_console: bool) -> anyhow::Result<()> {
     use tokio::io::AsyncReadExt;
     use tracing_subscriber::{Layer, layer::SubscriberExt, util::SubscriberInitExt};
     let _ = tracing_subscriber::registry()
@@ -327,11 +354,11 @@ open('/home/container/persist', 'w').write('volume-data')
 def tcp():
     s=socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR,1); s.bind(('0.0.0.0',{port})); s.listen()
     while True:
-        c,a=s.accept(); c.sendall(b'tcp-ok'); c.close()
+        c,a=s.accept(); open('/home/container/tcp-peer','w').write(a[0]); c.sendall(b'tcp-ok'); c.close()
 def udp():
     s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.bind(('0.0.0.0',{port}))
     while True:
-        d,a=s.recvfrom(100); s.sendto(b'udp-ok',a)
+        d,a=s.recvfrom(100); open('/home/container/udp-peer','w').write(a[0]); s.sendto(b'udp-ok',a)
 threading.Thread(target=tcp,daemon=True).start()
 threading.Thread(target=udp,daemon=True).start()
 print('READY',flush=True)
@@ -375,21 +402,97 @@ for line in sys.stdin:
         let mut reply = [0; 6];
         tokio::time::timeout(Duration::from_secs(10), udp.recv_from(&mut reply)).await??;
         ensure!(&reply == b"udp-ok", "UDP forward failed");
-        eprintln!("PASS real TCP/UDP forward traffic");
+        eprintln!("PASS concrete-address TCP/UDP NAT proxy traffic");
+        let desired = BTreeMap::from([(listen, BTreeSet::from([port]))]);
+        let name = IncusExecutor::name(server.uuid);
+        let instance = executor.instance(&name).await?;
+        let target = instance.config.get("user.wings.ip").context("test instance IP missing")?.clone();
+        let device_names: BTreeSet<_> = instance.devices.keys().filter(|name| name.starts_with("wings-port-")).cloned().collect();
+        ensure!(device_names.len() == 2, "expected two protocol proxy devices");
+        // Simulate the prior release: a running instance with an allocation journal
+        // and network forwards instead of proxy devices.
+        executor.network.sync(server.uuid, "", &BTreeMap::new()).await?;
+        let path = IncusExecutor::instance_path(&name);
+        let mut value: Value = executor.client.get(&path).await?;
+        value["config"]["user.wings.allocations"] = json!(serde_json::to_string(&desired)?);
+        executor.client.mutate(Method::PUT, &path, value).await?;
+        let mut global = executor.client.clone();
+        global.project = "default".into();
+        let forwards_path = format!("/1.0/networks/{network}/forwards");
+        let forward_path = format!("{forwards_path}/{listen}");
+        let owner = format!("wings:{node}");
+        let ports: Vec<_> = ["tcp", "udp"].iter().map(|protocol| json!({
+            "protocol": protocol, "listen_port": port.to_string(), "target_address": target,
+            "description": format!("{owner}:{}", server.uuid)
+        })).collect();
+        let mut mixed = ports.clone();
+        mixed.push(json!({"protocol": "tcp", "listen_port": (port + 1).to_string(), "target_address": target, "description": "operator-rule"}));
+        global.mutate(Method::POST, &forwards_path, json!({"listen_address": listen.to_string(), "description": owner, "ports": mixed})).await?;
+        ensure!(executor.network.boot().await.is_err(), "migration overwrote an unrelated forward entry");
+        let unchanged: Value = global.get(&forward_path).await?;
+        ensure!(unchanged["ports"].as_array().is_some_and(|p| p.len() == 3), "failed migration changed shared forward");
+        global.mutate(Method::PUT, &forward_path, json!({"description": owner, "config": {}, "ports": ports})).await?;
+        executor.network.boot().await?;
+        ensure!(global.optional::<Value>(&forward_path).await?.is_none(), "legacy forward was not removed");
+        let mut stream = tokio::net::TcpStream::connect(SocketAddr::new(listen, port)).await?;
+        stream.read_exact(&mut reply).await?;
+        ensure!(&reply == b"tcp-ok", "migration lost running-server TCP publication");
+        eprintln!("PASS migration of running instance and preservation of unrelated forwarding rules");
+        {
+            let mut config = server.configuration.write().await;
+            config.allocations.mappings.clear();
+            config.allocations.mappings.insert("0.0.0.0".into(), vec![port]);
+        }
+        executor.sync_server(&server, &name).await?;
+        let instance = executor.instance(&name).await?;
+        ensure!(device_names.iter().all(|name| !instance.devices.contains_key(name)), "stale concrete proxy survived wildcard update");
+        let socket = tokio::net::TcpSocket::new_v4()?;
+        socket.bind(SocketAddr::new(listen, 0))?;
+        let mut stream = socket.connect(SocketAddr::new(listen, port)).await?;
+        stream.read_exact(&mut reply).await?;
+        ensure!(&reply == b"tcp-ok", "wildcard TCP proxy failed");
+        let udp = tokio::net::UdpSocket::bind(SocketAddr::new(listen, 0)).await?;
+        udp.send_to(b"test", SocketAddr::new(listen, port)).await?;
+        tokio::time::timeout(Duration::from_secs(10), udp.recv_from(&mut reply)).await??;
+        ensure!(&reply == b"udp-ok", "wildcard UDP proxy failed");
+        for peer in ["tcp-peer", "udp-peer"] {
+            ensure!(tokio::fs::read_to_string(server.filesystem.base_path.join(peer)).await? == listen.to_string(), "NAT proxy changed client source IP");
+        }
+        let used = executor.network.used_ports(&[listen]).await?;
+        ensure!(used[&listen].iter().any(|p| p.port == port && p.server == Some(server.uuid)), "used_ports omitted wildcard publication");
+        let collision = executor.network.sync(uuid::Uuid::new_v4(), &target,
+            &BTreeMap::from([(listen, BTreeSet::from([port]))])).await.expect_err("overlapping concrete allocation accepted");
+        ensure!(collision.to_string().contains("conflicts"), "collision failed for wrong reason: {collision}");
+        executor.network.sync(server.uuid, "", &BTreeMap::new()).await?;
+        ensure!(tokio::net::TcpStream::connect(SocketAddr::new(listen, port)).await.is_err(), "removed proxy still accepts traffic");
+        executor.sync_server(&server, &name).await?;
+        eprintln!("PASS wildcard TCP/UDP traffic, client IP preservation, allocation update/removal, and overlap rejection");
         drop(handle); // Simulate Wings console disconnect without stopping the game.
         let (reattached, mut status) = executor.attach_server_process(&server).await?;
-        reattached.stop().await?;
-        let exit = tokio::time::timeout(Duration::from_secs(60), async {
-            while let Some(status) = status.recv().await {
-                if let super::super::ProcessStatus::Stopped { exit_code, .. } = status {
-                    return Ok::<_, anyhow::Error>(exit_code);
+        if test_console {
+            // Incus acknowledges the WebSocket before forkconsole finishes initializing.
+            // Very slow emulated nodes can exceed the runtime's normal input grace.
+            let settle: u64 = std::env::var("INCUS_TEST_CONSOLE_SETTLE_SECONDS")
+                .unwrap_or_else(|_| "0".into()).parse()?;
+            ensure!(settle <= 60, "test console settling delay must be at most 60 seconds");
+            tokio::time::sleep(Duration::from_secs(settle)).await;
+            reattached.stop().await?;
+            let exit = tokio::time::timeout(Duration::from_secs(60), async {
+                while let Some(status) = status.recv().await {
+                    if let super::super::ProcessStatus::Stopped { exit_code, .. } = status {
+                        return Ok::<_, anyhow::Error>(exit_code);
+                    }
                 }
-            }
-            anyhow::bail!("process status ended without exit")
-        })
-        .await??;
-        ensure!(exit == 7, "game exit code was not preserved");
-        eprintln!("PASS console reconnect, stdin stop, and exit code 7");
+                anyhow::bail!("process status ended without exit")
+            })
+            .await??;
+            ensure!(exit == 7, "game exit code was not preserved");
+            eprintln!("PASS console reconnect, stdin stop, and exit code 7");
+        } else {
+            reattached.kill().await?;
+            let _ = wait_live_exit(&mut status).await?;
+            eprintln!("PASS Incus API stop with proxy devices attached");
+        }
         drop(reattached);
         ensure!(
             tokio::fs::read_to_string(server.filesystem.base_path.join("persist")).await?

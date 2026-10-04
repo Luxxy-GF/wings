@@ -1,6 +1,6 @@
 # Incus 7.0 LTS executor (experimental)
 
-This backend follows [PR #34's LXC runtime approach](https://github.com/calagopus/wings/pull/34), with Incus replacing Proxmox and [Incus network forwards](https://linuxcontainers.org/incus/docs/main/howto/network_forwards/) publishing allocations. Select it explicitly with `runtime.backend: incus`; Docker remains the default. Runtime configuration changes require a restart.
+This backend follows [PR #34's LXC runtime approach](https://github.com/calagopus/wings/pull/34), with Incus replacing Proxmox and [Incus NAT proxy devices](https://linuxcontainers.org/incus/docs/main/reference/devices_proxy/) publishing allocations. Select it explicitly with `runtime.backend: incus`; Docker remains the default. Runtime configuration changes require a restart.
 
 ## Architecture
 
@@ -12,7 +12,7 @@ This backend follows [PR #34's LXC runtime approach](https://github.com/calagopu
 | Existing Wings server directory bound into LXC | Host directory mounted at `/home/container`, or `/mnt/server` for helpers |
 | OCI user and host data ownership | Incus resolves the OCI UID/GID; `raw.idmap` maps the non-root Wings data account to that user |
 | Host file APIs, quotas, backups, and inotify | Existing Wings filesystem and disk-limiter implementation remains responsible |
-| Proxmox bridge/edge forwarding | Incus-managed bridge, private addresses, and TCP/UDP network forwards |
+| Proxmox bridge/edge forwarding | Incus-managed bridge, private addresses, and TCP/UDP NAT proxy devices |
 
 Images are pulled from the egg/helper registry reference. There is no local Containerfile/Buildah recipe path. The official Incus client handles OCI conversion through `image export` and `image import`, using temporary archives and a private client configuration without modifying operator CLI remotes. This avoids Incus 7.0.1's OCI relay-copy alias bug. Allow temporary disk space for the converted archives beneath the Wings root directory. Incus instance, storage, lifecycle, console, and forwarding operations use the REST API over the local Unix socket.
 
@@ -72,8 +72,9 @@ runtime:
     root_disk_size: 10GiB
     network: wingsbr0
     ipv4_address: 10.76.0.1/24
-    listen_addresses:
-      - 192.0.2.10
+    # Optional concrete address for advertising wildcard allocations.
+    # Does not restrict proxy listening; panel allocation IPs control that.
+    listen_addresses: []
     operation_timeout_seconds: 120
     image_import_timeout_seconds: 1800
     max_concurrent_imports: 2
@@ -96,13 +97,25 @@ The project owns its images, profiles, and private control volumes. It uses `fea
 
 Disable Wings's machine-ID mounts for initial hardware tests. The default product-UUID target `/sys/class/dmi/id/product_uuid` includes a sysfs symlink on physical hosts, which LXC refuses as a bind-mount target. Private process files are placed in an image-user-owned child directory inside the control volume: Incus 7.0's file API does not change permissions or ownership when asked to create a directory that already exists, including the volume root.
 
-## Network forwards
+## Allocation proxy devices
 
-One Incus forward is shared per concrete allocation IP. Its TCP and UDP port entries point to each server's private IP and matching game port. A whole-address `target_address` is avoided because it would send unmatched ports to a single server.
+Panel allocation IPv4 addresses are used directly, including `0.0.0.0`. Each instance gets two NAT proxy devices per allocation IP: TCP and UDP, with the allocated port list connected to the same ports on its static private bridge IP. For example, `0.0.0.0:5000` listens on all host IPv4 destinations; `10.0.10.20:5000` listens only on that destination IP. `nat=true` avoids a userspace relay and preserves the client's source address. The host must be the container's gateway, as it is with the Wings-managed bridge.
 
-Updates preserve unrelated entries, tag entries with node/server ownership, reject overlapping port mappings, and serialize changes within the Wings process. Requests send ETags and retry precondition failures, but **Incus 7.0.1 does not enforce `If-Match` on network-forward updates**. Use one Wings process per managed network and avoid concurrent external edits to its forwards; those edits can otherwise be overwritten. A runtime start publishes allocations only after its assigned address is present. Failed publication attempts to remove its partial forwards and stop the instance. Cleanup removes only the server's entries.
+`listen_addresses` is no longer used to expand wildcard allocations. It remains an optional concrete address hint for features that advertise a wildcard allocation. Wings does not assign external IPs or configure upstream routing; a public address translated by a router still needs that router's port forwarding. Current support is IPv4 on managed bridges.
 
-Wildcard allocations require `listen_addresses` to expand them to concrete host IPs. These IPs must satisfy Incus's bridge-forward restrictions and be reachable through the host/upstream network. Wings does not assign external IPs or configure upstream routing. Current support is IPv4 on managed bridges.
+Wings reserves instance device names beginning with `wings-port-`. It updates only these allocation devices, preserves the other instance settings/devices, sends instance ETags, and waits for asynchronous REST operations. Publication occurs after the guest acquires its private address. Cleanup removes the allocation devices; deleting the instance also deletes its device definitions and active NAT rules. Devices remain attached when a container stops, so their allocations remain reserved for that server.
+
+Before adding devices, Wings rejects wildcard/concrete port overlaps within a server and checks existing host-bound proxies across all Incus projects, including profile devices. Use one Wings process for the node; simultaneous external edits and unrelated host NAT rules are not coordinated by this check.
+
+On startup, Wings migrates its previous network forwards to proxy devices and republishes running instances from their allocation journals. Panel reconciliation then refreshes running instances from current allocations. Migration removes only forwards owned entirely by this node. A forward mixed with unrelated entries causes a clear error without removing those entries. Incus 7.0 rejects a concrete-IP proxy if a network forward already uses that IP, even for different ports, so the old forward object must be removed before the new proxy is installed. Migration briefly interrupts published traffic; game files and container processes are retained.
+
+Inspect the devices with:
+
+```bash
+incus config device show wgs-SERVER_UUID --project wings
+```
+
+`incus network forward list` no longer shows the allocations after migration.
 
 Incus owns forwarding/NAT. The existing host nftables firewall preserves panel rule order and source-file sets. Incus ACLs have different action ordering, so they do not replace Wings's ordered firewall. The `docker.firewall.backend` setting currently selects this host policy backend; `auto`, `nftables`, and explicit `disabled` are supported.
 
@@ -116,12 +129,15 @@ This is an experimental implementation following the PR's architecture, with inc
 - The existing `docker.registries` credential map is not wired into Incus. Standard service-account registry authentication is used; private-registry/proxy combinations require validation.
 - Image replacement, console replay completeness, backups/transfers, host quota mounts, and daemon restart recovery need live validation. Cached-image garbage collection and automated backend migration are not implemented.
 - I/O priority supports Docker weights 10 or multiples of 100 through 1000. Other weights are rejected.
+- Console input waits five seconds after WebSocket attachment, but Incus does not acknowledge native relay readiness. Reconnect input was intermittently lost in the slow QEMU/TCG lab, including with an additional 15-second test delay; a later command through the official client succeeded. Early-input reliability remains a limitation requiring hardware checks.
 - The supervisor records exit codes. Forced kills can leave an unknown code (`-1`); there is no inferred OOM flag.
-- `used_ports` reflects Incus forwards, but does not completely represent host-service conflicts or unrelated NAT rules.
+- `used_ports` reflects Incus proxies and remaining legacy forwards, but does not completely represent host-service conflicts or unrelated NAT rules.
 
 ## Validation
 
-Local Incus and installation regression tests: **19 passed**. The full live lifecycle/helper test passed separately with the root Python image and the non-root Python yolk. Incus installers with a nonzero or unknown exit code now report failure even if no status file was written. Direct REST checks also passed for managed bridge/forward CRUD, shared-IP entries, collision/subnet rejection, unattached custom-volume file access, quota configuration, and cleanup. Quota configuration was checked; quota-overflow enforcement was not tested.
+Local Incus and installation regression tests: **19 passed**. Before the proxy migration change, the full live lifecycle/helper test passed separately with the root Python image and the non-root Python yolk. Incus installers with a nonzero or unknown exit code now report failure even if no status file was written. Direct REST checks also passed for managed bridge/forward CRUD, shared-IP entries, collision/subnet rejection, unattached custom-volume file access, quota configuration, and cleanup. Quota configuration was checked; quota-overflow enforcement was not tested.
+
+On 2026-10-04, the focused `live_incus_allocation_proxies_and_cleanup` test passed against Incus 7.0.1 with `python:3.13-alpine` and a Btrfs pool. It verified concrete and wildcard TCP/UDP traffic, client source-IP preservation, migration of a running instance, preservation of unrelated forward entries, allocation update/removal and overlap rejection, used-port reporting, Incus API stop, host file ownership/persistence after deletion, installer status/progress, script exit code 9, and owned-resource cleanup. Production Clippy passed with warnings denied. Rechecking the full console test encountered intermittent reconnect-input loss, including with an extra 15-second settling delay; that limitation remains unresolved.
 
 For an initial hardware smoke test, use a spare Linux node with Incus 7.0.1, an existing Btrfs/ZFS test pool, the required tools, and the UID/GID delegation above. Run the following as root from this checkout, supplying the node's real IPv4 address. The test creates its own random project and bridge and retains your existing pool:
 
@@ -138,6 +154,15 @@ cargo fmt --all -- --check
 cargo clippy -p wings-rs --bin wings-rs -- -D warnings
 cargo test -p wings-rs incus -- --skip live_incus_lifecycle_volume_console_and_forwards
 ```
+
+A focused networking/helper test uses the Incus stop API and checks allocation proxies, legacy-forward migration, conflict rejection, persistent data and cleanup independently of console input:
+
+```sh
+INCUS_TEST_POOL=your-test-pool INCUS_TEST_LISTEN_IP=your-node-ipv4 \
+  cargo test -p wings-rs live_incus_allocation_proxies_and_cleanup -- --ignored --nocapture
+```
+
+The full console test also accepts `INCUS_TEST_CONSOLE_SETTLE_SECONDS` (maximum 60 seconds) for diagnosis on slow emulated hosts. Additional settling did not eliminate the observed intermittent reconnect-input failure; it is not a runtime readiness fix.
 
 The ignored live test uses an explicitly selected disposable Incus host/pool. It creates a random project/bridge, imports an OCI image, tests TCP/UDP forwarding, reconnects the console, checks exit status and stopped-server host-file access, and deletes its owned resources. It retains the supplied storage pool.
 

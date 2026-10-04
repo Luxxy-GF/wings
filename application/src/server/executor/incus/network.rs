@@ -9,6 +9,7 @@ use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     net::{IpAddr, Ipv4Addr},
+    time::Duration,
 };
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -56,39 +57,27 @@ pub fn ipv4_pool(value: &str) -> anyhow::Result<(u32, u32, u32)> {
 
 pub fn allocations(
     config: &crate::server::configuration::ServerConfiguration,
-    listen: &[IpAddr],
+    _listen: &[IpAddr],
 ) -> anyhow::Result<BTreeMap<IpAddr, BTreeSet<u16>>> {
     let mut result = BTreeMap::<IpAddr, BTreeSet<u16>>::new();
     for (address, ports) in &config.allocations.mappings {
         let ip: IpAddr = address.parse().context("invalid panel allocation IP")?;
-        let addresses = if ip.is_unspecified() {
-            let addresses: Vec<_> = listen
-                .iter()
-                .copied()
-                .filter(|candidate| {
-                    candidate.is_ipv4() == ip.is_ipv4() && !candidate.is_unspecified()
-                })
-                .collect();
-            ensure!(
-                !addresses.is_empty(),
-                "wildcard allocation requires concrete runtime.incus.listen_addresses"
-            );
-            addresses
-        } else {
-            vec![ip]
-        };
-        for address in addresses {
-            ensure!(
-                ports.iter().all(|p| *p > 0),
-                "allocation port zero is invalid"
-            );
-            result
-                .entry(address)
-                .or_default()
-                .extend(ports.iter().copied());
-        }
+        ensure!(
+            ports.iter().all(|p| *p > 0),
+            "allocation port zero is invalid"
+        );
+        result.entry(ip).or_default().extend(ports.iter().copied());
     }
-    // The first implementation deliberately refuses IPv6 forwarding onto an IPv4-only bridge.
+    if let Some(wildcard) = result.get(&IpAddr::V4(Ipv4Addr::UNSPECIFIED)) {
+        ensure!(
+            result
+                .iter()
+                .filter(|(ip, _)| !ip.is_unspecified())
+                .all(|(_, ports)| ports.is_disjoint(wildcard)),
+            "wildcard and concrete allocations overlap on the same port"
+        );
+    }
+    // IPv6 proxies require an IPv6-enabled bridge and matching target address.
     ensure!(
         result.keys().all(IpAddr::is_ipv4),
         "IPv6 allocations require an IPv6-enabled Incus network (not implemented yet)"
@@ -113,41 +102,82 @@ fn port_set(value: &str) -> anyhow::Result<BTreeSet<u16>> {
     Ok(result)
 }
 
-pub fn merge_ports(
-    existing: &[ForwardPort],
-    owner: &str,
-    target: &str,
-    desired: &BTreeSet<u16>,
-) -> anyhow::Result<Vec<ForwardPort>> {
-    let mut result = Vec::new();
-    for entry in existing {
-        if entry.description == owner {
+const PROXY_PREFIX: &str = "wings-port-";
+type Devices = BTreeMap<String, BTreeMap<String, String>>;
+
+fn proxy_devices(target: &str, desired: &BTreeMap<IpAddr, BTreeSet<u16>>) -> Devices {
+    let mut devices = Devices::new();
+    for (ip, ports) in desired {
+        if ports.is_empty() {
             continue;
         }
-        ensure!(
-            port_set(&entry.listen_port)?.is_disjoint(desired),
-            "allocation conflicts with another Incus forward entry"
-        );
-        result.push(entry.clone());
-    }
-    if !desired.is_empty() {
-        let ports = desired
+        let ports = ports
             .iter()
             .map(u16::to_string)
             .collect::<Vec<_>>()
             .join(",");
         for protocol in ["tcp", "udp"] {
-            result.push(ForwardPort {
-                protocol: protocol.into(),
-                listen_port: ports.clone(),
-                target_address: target.into(),
-                target_port: String::new(),
-                description: owner.into(),
-                extra: BTreeMap::new(),
-            });
+            devices.insert(
+                format!(
+                    "{PROXY_PREFIX}{}-{protocol}",
+                    ip.to_string().replace('.', "-")
+                ),
+                BTreeMap::from([
+                    ("type".into(), "proxy".into()),
+                    ("bind".into(), "host".into()),
+                    ("nat".into(), "true".into()),
+                    ("listen".into(), format!("{protocol}:{ip}:{ports}")),
+                    ("connect".into(), format!("{protocol}:{target}:{ports}")),
+                ]),
+            );
         }
     }
-    Ok(result)
+    devices
+}
+
+fn proxy_binding(
+    device: &BTreeMap<String, String>,
+) -> anyhow::Result<Option<(IpAddr, BTreeSet<u16>)>> {
+    if device.get("type").map(String::as_str) != Some("proxy")
+        || device.get("bind").map(String::as_str) == Some("instance")
+    {
+        return Ok(None);
+    }
+    let Some(listen) = device.get("listen") else {
+        return Ok(None);
+    };
+    let mut parts = listen.splitn(3, ':');
+    if !matches!(parts.next(), Some("tcp" | "udp")) {
+        return Ok(None);
+    }
+    let Some(address) = parts.next().and_then(|s| s.parse::<IpAddr>().ok()) else {
+        return Ok(None);
+    };
+    Ok(Some((
+        address,
+        port_set(parts.next().context("proxy listen ports missing")?)?,
+    )))
+}
+
+fn overlaps(a: IpAddr, b: IpAddr) -> bool {
+    a.is_ipv4() == b.is_ipv4() && (a == b || a.is_unspecified() || b.is_unspecified())
+}
+
+fn check_proxy_conflicts(
+    devices: &Devices,
+    desired: &BTreeMap<IpAddr, BTreeSet<u16>>,
+) -> anyhow::Result<()> {
+    for device in devices.values() {
+        if let Some((address, ports)) = proxy_binding(device)? {
+            for (wanted_ip, wanted_ports) in desired {
+                ensure!(
+                    !overlaps(address, *wanted_ip) || ports.is_disjoint(wanted_ports),
+                    "allocation conflicts with an existing Incus proxy on {address}"
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 pub struct Network {
@@ -155,6 +185,7 @@ pub struct Network {
     name: String,
     owner: String,
     cidr: String,
+    timeout: Duration,
     lock: tokio::sync::Mutex<()>,
 }
 impl Network {
@@ -164,6 +195,7 @@ impl Network {
             name: cfg.network.clone(),
             owner: format!("wings:{node}"),
             cidr: cfg.ipv4_address.clone(),
+            timeout: Duration::from_secs(cfg.operation_timeout_seconds),
             lock: tokio::sync::Mutex::new(()),
         }
     }
@@ -198,6 +230,31 @@ impl Network {
             global.mutate(Method::POST, "/1.0/networks", json!({"name": self.name, "type": "bridge", "config": {
                 "ipv4.address": self.cidr, "ipv4.nat": "true", "ipv4.dhcp": "true", "ipv6.address": "none", "user.wings.owner": self.owner
             }})).await?;
+        }
+        self.migrate_forwards().await?;
+        let instances: Vec<Instance> = self.client.get("/1.0/instances?recursion=1").await?;
+        for instance in instances {
+            if instance.name.starts_with("wgs-")
+                && instance.config.get("user.wings.owner") == Some(&self.owner)
+                && matches!(instance.status.as_str(), "Running" | "Frozen")
+            {
+                let server = instance
+                    .config
+                    .get("user.wings.server")
+                    .context("instance server missing")?
+                    .parse()?;
+                let target = instance
+                    .config
+                    .get("user.wings.ip")
+                    .context("instance IP missing")?;
+                let desired = serde_json::from_str(
+                    instance
+                        .config
+                        .get("user.wings.allocations")
+                        .context("allocation journal missing")?,
+                )?;
+                self.sync(server, target, &desired).await?;
+            }
         }
         Ok(())
     }
@@ -242,6 +299,68 @@ impl Network {
             .get(&format!("{}/forwards?recursion=1", self.path()))
             .await
     }
+    async fn all_instances(&self) -> anyhow::Result<Vec<Instance>> {
+        // all-projects cannot be combined with the client's project query parameter.
+        let (value, _) = self
+            .client
+            .request(
+                Method::GET,
+                "/1.0/instances?recursion=1&all-projects=true",
+                None,
+                None,
+                false,
+            )
+            .await?;
+        serde_json::from_value(value).context("decoding all-project Incus instances")
+    }
+    async fn migrate_forwards(&self) -> anyhow::Result<()> {
+        let prefix = format!("{}:", self.owner);
+        let forwards = self.forwards().await?;
+        // Incus 7.0 rejects proxies on an IP with any existing forward. Never remove
+        // another operator's entries merely to make migration possible.
+        for forward in &forwards {
+            if forward
+                .ports
+                .iter()
+                .any(|p| p.description.starts_with(&prefix))
+            {
+                ensure!(
+                    forward.description == self.owner
+                        && forward
+                            .ports
+                            .iter()
+                            .all(|p| p.description.starts_with(&prefix))
+                        && !forward.config.contains_key("target_address"),
+                    "cannot migrate shared/unmanaged Incus forward {}; move its unrelated rules first",
+                    forward.listen_address
+                );
+            }
+        }
+        let mut global = self.client.clone();
+        global.project = "default".into();
+        for forward in forwards {
+            if forward.description == self.owner
+                && forward
+                    .ports
+                    .iter()
+                    .all(|p| p.description.starts_with(&prefix))
+                && !forward.config.contains_key("target_address")
+            {
+                global
+                    .mutate(
+                        Method::DELETE,
+                        &format!(
+                            "{}/forwards/{}",
+                            self.path(),
+                            segment(&forward.listen_address)
+                        ),
+                        json!({}),
+                    )
+                    .await?;
+            }
+        }
+        Ok(())
+    }
     pub async fn sync(
         &self,
         server: uuid::Uuid,
@@ -249,87 +368,103 @@ impl Network {
         desired: &BTreeMap<IpAddr, BTreeSet<u16>>,
     ) -> anyhow::Result<()> {
         let _guard = self.lock.lock().await;
-        let owner = format!("{}:{server}", self.owner);
-        let current = self.forwards().await?;
-        let mut addresses: BTreeSet<IpAddr> = desired.keys().copied().collect();
-        addresses.extend(
-            current
-                .iter()
-                .filter(|f| f.ports.iter().any(|p| p.description == owner))
-                .filter_map(|f| f.listen_address.parse::<IpAddr>().ok()),
-        );
-        let mut global = self.client.clone();
-        global.project = "default".into();
-        for ip in addresses {
-            let path = format!("{}/forwards/{}", self.path(), segment(&ip.to_string()));
-            let wanted = desired.get(&ip).cloned().unwrap_or_default();
-            let mut completed = false;
-            for _ in 0..5 {
-                let (mut forward, etag) =
-                    match global.request(Method::GET, &path, None, None, true).await {
-                        Ok((value, etag)) => (serde_json::from_value::<Forward>(value)?, etag),
-                        Err(err) if is_status(&err, StatusCode::NOT_FOUND) => (
-                            Forward {
-                                listen_address: ip.to_string(),
-                                description: self.owner.clone(),
-                                config: BTreeMap::new(),
-                                ports: Vec::new(),
-                            },
-                            None,
-                        ),
-                        Err(err) => return Err(err),
-                    };
-                ensure!(
-                    !forward.config.contains_key("target_address"),
-                    "Incus forward has a conflicting catch-all target"
-                );
-                forward.ports = merge_ports(&forward.ports, &owner, target, &wanted)?;
-                let result = if forward.ports.is_empty()
-                    && forward.description == self.owner
-                    && etag.is_some()
-                {
-                    global
-                        .request(Method::DELETE, &path, None, etag.as_deref(), true)
-                        .await
-                } else if etag.is_some() {
-                    let body = json!({"description": forward.description, "config": forward.config, "ports": forward.ports});
-                    global
-                        .request(Method::PUT, &path, Some(&body), etag.as_deref(), true)
-                        .await
-                } else if wanted.is_empty() {
-                    completed = true;
-                    break;
-                } else {
-                    global
-                        .request(
-                            Method::POST,
-                            &format!("{}/forwards", self.path()),
-                            Some(&serde_json::to_value(forward)?),
-                            None,
-                            true,
-                        )
-                        .await
-                };
-                match result {
-                    Ok(_) => {
-                        completed = true;
-                        break;
-                    }
-                    Err(err)
-                        if is_status(&err, StatusCode::PRECONDITION_FAILED)
-                            || is_status(&err, StatusCode::CONFLICT) =>
-                    {
-                        continue;
-                    }
-                    Err(err) => return Err(err),
-                }
+        let name = format!("wgs-{server}");
+        let path = format!("/1.0/instances/{}", segment(&name));
+        // NAT devices do not bind sockets, so Incus cannot detect all overlaps itself.
+        // Check proxies in all projects, including inherited profile devices.
+        let instances = self.all_instances().await?;
+        for instance in &instances {
+            if instance.name == name
+                && instance.project == self.client.project
+                && instance.config.get("user.wings.owner") == Some(&self.owner)
+                && instance.config.get("user.wings.server") == Some(&server.to_string())
+            {
+                let unmanaged: Devices = instance
+                    .effective_devices()
+                    .iter()
+                    .filter(|(name, _)| !name.starts_with(PROXY_PREFIX))
+                    .map(|(name, device)| (name.clone(), device.clone()))
+                    .collect();
+                check_proxy_conflicts(&unmanaged, desired)?;
+            } else {
+                check_proxy_conflicts(instance.effective_devices(), desired)?;
             }
+        }
+        for forward in self.forwards().await? {
+            let address: IpAddr = forward.listen_address.parse()?;
             ensure!(
-                completed,
-                "Incus forward changed repeatedly; refusing to overwrite it"
+                !desired.keys().any(|ip| overlaps(*ip, address)),
+                "allocation overlaps existing Incus network forward {address}; remove or migrate that forward first"
             );
         }
-        Ok(())
+        let deadline = tokio::time::Instant::now() + self.timeout;
+        let mut precondition_failures = 0;
+        loop {
+            let (mut value, etag) = match self
+                .client
+                .request(Method::GET, &path, None, None, true)
+                .await
+            {
+                Ok(result) => result,
+                Err(err) if is_status(&err, StatusCode::NOT_FOUND) && desired.is_empty() => {
+                    return Ok(());
+                }
+                Err(err) => return Err(err),
+            };
+            let instance: Instance = serde_json::from_value(value.clone())?;
+            ensure!(
+                instance.config.get("user.wings.owner") == Some(&self.owner)
+                    && instance.config.get("user.wings.server") == Some(&server.to_string()),
+                "refusing unmanaged Incus instance {name}"
+            );
+            let mut devices = instance.devices;
+            devices.retain(|name, _| !name.starts_with(PROXY_PREFIX));
+            devices.extend(proxy_devices(target, desired));
+            if value.get("devices") == Some(&serde_json::to_value(&devices)?)
+                && value
+                    .pointer("/config/user.wings.allocations")
+                    .and_then(Value::as_str)
+                    == Some(&serde_json::to_string(desired)?)
+            {
+                return Ok(());
+            }
+            let object = value
+                .as_object_mut()
+                .context("Incus instance metadata is not an object")?;
+            object.insert("devices".into(), serde_json::to_value(devices)?);
+            let mut config = instance.config;
+            config.insert(
+                "user.wings.allocations".into(),
+                serde_json::to_string(desired)?,
+            );
+            object.insert("config".into(), serde_json::to_value(config)?);
+            match self
+                .client
+                .request(Method::PUT, &path, Some(&value), etag.as_deref(), true)
+                .await
+            {
+                Ok(_) => return Ok(()),
+                Err(err) if is_status(&err, StatusCode::PRECONDITION_FAILED) => {
+                    precondition_failures += 1;
+                    ensure!(
+                        precondition_failures < 5,
+                        "Incus instance changed repeatedly while updating allocation proxies"
+                    );
+                }
+                Err(err)
+                    if err.chain().any(|cause| {
+                        cause
+                            .to_string()
+                            .contains("Instance is busy running a \"stop\" operation")
+                    }) && tokio::time::Instant::now() < deadline =>
+                {
+                    // Native teardown can still hold the instance after Stopped is reported.
+                    // Re-read metadata/ETag once that asynchronous stop has released it.
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                }
+                Err(err) => return Err(err),
+            }
+        }
     }
     pub async fn used_ports(
         &self,
@@ -337,6 +472,33 @@ impl Network {
     ) -> anyhow::Result<HashMap<IpAddr, Vec<super::super::UsedPort>>> {
         let mut result: HashMap<IpAddr, Vec<super::super::UsedPort>> =
             ips.iter().map(|ip| (*ip, Vec::new())).collect();
+        let instances = self.all_instances().await?;
+        for instance in instances {
+            let server = if instance.config.get("user.wings.owner") == Some(&self.owner) {
+                instance
+                    .config
+                    .get("user.wings.server")
+                    .and_then(|s| s.parse().ok())
+            } else {
+                None
+            };
+            for device in instance.effective_devices().values() {
+                if let Some((address, ports)) = proxy_binding(device)? {
+                    for (ip, entries) in &mut result {
+                        if overlaps(*ip, address) {
+                            for port in &ports {
+                                if !entries.iter().any(|item| item.port == *port) {
+                                    entries.push(super::super::UsedPort {
+                                        port: *port,
+                                        server,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
         for forward in self.forwards().await? {
             let address: IpAddr = forward.listen_address.parse()?;
             for (ip, entries) in &mut result {
@@ -364,14 +526,27 @@ impl Network {
 mod tests {
     use super::*;
     #[test]
-    fn merge_preserves_other_servers_and_rejects_conflicts() -> anyhow::Result<()> {
-        let first = merge_ports(&[], "first", "10.0.0.2", &BTreeSet::from([25565]))?;
-        let second = merge_ports(&first, "second", "10.0.0.3", &BTreeSet::from([25566]))?;
-        assert_eq!(second.len(), 4);
-        assert!(merge_ports(&first, "second", "10.0.0.3", &BTreeSet::from([25565])).is_err());
-        let removed = merge_ports(&second, "first", "", &BTreeSet::new())?;
-        assert_eq!(removed.len(), 2);
-        assert!(removed.iter().all(|p| p.description == "second"));
+    fn wildcard_proxies_conflict_with_concrete_bindings_but_not_other_ports() -> anyhow::Result<()>
+    {
+        let wildcard = BTreeMap::from([("0.0.0.0".parse()?, BTreeSet::from([25565]))]);
+        let devices = proxy_devices("10.76.0.2", &wildcard);
+        let concrete = BTreeMap::from([("192.0.2.10".parse()?, BTreeSet::from([25565]))]);
+        assert!(check_proxy_conflicts(&devices, &concrete).is_err());
+        assert!(check_proxy_conflicts(&proxy_devices("10.76.0.3", &concrete), &wildcard).is_err());
+        assert!(
+            check_proxy_conflicts(
+                &devices,
+                &BTreeMap::from([("192.0.2.10".parse()?, BTreeSet::from([25566]))])
+            )
+            .is_ok()
+        );
+        assert!(
+            check_proxy_conflicts(
+                &proxy_devices("10.76.0.2", &concrete),
+                &BTreeMap::from([("192.0.2.11".parse()?, BTreeSet::from([25565]))])
+            )
+            .is_ok()
+        );
         Ok(())
     }
     #[test]

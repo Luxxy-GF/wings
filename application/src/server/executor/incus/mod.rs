@@ -31,11 +31,24 @@ use storage::Storage;
 pub struct Instance {
     pub name: String,
     #[serde(default)]
+    pub project: String,
+    #[serde(default)]
     pub status: String,
     #[serde(default)]
     pub config: BTreeMap<String, String>,
     #[serde(default)]
     pub devices: BTreeMap<String, BTreeMap<String, String>>,
+    #[serde(default)]
+    pub expanded_devices: BTreeMap<String, BTreeMap<String, String>>,
+}
+impl Instance {
+    fn effective_devices(&self) -> &BTreeMap<String, BTreeMap<String, String>> {
+        if self.expanded_devices.is_empty() {
+            &self.devices
+        } else {
+            &self.expanded_devices
+        }
+    }
 }
 #[derive(Clone, Debug, Deserialize)]
 pub struct InstanceState {
@@ -343,9 +356,6 @@ impl IncusExecutor {
         let cfg = server.configuration.read().await;
         Self::validate_server(&cfg)?;
         let runtime = self.config.load().runtime.incus.clone();
-        if !installer {
-            self.network.sync(server.uuid, "", &BTreeMap::new()).await?;
-        }
         if let Some(existing) = self
             .client
             .optional::<Instance>(&Self::instance_path(name))
@@ -719,6 +729,7 @@ pub fn verify_version(version: &str, extensions: &[String]) -> anyhow::Result<()
         "instance_oci_entrypoint",
         "oci_network_config",
         "network_forward",
+        "proxy_nat",
         "file_storage_volume",
     ] {
         ensure!(
@@ -743,7 +754,7 @@ fn firewall_spec(
                 ports
                     .iter()
                     .map(|port| crate::server::firewall::FirewallBinding {
-                        ip: Some(*ip),
+                        ip: (!ip.is_unspecified()).then_some(*ip),
                         port: *port,
                     })
             })
@@ -886,7 +897,8 @@ impl ServerExecutor for IncusExecutor {
     }
     async fn cleanup_server_process(&self, server: &Server) -> anyhow::Result<()> {
         let _guard = self.provisioning.lock().await;
-        self.network.sync(server.uuid, "", &BTreeMap::new()).await?;
+        // Instance deletion removes its proxy definitions and NAT rules as one lifecycle
+        // operation; avoid a separate device PUT racing native stop completion.
         self.remove_instance(&Self::name(server.uuid)).await?;
         if server.suspended.load(std::sync::atomic::Ordering::SeqCst) {
             self.cleanup_owned_helpers(server.uuid).await?;
@@ -1008,6 +1020,10 @@ impl ServerExecutor for IncusExecutor {
                 .get("user.wings.ip")
                 .context("instance address missing")?
                 .parse()?;
+            if matches!(instance.status.as_str(), "Running" | "Frozen") {
+                let desired = network::allocations(&raw.settings, &[])?;
+                self.network.sync(uuid, &ip.to_string(), &desired).await?;
+            }
             let mut spec = firewall_spec(
                 &raw.settings,
                 ip,
