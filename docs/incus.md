@@ -16,7 +16,7 @@ This backend follows [PR #34's LXC runtime approach](https://github.com/calagopu
 
 Images are pulled from the egg/helper registry reference. There is no local Containerfile/Buildah recipe path. The official Incus client handles OCI conversion through `image export` and `image import`, using temporary archives and a private client configuration without modifying operator CLI remotes. This avoids Incus 7.0.1's OCI relay-copy alias bug. Allow temporary disk space for the converted archives beneath the Wings root directory. Incus instance, storage, lifecycle, console, and forwarding operations use the REST API over the local Unix socket.
 
-Root disks are disposable Incus storage volumes. Private launch scripts and process-control files use separate Incus custom volumes mounted at `/opt/wings-control`, outside panel-visible data and the image's `/run` mounts. A simple file entrypoint preserves multiline arguments through LXC's configuration parser. Instance cleanup preserves the host server directory. Explicit server deletion uses Wings's normal filesystem deletion path.
+Root disks are disposable Incus storage volumes. Private launch scripts and process-control files use separate Incus custom volumes mounted at `/opt/wings-control`, outside panel-visible data and the image's `/run` mounts. A simple file entrypoint preserves multiline arguments through LXC's configuration parser. Process files live in the image-user-owned `/opt/wings-control/process` child directory. Instance cleanup preserves the host server directory. Explicit server deletion uses Wings's normal filesystem deletion path.
 
 ## Requirements and configuration
 
@@ -108,11 +108,11 @@ Incus owns forwarding/NAT. The existing host nftables firewall preserves panel r
 
 ## Current limitations
 
-This is an experimental implementation following the PR's architecture, with incomplete feature parity. On 2026-10-03, the complete live smoke test passed against Incus 7.0.1 in a disposable Debian VM with a Btrfs pool, using `python:3.13-alpine`. It covered OCI import, real TCP/UDP forward traffic, console reconnect and command stop with exit code 7, host data ownership/persistence, installer progress/status files, script exit code 9, and owned-resource cleanup.
+This is an experimental implementation following the PR's architecture, with incomplete feature parity. On 2026-10-03, the complete live smoke test passed against Incus 7.0.1 in a disposable Debian VM with a Btrfs pool, using `python:3.13-alpine`. It covered OCI import, real TCP/UDP forward traffic, console reconnect and command stop with exit code 7, host data ownership/persistence, installer progress/status files, script exit code 9, and owned-resource cleanup. On 2026-10-04, the same full test passed with the non-root `ghcr.io/pterodactyl/yolks:python_3.11` image after the control-directory and state-monitor fixes.
 
 - Tundra provisioning, IPv6, remote Incus, clusters/OVN, forced outgoing-IP SNAT, device passthrough, custom seccomp, OOM-disable, and CPU boosts remain unsupported and are rejected when requested.
-- **Non-root OCI images are not ready for general use.** The current console launch path opens `/dev/console` as the image user, while Incus creates it with root-only access. Most normal Wings yolks use a non-root user and need an additional bootstrap fix. Use the root-user smoke image for hardware validation; do not deploy this backend to existing game servers yet.
-- Native Incus `raw.idmap` is an instance-wide mapping, unlike Proxmox's per-mount `mpN` ID maps. The live smoke test verified guest root mapped to host data UID 1000; other image users and extra mount ownership still require validation.
+- **Non-root OCI startup has been smoke-tested with `ghcr.io/pterodactyl/yolks:python_3.11`.** Console I/O, control-file writes, forwarding, and helper execution passed. Full game eggs and their installer scripts still require hardware validation; this remains an experimental backend.
+- Native Incus `raw.idmap` is an instance-wide mapping, unlike Proxmox's per-mount `mpN` ID maps. The live tests verified both guest root and the non-root Python yolk mapped to host data UID 1000; extra mount ownership still requires validation.
 - The existing `docker.registries` credential map is not wired into Incus. Standard service-account registry authentication is used; private-registry/proxy combinations require validation.
 - Image replacement, console replay completeness, backups/transfers, host quota mounts, and daemon restart recovery need live validation. Cached-image garbage collection and automated backend migration are not implemented.
 - I/O priority supports Docker weights 10 or multiples of 100 through 1000. Other weights are rejected.
@@ -121,7 +121,7 @@ This is an experimental implementation following the PR's architecture, with inc
 
 ## Validation
 
-Local Incus and installation regression tests: **19 passed**. The full live lifecycle/helper test: **1 passed**. Direct REST checks also passed for managed bridge/forward CRUD, shared-IP entries, collision/subnet rejection, unattached custom-volume file access, quota configuration, and cleanup. Quota configuration was checked; quota-overflow enforcement was not tested.
+Local Incus and installation regression tests: **19 passed**. The full live lifecycle/helper test passed separately with the root Python image and the non-root Python yolk. Incus installers with a nonzero or unknown exit code now report failure even if no status file was written. Direct REST checks also passed for managed bridge/forward CRUD, shared-IP entries, collision/subnet rejection, unattached custom-volume file access, quota configuration, and cleanup. Quota configuration was checked; quota-overflow enforcement was not tested.
 
 For an initial hardware smoke test, use a spare Linux node with Incus 7.0.1, an existing Btrfs/ZFS test pool, the required tools, and the UID/GID delegation above. Run the following as root from this checkout, supplying the node's real IPv4 address. The test creates its own random project and bridge and retains your existing pool:
 
