@@ -17,7 +17,7 @@ use tokio::{
 };
 use tokio_tungstenite::tungstenite::Message;
 
-pub const SUPERVISOR: &str = concat!(
+pub(super) const SUPERVISOR: &str = concat!(
     "rm -f /opt/wings-control/process/exit; exec 3<&0; ",
     r#""$@" <&3 3<&- & child=$!; exec 3<&-; "#,
     r#"printf '%s\n' "$child" > /opt/wings-control/process/pid; "#,
@@ -29,7 +29,7 @@ pub const SUPERVISOR: &str = concat!(
     r#"mv /opt/wings-control/process/exit.tmp /opt/wings-control/process/exit; exit "$code""#,
 );
 
-pub fn encode_argv(args: &[String]) -> anyhow::Result<String> {
+pub(super) fn encode_argv(args: &[String]) -> anyhow::Result<String> {
     ensure!(
         !args.is_empty() && args.iter().all(|arg| !arg.contains('\0')),
         "invalid OCI argv"
@@ -41,7 +41,7 @@ pub fn encode_argv(args: &[String]) -> anyhow::Result<String> {
         .join(" "))
 }
 
-pub fn launch_script(args: &[String]) -> anyhow::Result<String> {
+pub(super) fn launch_script(args: &[String]) -> anyhow::Result<String> {
     let script = format!(
         "#!/bin/sh\nexec </dev/console >/dev/console 2>&1\nexec {}\n",
         encode_argv(args)?
@@ -66,7 +66,7 @@ fn console_input(data: &[u8]) -> Vec<u8> {
     input
 }
 
-pub struct Handle {
+pub(super) struct Handle {
     name: String,
     executor: IncusExecutor,
     server: Weak<crate::server::InnerServer>,
@@ -85,7 +85,7 @@ impl Drop for Handle {
     }
 }
 impl Handle {
-    pub async fn connect(
+    pub(super) async fn connect(
         executor: IncusExecutor,
         server: &crate::server::Server,
         name: String,
@@ -148,17 +148,14 @@ async fn console_task(
     limited: broadcast::Sender<Arc<compact_str::CompactString>>,
     path: PathBuf,
 ) {
-    let mut pending = Vec::new();
+    let mut line_buffer = crate::io::line_buffer::LineBuffer::new();
     let mut line_count = 0;
     let mut interval = std::time::Instant::now();
     let mut initial_replay = true;
     let mut emit = |chunk: &[u8]| {
-        pending.extend_from_slice(chunk);
-        while let Some(position) = pending.iter().position(|byte| *byte == b'\n') {
-            let bytes: Vec<_> = pending.drain(..=position).collect();
-            let line = Arc::new(compact_str::CompactString::from(
-                String::from_utf8_lossy(&bytes).trim_end_matches(['\r', '\n']),
-            ));
+        line_buffer.extend(chunk);
+        while let Some(bytes) = line_buffer.next_line() {
+            let line = Arc::new(compact_str::CompactString::from_utf8_lossy(bytes));
             let _ = lines.send(Arc::clone(&line));
             let cfg = executor.config.load();
             if interval.elapsed() >= Duration::from_millis(cfg.throttles.line_reset_interval) {
@@ -170,9 +167,7 @@ async fn console_task(
                 let _ = limited.send(line);
             }
         }
-        if pending.len() > 65536 {
-            pending.clear();
-        }
+        line_buffer.compact();
     };
     loop {
         let connection = async {
@@ -241,13 +236,34 @@ async fn console_task(
                             tracing::debug!(instance = %name, "Incus console input frame sent");
                         }
                         message = data.next() => {
-                            let chunk = match message { Some(Ok(Message::Binary(data))) => data, Some(Ok(Message::Text(data))) => data.as_bytes().to_vec().into(), Some(Ok(Message::Ping(ping))) => { let _ = data.send(Message::Pong(ping)).await; continue; }, Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break, _ => continue };
-                            if log.metadata().await.is_ok_and(|meta| meta.len() > 10 * 1024 * 1024) { let _ = log.set_len(0).await; }
-                            let _ = log.write_all(&chunk).await;
+                            let chunk = match message {
+                                Some(Ok(Message::Binary(data))) => data,
+                                Some(Ok(Message::Text(data))) => data.as_bytes().to_vec().into(),
+                                Some(Ok(Message::Ping(ping))) => {
+                                    if data.send(Message::Pong(ping)).await.is_err() { break; }
+                                    continue;
+                                }
+                                Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
+                                _ => continue,
+                            };
+                            if log.metadata().await.is_ok_and(|meta| meta.len() > 10 * 1024 * 1024)
+                                && let Err(error) = log.set_len(0).await
+                            {
+                                tracing::warn!(instance = %name, %error, "could not truncate Incus console log");
+                            }
+                            if let Err(error) = log.write_all(&chunk).await {
+                                tracing::warn!(instance = %name, %error, "could not write Incus console log");
+                            }
                             emit(&chunk);
                         }
                         message = control.next() => {
-                            match message { Some(Ok(Message::Ping(data))) => { let _ = control.send(Message::Pong(data)).await; }, Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break, _ => {} }
+                            match message {
+                                Some(Ok(Message::Ping(data))) => {
+                                    if control.send(Message::Pong(data)).await.is_err() { break; }
+                                }
+                                Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
+                                _ => {}
+                            }
                         }
                     }
                 }
@@ -316,26 +332,14 @@ async fn monitor_task(
                                     0
                                 }
                             });
-                        if let Some(counters) =
-                            state.network.get("eth0").and_then(|v| v.get("counters"))
-                        {
-                            usage.network.rx_bytes = counters
-                                .get("bytes_received")
-                                .and_then(Value::as_u64)
-                                .unwrap_or(0);
-                            usage.network.tx_bytes = counters
-                                .get("bytes_sent")
-                                .and_then(Value::as_u64)
-                                .unwrap_or(0);
-                            usage.network.rx_packets = counters
-                                .get("packets_received")
-                                .and_then(Value::as_u64)
-                                .unwrap_or(0);
-                            usage.network.tx_packets = counters
-                                .get("packets_sent")
-                                .and_then(Value::as_u64)
-                                .unwrap_or(0);
-                        }
+                        let counters = state.network.get("eth0").map(|nic| &nic.counters);
+                        usage.network.rx_bytes =
+                            counters.map_or(0, |counters| counters.bytes_received);
+                        usage.network.tx_bytes = counters.map_or(0, |counters| counters.bytes_sent);
+                        usage.network.rx_packets =
+                            counters.map_or(0, |counters| counters.packets_received);
+                        usage.network.tx_packets =
+                            counters.map_or(0, |counters| counters.packets_sent);
                     });
                 }
                 if state.status != previous {
@@ -495,7 +499,20 @@ impl ProcessHandle for Handle {
                         .await?;
                     let pid: u32 = std::str::from_utf8(&pid)?.trim().parse()?;
                     ensure!(pid > 1, "invalid game process PID");
-                    let result = self.executor.client.mutate(reqwest::Method::POST, &format!("/1.0/instances/{}/exec", segment(&self.name)), json!({"command": ["/bin/sh", "-c", format!("kill -s {signal} {pid}")], "wait-for-websocket": false, "interactive": false})).await?;
+                    let body = json!({
+                        "command": ["/bin/sh", "-c", format!("kill -s {signal} {pid}")],
+                        "wait-for-websocket": false,
+                        "interactive": false,
+                    });
+                    let result = self
+                        .executor
+                        .client
+                        .mutate(
+                            reqwest::Method::POST,
+                            &format!("/1.0/instances/{}/exec", segment(&self.name)),
+                            body,
+                        )
+                        .await?;
                     ensure!(
                         result.pointer("/metadata/return").and_then(Value::as_i64) == Some(0),
                         "Incus stop signal was not delivered"

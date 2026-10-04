@@ -1,6 +1,7 @@
 use super::{
     Instance,
     client::{Client, is_status, segment},
+    instance::Devices,
 };
 use anyhow::{Context, ensure};
 use reqwest::{Method, StatusCode};
@@ -13,7 +14,7 @@ use std::{
 };
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
-pub struct ForwardPort {
+pub(super) struct ForwardPort {
     pub protocol: String,
     pub listen_port: String,
     pub target_address: String,
@@ -25,7 +26,7 @@ pub struct ForwardPort {
     pub extra: BTreeMap<String, Value>,
 }
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct Forward {
+pub(super) struct Forward {
     pub listen_address: String,
     #[serde(default)]
     pub description: String,
@@ -35,7 +36,7 @@ pub struct Forward {
     pub ports: Vec<ForwardPort>,
 }
 
-pub fn ipv4_pool(value: &str) -> anyhow::Result<(u32, u32, u32)> {
+pub(super) fn ipv4_pool(value: &str) -> anyhow::Result<(u32, u32, u32)> {
     let (address, prefix) = value
         .split_once('/')
         .context("Incus bridge requires IPv4 CIDR")?;
@@ -55,9 +56,8 @@ pub fn ipv4_pool(value: &str) -> anyhow::Result<(u32, u32, u32)> {
     Ok((network, broadcast, gateway))
 }
 
-pub fn allocations(
+pub(super) fn allocations(
     config: &crate::server::configuration::ServerConfiguration,
-    _listen: &[IpAddr],
 ) -> anyhow::Result<BTreeMap<IpAddr, BTreeSet<u16>>> {
     let mut result = BTreeMap::<IpAddr, BTreeSet<u16>>::new();
     for (address, ports) in &config.allocations.mappings {
@@ -102,7 +102,6 @@ fn port_set(value: &str) -> anyhow::Result<BTreeSet<u16>> {
 }
 
 const PROXY_PREFIX: &str = "wings-port-";
-type Devices = BTreeMap<String, BTreeMap<String, String>>;
 
 fn proxy_devices(target: &str, desired: &BTreeMap<IpAddr, BTreeSet<u16>>) -> Devices {
     let mut devices = Devices::new();
@@ -179,7 +178,7 @@ fn check_proxy_conflicts(
     Ok(())
 }
 
-pub struct Network {
+pub(super) struct Network {
     client: Client,
     name: String,
     owner: String,
@@ -188,7 +187,7 @@ pub struct Network {
     lock: tokio::sync::Mutex<()>,
 }
 impl Network {
-    pub fn new(client: Client, cfg: &crate::config::IncusRuntime, node: uuid::Uuid) -> Self {
+    pub(super) fn new(client: Client, cfg: &crate::config::IncusRuntime, node: uuid::Uuid) -> Self {
         Self {
             client,
             name: cfg.network.clone(),
@@ -201,7 +200,7 @@ impl Network {
     fn path(&self) -> String {
         format!("/1.0/networks/{}", segment(&self.name))
     }
-    pub async fn boot(&self) -> anyhow::Result<()> {
+    pub(super) async fn boot(&self) -> anyhow::Result<()> {
         ipv4_pool(&self.cidr)?;
         let mut global = self.client.clone();
         global.project = "default".into();
@@ -256,7 +255,7 @@ impl Network {
         }
         Ok(())
     }
-    pub async fn allocate(&self, instances: &[Instance]) -> anyhow::Result<Ipv4Addr> {
+    pub(super) async fn allocate(&self, instances: &[Instance]) -> anyhow::Result<Ipv4Addr> {
         let (network, broadcast, gateway) = ipv4_pool(&self.cidr)?;
         let mut used: BTreeSet<u32> = instances
             .iter()
@@ -356,7 +355,7 @@ impl Network {
         }
         Ok(())
     }
-    pub async fn sync(
+    pub(super) async fn sync(
         &self,
         server: uuid::Uuid,
         target: &str,
@@ -393,47 +392,40 @@ impl Network {
         let deadline = tokio::time::Instant::now() + self.timeout;
         let mut precondition_failures = 0;
         loop {
-            let (mut value, etag) = match self
-                .client
-                .request(Method::GET, &path, None, None, true)
-                .await
-            {
+            let (mut instance, etag) = match self.client.get_with_etag::<Instance>(&path).await {
                 Ok(result) => result,
                 Err(err) if is_status(&err, StatusCode::NOT_FOUND) && desired.is_empty() => {
                     return Ok(());
                 }
                 Err(err) => return Err(err),
             };
-            let instance: Instance = serde_json::from_value(value.clone())?;
             ensure!(
                 instance.config.get("user.wings.owner") == Some(&self.owner)
                     && instance.config.get("user.wings.server") == Some(&server.to_string()),
                 "refusing unmanaged Incus instance {name}"
             );
-            let mut devices = instance.devices;
+            let mut devices = instance.devices.clone();
             devices.retain(|name, _| !name.starts_with(PROXY_PREFIX));
             devices.extend(proxy_devices(target, desired));
-            if value.get("devices") == Some(&serde_json::to_value(&devices)?)
-                && value
-                    .pointer("/config/user.wings.allocations")
-                    .and_then(Value::as_str)
-                    == Some(&serde_json::to_string(desired)?)
+            let journal = serde_json::to_string(desired)?;
+            if instance.devices == devices
+                && instance.config.get("user.wings.allocations") == Some(&journal)
             {
                 return Ok(());
             }
-            let object = value
-                .as_object_mut()
-                .context("Incus instance metadata is not an object")?;
-            object.insert("devices".into(), serde_json::to_value(devices)?);
-            let mut config = instance.config;
-            config.insert(
-                "user.wings.allocations".into(),
-                serde_json::to_string(desired)?,
-            );
-            object.insert("config".into(), serde_json::to_value(config)?);
+            instance.devices = devices;
+            instance
+                .config
+                .insert("user.wings.allocations".into(), journal);
             match self
                 .client
-                .request(Method::PUT, &path, Some(&value), etag.as_deref(), true)
+                .request(
+                    Method::PUT,
+                    &path,
+                    Some(&instance.update_body()),
+                    etag.as_deref(),
+                    true,
+                )
                 .await
             {
                 Ok(_) => return Ok(()),
@@ -457,7 +449,7 @@ impl Network {
             }
         }
     }
-    pub async fn used_ports(
+    pub(super) async fn used_ports(
         &self,
         ips: &[IpAddr],
     ) -> anyhow::Result<HashMap<IpAddr, Vec<super::super::UsedPort>>> {

@@ -4,13 +4,13 @@ use reqwest::{Method, StatusCode};
 use serde_json::{Value, json};
 use std::sync::Arc;
 
-pub struct Storage {
+pub(super) struct Storage {
     client: Client,
     pool: String,
     owner: String,
 }
 impl Storage {
-    pub fn new(client: Client, config: Arc<crate::config::Config>) -> Self {
+    pub(super) fn new(client: Client, config: Arc<crate::config::Config>) -> Self {
         let pool = config.load().runtime.incus.storage_pool.clone();
         let owner = format!("wings:{}", config.load().uuid);
         Self {
@@ -19,24 +19,24 @@ impl Storage {
             owner,
         }
     }
-    pub fn control_name(instance: &str) -> String {
+    pub(super) fn control_name(instance: &str) -> String {
         format!("wgc-{instance}")
     }
-    pub fn path(&self, volume: &str) -> String {
+    pub(super) fn path(&self, volume: &str) -> String {
         format!(
             "/1.0/storage-pools/{}/volumes/custom/{}",
             segment(&self.pool),
             segment(volume)
         )
     }
-    pub fn file_path(&self, volume: &str, name: &str) -> String {
+    pub(super) fn file_path(&self, volume: &str, name: &str) -> String {
         format!(
             "{}/files?path={}",
             self.path(volume),
             segment(&format!("/{name}"))
         )
     }
-    pub async fn boot(&self) -> anyhow::Result<()> {
+    pub(super) async fn boot(&self) -> anyhow::Result<()> {
         let pool: Value = self
             .client
             .get(&format!("/1.0/storage-pools/{}", segment(&self.pool)))
@@ -50,7 +50,7 @@ impl Storage {
         );
         Ok(())
     }
-    pub async fn ensure_volume(&self, name: &str, quota: u64) -> anyhow::Result<()> {
+    pub(super) async fn ensure_volume(&self, name: &str, quota: u64) -> anyhow::Result<()> {
         if let Some(volume) = self.client.optional::<Value>(&self.path(name)).await? {
             self.check_owner(&volume)?;
         } else {
@@ -61,7 +61,19 @@ impl Storage {
             if quota > 0 {
                 config.insert("size", quota.to_string());
             }
-            self.client.mutate(Method::POST, &format!("/1.0/storage-pools/{}/volumes/custom", segment(&self.pool)), json!({"name": name, "type": "custom", "content_type": "filesystem", "config": config})).await?;
+            let body = json!({
+                "name": name,
+                "type": "custom",
+                "content_type": "filesystem",
+                "config": config,
+            });
+            self.client
+                .mutate(
+                    Method::POST,
+                    &format!("/1.0/storage-pools/{}/volumes/custom", segment(&self.pool)),
+                    body,
+                )
+                .await?;
         }
         Ok(())
     }
@@ -79,7 +91,7 @@ impl Storage {
         );
         Ok(())
     }
-    pub async fn delete_volume(&self, name: &str) -> anyhow::Result<()> {
+    pub(super) async fn delete_volume(&self, name: &str) -> anyhow::Result<()> {
         let path = self.path(name);
         if let Some(volume) = self.client.optional::<Value>(&path).await? {
             self.check_owner(&volume)?;

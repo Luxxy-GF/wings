@@ -162,29 +162,24 @@ fn wildcard_allocations_are_preserved_for_nat_proxies() -> anyhow::Result<()> {
         .mappings
         .insert("0.0.0.0".into(), vec![25565]);
     assert_eq!(
-        network::allocations(&server, &[])?.get(&"0.0.0.0".parse()?),
+        network::allocations(&server)?.get(&"0.0.0.0".parse()?),
         Some(&BTreeSet::from([25565]))
     );
-    let ip: IpAddr = "192.0.2.10".parse()?;
-    assert_eq!(
-        network::allocations(&server, &[ip])?.get(&"0.0.0.0".parse()?),
-        Some(&BTreeSet::from([25565]))
-    );
-    let spec = firewall_spec(&server, "10.76.0.2".parse()?, &[ip])?;
+    let spec = firewall_spec(&server, "10.76.0.2".parse()?)?;
     assert!(spec.bindings.iter().all(|binding| binding.ip.is_none()));
     server
         .allocations
         .mappings
         .insert("192.0.2.20".into(), vec![25566]);
-    assert!(network::allocations(&server, &[ip])?.contains_key(&"192.0.2.20".parse()?));
+    assert!(network::allocations(&server)?.contains_key(&"192.0.2.20".parse()?));
     server
         .allocations
         .mappings
         .insert("192.0.2.20".into(), vec![25565]);
-    assert!(network::allocations(&server, &[ip]).is_err());
+    assert!(network::allocations(&server).is_err());
     server.allocations.mappings.remove("192.0.2.20");
     server.allocations.mappings.insert("::".into(), vec![25565]);
-    assert!(network::allocations(&server, &[ip]).is_err());
+    assert!(network::allocations(&server).is_err());
     Ok(())
 }
 
@@ -213,6 +208,190 @@ async fn api_errors_keep_status_for_conditional_retries() -> anyhow::Result<()> 
         ));
     }
     fixture.finish().await
+}
+
+#[tokio::test]
+async fn failed_async_operation_and_error_envelopes_are_not_successes() -> anyhow::Result<()> {
+    let fixture = MockIncus::new(vec![
+        (
+            "POST /1.0/instances?project=wings",
+            reqwest::StatusCode::OK,
+            json!({"type": "async", "operation": "/1.0/operations/job"}),
+        ),
+        (
+            "GET /1.0/operations/job/wait?project=wings&timeout=120",
+            reqwest::StatusCode::OK,
+            json!({"type": "sync", "metadata": {"status_code": 400, "err": "start failed"}}),
+        ),
+        (
+            "GET /1.0/instances/missing?project=wings",
+            reqwest::StatusCode::OK,
+            json!({"type": "error", "error_code": 404, "error": "missing"}),
+        ),
+        (
+            "GET /1.0/instances/missing?project=wings",
+            reqwest::StatusCode::NOT_FOUND,
+            json!(null),
+        ),
+    ])?;
+    let error = fixture
+        .client
+        .mutate(Method::POST, "/1.0/instances", json!({}))
+        .await
+        .err()
+        .context("failed operation was accepted")?;
+    assert!(error.to_string().contains("start failed"));
+    assert!(
+        fixture
+            .client
+            .optional::<Instance>("/1.0/instances/missing")
+            .await?
+            .is_none()
+    );
+    assert!(
+        fixture
+            .client
+            .optional::<Instance>("/1.0/instances/missing")
+            .await?
+            .is_none()
+    );
+    fixture.finish().await
+}
+
+#[test]
+fn api_paths_and_operation_ids_stay_within_the_incus_api() -> anyhow::Result<()> {
+    let client = Client::new(&crate::config::IncusRuntime::default())?;
+    for path in [
+        "https://example.org/1.0",
+        "//example.org/1.0",
+        "/1.00",
+        "/1.0/../../outside",
+        "/1.0#fragment",
+    ] {
+        assert!(client.url(path, true).is_err(), "accepted {path}");
+    }
+    assert_eq!(client.url("/1.0", true)?.query(), Some("project=wings"));
+    assert!(client.url("/1.0", false)?.query().is_none());
+    Ok(())
+}
+
+#[tokio::test]
+async fn async_operation_urls_cannot_redirect_or_append_queries() -> anyhow::Result<()> {
+    for operation in [
+        "/1.0/operations/",
+        "/1.0/operations/../instances",
+        "/1.0/operations/job?project=default",
+        "https://example.org/1.0/operations/job",
+    ] {
+        let fixture = MockIncus::new(vec![(
+            "POST /1.0/instances?project=wings",
+            reqwest::StatusCode::OK,
+            json!({"type": "async", "operation": operation}),
+        )])?;
+        assert!(
+            fixture
+                .client
+                .mutate(Method::POST, "/1.0/instances", json!({}))
+                .await
+                .is_err()
+        );
+        fixture.finish().await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn console_handshake_has_a_deadline() -> anyhow::Result<()> {
+    let directory = tempfile::tempdir()?;
+    let socket = directory.path().join("incus.sock");
+    let listener = tokio::net::UnixListener::bind(&socket)?;
+    let client = Client::new(&crate::config::IncusRuntime {
+        socket: socket.display().to_string(),
+        operation_timeout_seconds: 1,
+        ..Default::default()
+    })?;
+    let (result, accepted) = tokio::join!(
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            client.websocket("/1.0/operations/job", "secret")
+        ),
+        listener.accept()
+    );
+    let _connection = accepted?;
+    let error = result?
+        .err()
+        .context("console handshake did not time out")?;
+    assert!(error.to_string().contains("timed out"));
+    Ok(())
+}
+
+#[test]
+fn instance_updates_preserve_editable_settings_and_omit_runtime_fields() -> anyhow::Result<()> {
+    let instance: Instance = serde_json::from_value(json!({
+        "name": "wgs-test", "project": "wings", "status": "Running",
+        "architecture": "x86_64", "description": "operator description",
+        "ephemeral": true, "stateful": true, "profiles": ["custom"],
+        "config": {"environment.PATH": "/bin"},
+        "devices": {"root": {"type": "disk", "path": "/"}},
+        "expanded_devices": {"inherited": {"type": "disk", "path": "/extra"}}
+    }))?;
+    let body = instance.update_body();
+    assert_eq!(
+        body.get("description"),
+        Some(&json!("operator description"))
+    );
+    assert_eq!(body.get("architecture"), Some(&json!("x86_64")));
+    assert_eq!(body.get("ephemeral"), Some(&json!(true)));
+    assert_eq!(body.get("stateful"), Some(&json!(true)));
+    assert_eq!(body.get("profiles"), Some(&json!(["custom"])));
+    assert_eq!(body.pointer("/devices/root/path"), Some(&json!("/")));
+    for field in ["name", "project", "status", "expanded_devices"] {
+        assert!(body.get(field).is_none());
+    }
+    assert!(
+        serde_json::from_value::<InstanceState>(json!({
+            "status": "Running", "network": {"eth0": {"counters": {"bytes_received": "invalid"}}}
+        }))
+        .is_err()
+    );
+    Ok(())
+}
+
+#[test]
+fn helper_cleanup_excludes_games_and_unrelated_instances() -> anyhow::Result<()> {
+    let server = uuid::Uuid::new_v4();
+    for (name, helper) in [
+        (format!("wgi-{server}"), true),
+        (format!("wgx-{server}-0123456789abcdef"), true),
+        (format!("wgs-{server}"), false),
+        (format!("wgi-{}", uuid::Uuid::new_v4()), false),
+        (format!("wgx-{server}-unrelated"), false),
+    ] {
+        let instance: Instance = serde_json::from_value(json!({"name": name}))?;
+        assert_eq!(instance.is_helper_for(server), helper);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn recovery_checks_ownership_before_preparing_the_filesystem() -> anyhow::Result<()> {
+    let state = crate::routes::AppState::mock();
+    let executor = IncusExecutor::new(Arc::clone(&state.config))?;
+    let server = Server::mock(uuid::Uuid::new_v4(), state);
+    server.filesystem.disk_checker.abort();
+    let instance: Instance =
+        serde_json::from_value(json!({"name": IncusExecutor::name(server.uuid)}))?;
+    let error = executor
+        .verify_data_mount(&server, &instance)
+        .await
+        .err()
+        .context("unmanaged instance was accepted")?;
+    assert!(
+        error
+            .to_string()
+            .contains("refusing unmanaged Incus instance")
+    );
+    Ok(())
 }
 
 struct MockIncus {

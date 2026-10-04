@@ -7,7 +7,7 @@ use std::{
     collections::{BTreeMap, HashMap},
     path::PathBuf,
     process::Stdio,
-    sync::Arc,
+    sync::{Arc, Weak},
     time::Duration,
 };
 use tokio::{
@@ -99,7 +99,7 @@ async fn read_stdout(
     }
 }
 
-pub async fn run(
+pub(super) async fn run(
     executable: &str,
     args: &[String],
     timeout: Duration,
@@ -170,7 +170,7 @@ async fn run_with_progress(
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct Image {
+pub(super) struct Image {
     pub fingerprint: String,
     pub digest: String,
     pub args: Vec<String>,
@@ -225,15 +225,15 @@ struct ImageConfig {
     environment: Option<Vec<String>>,
 }
 
-pub struct Images {
+pub(super) struct Images {
     config: Arc<crate::config::Config>,
     client: Client,
     concurrency: Semaphore,
-    locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    locks: Mutex<HashMap<String, Weak<Mutex<()>>>>,
     cache_gate: RwLock<()>,
 }
 impl Images {
-    pub fn new(config: Arc<crate::config::Config>, client: Client) -> Self {
+    pub(super) fn new(config: Arc<crate::config::Config>, client: Client) -> Self {
         let concurrency = Semaphore::new(config.load().runtime.incus.max_concurrent_imports);
         Self {
             config,
@@ -248,7 +248,7 @@ impl Images {
             .resolve_as_path(|cfg| &cfg.system.root_directory)
             .join("incus-images")
     }
-    pub async fn boot(self: &Arc<Self>) -> anyhow::Result<()> {
+    pub(super) async fn boot(self: &Arc<Self>) -> anyhow::Result<()> {
         let cfg = self.config.load().runtime.incus.clone();
         for path in [&cfg.incus_path, &cfg.skopeo_path] {
             run(path, &["--version".into()], Duration::from_secs(10), None).await?;
@@ -271,7 +271,7 @@ impl Images {
         });
         Ok(())
     }
-    pub async fn ensure(
+    pub(super) async fn ensure(
         &self,
         source: &str,
         server: &crate::server::Server,
@@ -286,13 +286,7 @@ impl Images {
         let cfg = self.config.load().runtime.incus.clone();
         let reference = source.trim_end_matches('~').to_string();
         let key = format!("pull:{reference}");
-        let lock = self
-            .locks
-            .lock()
-            .await
-            .entry(key)
-            .or_insert_with(|| Arc::new(Mutex::new(())))
-            .clone();
+        let lock = self.lock(key).await;
         let _guard = lock.lock().await;
         let _permit = self.concurrency.acquire().await?;
         let timeout = Duration::from_secs(cfg.image_import_timeout_seconds);
@@ -350,13 +344,7 @@ impl Images {
         let cache_key = hex::encode(Sha256::digest(
             format!("{pinned}:{architecture}").as_bytes(),
         ));
-        let artifact_lock = self
-            .locks
-            .lock()
-            .await
-            .entry(format!("import:{cache_key}"))
-            .or_insert_with(|| Arc::new(Mutex::new(())))
-            .clone();
+        let artifact_lock = self.lock(format!("import:{cache_key}")).await;
         let _artifact_guard = artifact_lock.lock().await;
         let path = self.root().join(format!("{cache_key}.json"));
         if let Ok(data) = tokio::fs::read(&path).await
@@ -500,6 +488,17 @@ impl Images {
         Ok(image)
     }
 
+    async fn lock(&self, key: String) -> Arc<Mutex<()>> {
+        let mut locks = self.locks.lock().await;
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        if let Some(lock) = locks.get(&key).and_then(Weak::upgrade) {
+            return lock;
+        }
+        let lock = Arc::new(Mutex::new(()));
+        locks.insert(key, Arc::downgrade(&lock));
+        lock
+    }
+
     async fn save(path: &std::path::Path, image: &Image) -> anyhow::Result<()> {
         let temporary = path.with_extension(format!("{}.tmp", uuid::Uuid::new_v4()));
         tokio::fs::write(&temporary, serde_json::to_vec(image)?).await?;
@@ -597,7 +596,7 @@ fn collectible(image: &Value, key: &str, owner: &str, instances: &[super::Instan
         })
 }
 
-pub fn parse_reference(value: &str) -> anyhow::Result<(String, String)> {
+pub(super) fn parse_reference(value: &str) -> anyhow::Result<(String, String)> {
     ensure!(
         !value.contains("://") && !value.chars().any(char::is_whitespace),
         "OCI reference must be a registry reference, not a URL"
@@ -627,6 +626,27 @@ pub fn parse_reference(value: &str) -> anyhow::Result<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn active_image_locks_are_shared_and_unused_keys_are_reclaimed() -> anyhow::Result<()> {
+        let images = Images::new(
+            Arc::new(crate::config::Config::mock()),
+            Client::new(&crate::config::IncusRuntime::default())?,
+        );
+        let first = images.lock("image-one".into()).await;
+        let same = images.lock("image-one".into()).await;
+        assert!(Arc::ptr_eq(&first, &same));
+        let guard = first.lock().await;
+        assert!(same.try_lock().is_err());
+        drop(guard);
+        drop(first);
+        drop(same);
+        let _second = images.lock("image-two".into()).await;
+        let locks = images.locks.lock().await;
+        assert!(!locks.contains_key("image-one"));
+        assert_eq!(locks.len(), 1);
+        Ok(())
+    }
 
     #[test]
     fn cleanup_protects_stopped_instances_unknown_bases_and_admin_aliases() -> anyhow::Result<()> {

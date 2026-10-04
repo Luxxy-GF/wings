@@ -1,8 +1,11 @@
 mod auth;
 mod client;
+mod configuration;
 mod image;
+mod instance;
 mod network;
 mod process;
+mod provision;
 mod storage;
 #[cfg(test)]
 mod tests;
@@ -15,8 +18,8 @@ use crate::server::{
 };
 use anyhow::{Context, ensure};
 use client::{Client, segment};
+use instance::{Devices, Instance, InstanceState};
 use reqwest::Method;
-use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
@@ -27,44 +30,6 @@ use std::{
 };
 use storage::Storage;
 
-#[derive(Clone, Debug, Deserialize)]
-pub struct Instance {
-    pub name: String,
-    #[serde(default)]
-    pub project: String,
-    #[serde(default)]
-    pub status: String,
-    #[serde(default)]
-    pub config: BTreeMap<String, String>,
-    #[serde(default)]
-    pub devices: BTreeMap<String, BTreeMap<String, String>>,
-    #[serde(default)]
-    pub expanded_devices: BTreeMap<String, BTreeMap<String, String>>,
-}
-impl Instance {
-    fn effective_devices(&self) -> &BTreeMap<String, BTreeMap<String, String>> {
-        if self.expanded_devices.is_empty() {
-            &self.devices
-        } else {
-            &self.expanded_devices
-        }
-    }
-}
-#[derive(Clone, Debug, Deserialize)]
-pub struct InstanceState {
-    pub status: String,
-    #[serde(default)]
-    pub pid: u32,
-    #[serde(default, deserialize_with = "crate::deserialize::deserialize_nullable")]
-    pub cpu: BTreeMap<String, u64>,
-    #[serde(default, deserialize_with = "crate::deserialize::deserialize_nullable")]
-    pub memory: BTreeMap<String, u64>,
-    #[serde(default, deserialize_with = "crate::deserialize::deserialize_nullable")]
-    pub network: BTreeMap<String, Value>,
-    #[serde(default)]
-    pub started_at: Option<String>,
-}
-
 #[derive(Debug)]
 pub(crate) struct RecoveryError(anyhow::Error);
 impl std::fmt::Display for RecoveryError {
@@ -72,7 +37,11 @@ impl std::fmt::Display for RecoveryError {
         write!(formatter, "Incus recovery failed: {:#}", self.0)
     }
 }
-impl std::error::Error for RecoveryError {}
+impl std::error::Error for RecoveryError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.0.as_ref())
+    }
+}
 
 #[derive(Clone)]
 pub struct IncusExecutor {
@@ -87,9 +56,10 @@ pub struct IncusExecutor {
 }
 impl IncusExecutor {
     pub fn new(config: Arc<crate::config::Config>) -> anyhow::Result<Self> {
-        let client = Client::new(&config.load().runtime.incus)?;
-        let owner = format!("wings:{}", config.load().uuid);
-        let firewall: Arc<dyn FirewallBackend> = match config.load().docker.firewall.backend {
+        let settings = config.load();
+        let client = Client::new(&settings.runtime.incus)?;
+        let owner = format!("wings:{}", settings.uuid);
+        let firewall: Arc<dyn FirewallBackend> = match settings.docker.firewall.backend {
             crate::server::firewall::FirewallBackendKind::Disabled => {
                 Arc::new(crate::server::firewall::noop::NoopFirewall::new(false))
             }
@@ -105,13 +75,15 @@ impl IncusExecutor {
                 "Incus requires the host nftables firewall backend or explicitly disabled policy"
             ),
         };
+        let network = Arc::new(network::Network::new(
+            client.clone(),
+            &settings.runtime.incus,
+            settings.uuid,
+        ));
+        drop(settings);
         Ok(Self {
             images: Arc::new(image::Images::new(Arc::clone(&config), client.clone())),
-            network: Arc::new(network::Network::new(
-                client.clone(),
-                &config.load().runtime.incus,
-                config.load().uuid,
-            )),
+            network,
             storage: Arc::new(Storage::new(client.clone(), Arc::clone(&config))),
             config,
             client,
@@ -140,12 +112,30 @@ impl IncusExecutor {
         Ok(())
     }
     async fn instance(&self, name: &str) -> anyhow::Result<Instance> {
-        let instance = self
+        Ok(self.instance_with_etag(name).await?.0)
+    }
+
+    async fn instance_with_etag(&self, name: &str) -> anyhow::Result<(Instance, Option<String>)> {
+        let (instance, etag) = self
             .client
-            .get::<Instance>(&Self::instance_path(name))
+            .get_with_etag::<Instance>(&Self::instance_path(name))
             .await?;
         self.check_owner(&instance)?;
-        Ok(instance)
+        Ok((instance, etag))
+    }
+
+    async fn update_instance(&self, instance: &Instance, etag: Option<&str>) -> anyhow::Result<()> {
+        self.check_owner(instance)?;
+        self.client
+            .request(
+                Method::PUT,
+                &Self::instance_path(&instance.name),
+                Some(&instance.update_body()),
+                etag,
+                true,
+            )
+            .await?;
+        Ok(())
     }
     pub async fn remove_instance(&self, name: &str) -> anyhow::Result<()> {
         let deadline = tokio::time::Instant::now()
@@ -191,370 +181,6 @@ impl IncusExecutor {
         }
         Ok(())
     }
-    fn validate_server(config: &ServerConfiguration) -> anyhow::Result<()> {
-        ensure!(
-            !config.allocations.force_outgoing_ip,
-            "Incus force_outgoing_ip requires an explicit SNAT design; unsupported"
-        );
-        ensure!(
-            !config.build.oom_disabled,
-            "Incus does not support disabling the OOM killer"
-        );
-        ensure!(
-            config.devices.is_empty()
-                && !config.container.kvm_passthrough_enabled
-                && !config.container.hugepages_passthrough_enabled,
-            "Incus device passthrough is not implemented"
-        );
-        ensure!(
-            config.container.seccomp.remove_allowed.is_empty(),
-            "Incus custom seccomp policy is not implemented"
-        );
-        if let Some(weight) = config.build.io_weight {
-            ensure!(
-                weight == 10 || ((100..=1000).contains(&weight) && weight.is_multiple_of(100)),
-                "Incus I/O weight must be 10 or a multiple of 100 through 1000"
-            );
-        }
-        ensure!(
-            config.features.startup_cpu_boost.is_none()
-                && config.features.runtime_cpu_boost.is_none(),
-            "Incus CPU boost configuration is not implemented"
-        );
-        Ok(())
-    }
-    fn resources(
-        &self,
-        config: &ServerConfiguration,
-        installer: bool,
-    ) -> anyhow::Result<BTreeMap<String, String>> {
-        let mut result = BTreeMap::new();
-        let cfg = self.config.load();
-        let memory = if installer {
-            cfg.docker.installer_limits.memory.as_mib() as i64
-        } else if config.build.memory_limit <= 0 {
-            0
-        } else {
-            config
-                .build
-                .memory_limit
-                .saturating_add(config.build.overhead_memory)
-                .max(0)
-        };
-        let cpu = if installer {
-            cfg.docker.installer_limits.cpu as i64
-        } else {
-            config.build.cpu_limit
-        };
-        if memory > 0 {
-            result.insert("limits.memory".into(), format!("{memory}MiB"));
-        }
-        if cpu > 0 {
-            result.insert("limits.cpu.allowance".into(), format!("{cpu}ms/100ms"));
-        }
-        if !installer && let Some(threads) = config.build.threads.as_ref() {
-            ensure!(
-                threads
-                    .bytes()
-                    .all(|b| b.is_ascii_digit() || matches!(b, b',' | b'-')),
-                "invalid CPU pinning list"
-            );
-            result.insert("limits.cpu".into(), threads.to_string());
-        }
-        if !installer && let Some(weight) = config.build.io_weight {
-            result.insert("limits.disk.priority".into(), (weight / 100).to_string());
-        }
-        if cfg.docker.container_pid_limit > 0 {
-            result.insert(
-                "limits.processes".into(),
-                cfg.docker.container_pid_limit.to_string(),
-            );
-        }
-        if !installer {
-            result.insert(
-                "limits.memory.swap".into(),
-                match config.build.swap {
-                    0 => "false".into(),
-                    -1 => "true".into(),
-                    value if value > 0 => format!("{value}MiB"),
-                    _ => anyhow::bail!("invalid swap limit"),
-                },
-            );
-        }
-        Ok(result)
-    }
-    fn process_config(
-        &self,
-        config: &ServerConfiguration,
-        image: &image::Image,
-        installer: bool,
-        command: Option<Vec<String>>,
-    ) -> anyhow::Result<BTreeMap<String, String>> {
-        let mut result = self.resources(config, installer)?;
-        let args = match command {
-            Some(command) => command,
-            None => match config.entrypoint.as_ref() {
-                Some(entrypoint) => {
-                    let mut args = entrypoint.clone();
-                    args.extend(image.cmd.clone());
-                    args
-                }
-                None => image.args.clone(),
-            },
-        };
-        let mut supervised = vec![
-            "/bin/sh".into(),
-            "-c".into(),
-            process::SUPERVISOR.into(),
-            "wings-supervisor".into(),
-        ];
-        supervised.extend(args);
-        result.insert(
-            "user.wings.launch".into(),
-            process::launch_script(&supervised)?,
-        );
-        result.insert(
-            "oci.entrypoint".into(),
-            process::encode_argv(&["/bin/sh".into(), "/opt/wings-control/process/launch".into()])?,
-        );
-        result.insert(
-            "oci.cwd".into(),
-            if installer {
-                "/mnt/server"
-            } else {
-                "/home/container"
-            }
-            .into(),
-        );
-        result.insert(
-            "oci.uid".into(),
-            if installer { 0 } else { image.uid }.to_string(),
-        );
-        result.insert(
-            "oci.gid".into(),
-            if installer { 0 } else { image.gid }.to_string(),
-        );
-        result.insert("security.privileged".into(), "false".into());
-        result.insert("security.nesting".into(), "false".into());
-        result.insert("security.idmap.isolated".into(), "true".into());
-        result.insert("security.guestapi".into(), "false".into());
-        result.insert("boot.autostart".into(), "false".into());
-        for (key, value) in &image.environment {
-            result.insert(format!("environment.{key}"), value.clone());
-        }
-        for entry in config.environment(&self.config) {
-            let (key, value) = entry.split_once('=').context("invalid environment entry")?;
-            result.insert(format!("environment.{key}"), value.into());
-        }
-        Ok(result)
-    }
-    async fn create(
-        &self,
-        server: &Server,
-        name: &str,
-        image: &image::Image,
-        command: Option<Vec<String>>,
-        installer: bool,
-        extra_env: &HashMap<compact_str::CompactString, Value>,
-    ) -> anyhow::Result<()> {
-        let _guard = self.provisioning.lock().await;
-        let cfg = server.configuration.read().await;
-        Self::validate_server(&cfg)?;
-        let runtime = self.config.load().runtime.incus.clone();
-        if let Some(existing) = self
-            .client
-            .optional::<Instance>(&Self::instance_path(name))
-            .await?
-        {
-            self.check_owner(&existing)?;
-            ensure!(
-                existing.status == "Stopped",
-                "server instance is already running"
-            );
-            self.remove_instance(name).await?;
-        }
-        let instances: Vec<Instance> = self.client.get("/1.0/instances?recursion=1").await?;
-        let address = self.network.allocate(&instances).await?;
-        let control = Storage::control_name(name);
-        self.storage
-            .ensure_volume(&control, 16 * 1024 * 1024)
-            .await?;
-        let mut config = self.process_config(&cfg, image, installer, command)?;
-        config.extend(BTreeMap::from([
-            ("user.wings.owner".into(), self.owner.clone()),
-            ("user.wings.server".into(), server.uuid.to_string()),
-            ("user.wings.ip".into(), address.to_string()),
-            ("user.wings.digest".into(), image.digest.clone()),
-            (
-                "user.wings.image-env".into(),
-                serde_json::to_string(&image.environment)?,
-            ),
-            (
-                "user.wings.allocations".into(),
-                serde_json::to_string(&network::allocations(&cfg, &runtime.listen_addresses)?)?,
-            ),
-        ]));
-        for (key, value) in extra_env {
-            config.insert(
-                format!("environment.{key}"),
-                value
-                    .as_str()
-                    .map(str::to_owned)
-                    .unwrap_or_else(|| value.to_string()),
-            );
-        }
-        let data_source = self.prepare_data_mount(server).await?;
-        ensure!(
-            data_source.is_absolute() && data_source.is_dir(),
-            "Wings server directory must be initialized before creating an Incus instance"
-        );
-        let mut devices = json!({
-            "root": {"type": "disk", "path": "/", "pool": runtime.storage_pool, "size": runtime.root_disk_size},
-            "eth0": {"type": "nic", "network": runtime.network, "name": "eth0", "ipv4.address": address.to_string(), "security.mac_filtering": "true", "security.ipv4_filtering": "true", "security.port_isolation": "true"},
-            "data": {"type": "disk", "source": data_source, "path": if installer {"/mnt/server"} else {"/home/container"}},
-            "control": {"type": "disk", "pool": runtime.storage_pool, "source": control, "path": "/opt/wings-control"}
-        });
-        if !installer {
-            cfg.ensure_vmounts(&self.config).await?;
-            for (index, mount) in cfg
-                .mounts(&self.config, &server.filesystem)
-                .await
-                .into_iter()
-                .filter(|mount| mount.target != "/home/container")
-                .enumerate()
-            {
-                let source = std::path::Path::new(mount.source.as_str());
-                ensure!(
-                    source.is_absolute() && source.exists(),
-                    "Incus mount source is missing"
-                );
-                let target = if mount.target == "/etc/hosts" {
-                    config.insert("raw.lxc".into(),
-                        "lxc.mount.entry = opt/wings-private-hosts etc/hosts none bind,ro,relative,create=file 0 0\n".into());
-                    "/opt/wings-private-hosts"
-                } else {
-                    mount.target.as_str()
-                };
-                let device = serde_json::Map::from_iter([
-                    ("type".into(), "disk".into()),
-                    ("source".into(), mount.source.to_string().into()),
-                    ("path".into(), target.to_string().into()),
-                    ("readonly".into(), mount.read_only.to_string().into()),
-                ]);
-                devices
-                    .as_object_mut()
-                    .ok_or_else(|| anyhow::anyhow!("invalid Incus devices"))?
-                    .insert(format!("mount-{index}"), Value::Object(device));
-            }
-        }
-        self.client.mutate(Method::POST, "/1.0/instances", json!({"name": name, "type": "container", "profiles": [], "source": {"type": "image", "fingerprint": image.fingerprint}, "config": config, "devices": devices})).await?;
-        let (value, etag) = self
-            .client
-            .request(Method::GET, &Self::instance_path(name), None, None, true)
-            .await?;
-        let mut instance: Instance = serde_json::from_value(value)?;
-        self.check_owner(&instance)?;
-        let uid: u32 = instance
-            .config
-            .get("oci.uid")
-            .context("Incus did not resolve the OCI UID")?
-            .parse()?;
-        let gid: u32 = instance
-            .config
-            .get("oci.gid")
-            .context("Incus did not resolve the OCI GID")?
-            .parse()?;
-        instance.config.insert(
-            "raw.idmap".into(),
-            format!(
-                "uid {} {uid}\ngid {} {gid}",
-                self.config.load().system.user.uid,
-                self.config.load().system.user.gid
-            ),
-        );
-        self.client.request(Method::PUT, &Self::instance_path(name), Some(&json!({"config": instance.config, "devices": instance.devices, "profiles": []})), etag.as_deref(), true).await?;
-        self.client
-            .directory(
-                &self.storage.file_path(&control, "process"),
-                uid,
-                gid,
-                "0700",
-            )
-            .await?;
-        self.client
-            .write_file(
-                &self.storage.file_path(&control, "process/launch"),
-                instance
-                    .config
-                    .get("user.wings.launch")
-                    .context("OCI launch script missing")?
-                    .as_bytes()
-                    .to_vec(),
-                uid,
-                gid,
-                "0600",
-            )
-            .await?;
-        self.client
-            .write_file(
-                &self.storage.file_path(&control, "process/exit"),
-                Vec::new(),
-                uid,
-                gid,
-                "0600",
-            )
-            .await?;
-        drop(cfg);
-        drop(_guard);
-        if !installer {
-            self.sync_server(server, name).await?;
-        }
-        Ok(())
-    }
-
-    async fn prepare_data_mount(&self, server: &Server) -> anyhow::Result<PathBuf> {
-        use crate::server::filesystem::limiter::DiskLimiterMode;
-        ensure!(
-            !server.filesystem.is_uninitialized(),
-            "Wings server filesystem is not initialized"
-        );
-        let mode = self.config.load().system.disk_limiter_mode;
-        let limiter = server.filesystem.get_disk_limiter();
-        limiter
-            .attach()
-            .await
-            .context("attaching the server disk limiter")?;
-        limiter
-            .startup()
-            .await
-            .context("starting the server disk limiter")?;
-        let source = server.filesystem.get_base_fs_mount_path().await;
-        if mode == DiskLimiterMode::FuseQuota {
-            let fuse = crate::server::filesystem::limiter::fuse_quota::FuseQuotaLimiter {
-                filesystem: &server.filesystem,
-            };
-            tokio::time::timeout(
-                Duration::from_secs(self.config.load().runtime.incus.operation_timeout_seconds),
-                async {
-                    loop {
-                        let mounted = rustix::fs::statfs(&source)
-                            .is_ok_and(|stat| stat.f_type == 0x6573_5546);
-                        if mounted && fuse.is_socket_functional().await {
-                            break;
-                        }
-                        tokio::time::sleep(Duration::from_millis(100)).await;
-                    }
-                },
-            )
-            .await
-            .context("waiting for the quota filesystem to mount")?;
-        }
-        limiter
-            .update_disk_limit(server.filesystem.disk_limit() as u64)
-            .await
-            .context("applying the server data quota")?;
-        Ok(source)
-    }
     async fn sync_server(
         &self,
         server: &Arc<crate::server::InnerServer>,
@@ -563,13 +189,7 @@ impl IncusExecutor {
         let _guard = self.provisioning.lock().await;
         let cfg = server.configuration.read().await;
         Self::validate_server(&cfg)?;
-        let runtime = self.config.load().runtime.incus.clone();
-        let (value, etag) = self
-            .client
-            .request(Method::GET, &Self::instance_path(name), None, None, true)
-            .await?;
-        let mut instance: Instance = serde_json::from_value(value)?;
-        self.check_owner(&instance)?;
+        let (mut instance, etag) = self.instance_with_etag(name).await?;
         let image_environment: BTreeMap<String, String> = serde_json::from_str(
             instance
                 .config
@@ -591,30 +211,21 @@ impl IncusExecutor {
         }
         instance.config.insert(
             "user.wings.allocations".into(),
-            serde_json::to_string(&network::allocations(&cfg, &runtime.listen_addresses)?)?,
+            serde_json::to_string(&network::allocations(&cfg)?)?,
         );
         let ip: IpAddr = instance
             .config
             .get("user.wings.ip")
             .context("instance address missing")?
             .parse()?;
-        let mut spec = firewall_spec(&cfg, ip, &runtime.listen_addresses)?;
+        let mut spec = firewall_spec(&cfg, ip)?;
         spec.files = Some(crate::server::firewall::sets::FirewallFileAccess {
             filesystem: (*server.filesystem).clone(),
             notifier: Some(server.filesystem.server_notifier().clone()),
             server: Some(Arc::downgrade(server)),
         });
         self.firewall.sync(&spec).await?;
-        let body = json!({"config": instance.config, "devices": instance.devices, "profiles": []});
-        self.client
-            .request(
-                Method::PUT,
-                &Self::instance_path(name),
-                Some(&body),
-                etag.as_deref(),
-                true,
-            )
-            .await?;
+        self.update_instance(&instance, etag.as_deref()).await?;
         if instance.status == "Running" {
             self.publish(name).await?;
         }
@@ -637,16 +248,11 @@ impl IncusExecutor {
                 .client
                 .get(&format!("{}/state", Self::instance_path(name)))
                 .await?;
-            let actual = state
+            if state
                 .network
                 .get("eth0")
-                .and_then(|nic| nic.get("addresses"))
-                .and_then(Value::as_array);
-            if actual.is_some_and(|addresses| {
-                addresses
-                    .iter()
-                    .any(|address| address.get("address").and_then(Value::as_str) == Some(ip))
-            }) {
+                .is_some_and(|nic| nic.addresses.iter().any(|address| &address.address == ip))
+            {
                 break;
             }
             ensure!(
@@ -666,103 +272,6 @@ impl IncusExecutor {
                 .context("allocation journal missing")?,
         )?;
         self.network.sync(uuid, ip, &desired).await
-    }
-    async fn setup_helper(
-        &self,
-        server: &Server,
-        script: &crate::server::installation::InstallationScript,
-        installation: bool,
-    ) -> anyhow::Result<(Arc<dyn ProcessHandle>, StatusReceiver)> {
-        server.log_daemon_install("[Incus] Preparing server data permissions...".into());
-        server
-            .filesystem
-            .async_chown_path_recursive(&server.filesystem.base_path)
-            .await
-            .context("preparing Incus helper data permissions")?;
-        let image = self
-            .images
-            .ensure(&script.container_image, server, installation)
-            .await?;
-        let name = if installation {
-            format!("wgi-{}", server.uuid)
-        } else {
-            let identity = uuid::Uuid::new_v4().simple().to_string();
-            format!(
-                "wgx-{}-{}",
-                server.uuid,
-                identity.get(..16).context("helper ID")?
-            )
-        };
-        let staging = if installation {
-            self.config.tmp_data_path(server.uuid)
-        } else {
-            self.state_root().join("scripts").join(&name)
-        };
-        tokio::fs::create_dir_all(&staging).await?;
-        if installation {
-            for filename in [
-                crate::server::installation::INSTALL_STATUS_FILE_NAME,
-                crate::server::installation::INSTALL_PROGRESS_FILE_NAME,
-            ] {
-                tokio::fs::write(staging.join(filename), []).await?;
-            }
-        }
-        let target = if installation {
-            "/mnt/install"
-        } else {
-            "/mnt/script"
-        };
-        let filename = if installation {
-            "install.sh"
-        } else {
-            "script.sh"
-        };
-        let mut env = script.environment.clone();
-        if installation {
-            env.insert(
-                "INSTALL_STATUS_FILE".into(),
-                Value::String(format!(
-                    "{target}/{}",
-                    crate::server::installation::INSTALL_STATUS_FILE_NAME
-                )),
-            );
-            env.insert(
-                "INSTALL_PROGRESS_FILE".into(),
-                Value::String(format!(
-                    "{target}/{}",
-                    crate::server::installation::INSTALL_PROGRESS_FILE_NAME
-                )),
-            );
-        }
-        self.create(
-            server,
-            &name,
-            &image,
-            Some(vec![
-                script.entrypoint.to_string(),
-                format!("{target}/{filename}"),
-            ]),
-            true,
-            &env,
-        )
-        .await?;
-        let (value, etag) = self
-            .client
-            .request(Method::GET, &Self::instance_path(&name), None, None, true)
-            .await?;
-        let mut instance: Instance = serde_json::from_value(value)?;
-        instance.devices.insert(
-            "staging".into(),
-            BTreeMap::from([
-                ("type".into(), "disk".into()),
-                ("source".into(), staging.display().to_string()),
-                ("path".into(), target.into()),
-                ("shift".into(), "true".into()),
-            ]),
-        );
-        self.client.request(Method::PUT, &Self::instance_path(&name), Some(&json!({"config": instance.config, "devices": instance.devices, "profiles": []})), etag.as_deref(), true).await?;
-        tokio::fs::write(staging.join(filename), script.script.replace("\r\n", "\n")).await?;
-        process::Handle::connect(self.clone(), server, name, false, false).await
     }
 }
 
@@ -799,9 +308,8 @@ pub fn verify_version(version: &str, extensions: &[String]) -> anyhow::Result<()
 fn firewall_spec(
     config: &ServerConfiguration,
     private: IpAddr,
-    listen: &[IpAddr],
 ) -> anyhow::Result<FirewallServerSpec> {
-    let mappings = network::allocations(config, listen)?;
+    let mappings = network::allocations(config)?;
     Ok(FirewallServerSpec {
         server: config.uuid,
         bindings: mappings
@@ -910,7 +418,20 @@ impl ServerExecutor for IncusExecutor {
                 );
             }
             Err(err) if client::is_status(&err, reqwest::StatusCode::NOT_FOUND) => {
-                self.client.request(Method::POST, "/1.0/projects", Some(&json!({"name": runtime.project, "description": self.owner, "config": {"features.images": "true", "features.profiles": "true", "features.storage.volumes": "true", "features.networks": "false", "user.wings.owner": self.owner}})), None, false).await?;
+                let body = json!({
+                    "name": runtime.project,
+                    "description": self.owner,
+                    "config": {
+                        "features.images": "true",
+                        "features.profiles": "true",
+                        "features.storage.volumes": "true",
+                        "features.networks": "false",
+                        "user.wings.owner": self.owner,
+                    },
+                });
+                self.client
+                    .request(Method::POST, "/1.0/projects", Some(&body), None, false)
+                    .await?;
             }
             Err(err) => return Err(err),
         }
@@ -954,20 +475,12 @@ impl ServerExecutor for IncusExecutor {
             "Incus server is not running"
         );
         async {
-            use std::os::unix::fs::MetadataExt;
-            self.check_owner(&instance)?;
-            let source = self.prepare_data_mount(server).await?;
-            ensure!(instance.effective_devices().get("data").and_then(|device| device.get("source")) == Some(&source.display().to_string()),
-                "running Incus server uses a different data mount; stop it before changing filesystem configuration");
-            let state: InstanceState = self.client.get(&format!("{}/state", Self::instance_path(&name))).await?;
-            ensure!(state.pid > 0, "running Incus server has no host PID");
-            let host = tokio::fs::metadata(&source).await?;
-            let guest = tokio::fs::metadata(format!("/proc/{}/root/home/container", state.pid)).await?;
-            ensure!(host.dev() == guest.dev() && host.ino() == guest.ino(),
-                "running Incus server has a stale data mount; stop it before recovering the quota filesystem");
+            self.verify_data_mount(server, &instance).await?;
             self.sync_server(server, &name).await?;
             process::Handle::connect(self.clone(), server, name, true, true).await
-        }.await.map_err(|error| RecoveryError(error).into())
+        }
+        .await
+        .map_err(|error| RecoveryError(error).into())
     }
     async fn cleanup_server_process(&self, server: &Server) -> anyhow::Result<()> {
         let _guard = self.provisioning.lock().await;
@@ -1040,7 +553,10 @@ impl ServerExecutor for IncusExecutor {
         servers: &[crate::remote::servers::RawServer],
     ) -> anyhow::Result<()> {
         let instances: Vec<Instance> = self.client.get("/1.0/instances?recursion=1").await?;
-        let live: BTreeSet<_> = servers.iter().map(|server| server.settings.uuid).collect();
+        let servers: HashMap<_, _> = servers
+            .iter()
+            .map(|server| (server.settings.uuid, &server.settings))
+            .collect();
         let mut specs = Vec::new();
         for instance in instances {
             if instance.config.get("user.wings.owner") != Some(&self.owner) {
@@ -1053,31 +569,23 @@ impl ServerExecutor for IncusExecutor {
             else {
                 continue;
             };
-            if !live.contains(&uuid) {
+            if instance.name != Self::name(uuid) {
+                continue;
+            }
+            let Some(settings) = servers.get(&uuid) else {
                 self.network.sync(uuid, "", &BTreeMap::new()).await?;
                 continue;
-            }
-            if !instance.name.starts_with("wgs-") {
-                continue;
-            }
-            let raw = servers
-                .iter()
-                .find(|server| server.settings.uuid == uuid)
-                .context("server reconciliation mismatch")?;
+            };
             let ip: IpAddr = instance
                 .config
                 .get("user.wings.ip")
                 .context("instance address missing")?
                 .parse()?;
             if matches!(instance.status.as_str(), "Running" | "Frozen") {
-                let desired = network::allocations(&raw.settings, &[])?;
+                let desired = network::allocations(settings)?;
                 self.network.sync(uuid, &ip.to_string(), &desired).await?;
             }
-            let mut spec = firewall_spec(
-                &raw.settings,
-                ip,
-                &self.config.load().runtime.incus.listen_addresses,
-            )?;
+            let mut spec = firewall_spec(settings, ip)?;
             if spec.references_files() {
                 spec.files = Some(crate::server::firewall::sets::FirewallFileAccess {
                     filesystem: crate::server::filesystem::cap::CapFilesystem::new(
@@ -1096,9 +604,11 @@ impl ServerExecutor for IncusExecutor {
 impl IncusExecutor {
     async fn cleanup_owned_helpers(&self, uuid: uuid::Uuid) -> anyhow::Result<()> {
         let instances: Vec<Instance> = self.client.get("/1.0/instances?recursion=1").await?;
+        let server = uuid.to_string();
         for instance in instances {
-            if instance.config.get("user.wings.owner") == Some(&self.owner)
-                && instance.config.get("user.wings.server") == Some(&uuid.to_string())
+            if instance.is_helper_for(uuid)
+                && instance.config.get("user.wings.owner") == Some(&self.owner)
+                && instance.config.get("user.wings.server") == Some(&server)
             {
                 self.remove_instance(&instance.name).await?;
             }
