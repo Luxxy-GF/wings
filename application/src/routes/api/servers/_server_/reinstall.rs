@@ -48,6 +48,12 @@ mod post {
             },
         };
 
+        if server.filesystem.native_instance {
+            return ApiResponse::error("native OS reinstallation requires recreating the server")
+                .with_status(StatusCode::BAD_REQUEST)
+                .ok();
+        }
+
         if let Some(state) = server.locked_state() {
             return ApiResponse::error(&format!(
                 "server is in a locked state ({state}), cannot reinstall the server"

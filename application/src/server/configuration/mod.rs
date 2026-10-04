@@ -281,10 +281,34 @@ pub struct Schedule {
     pub actions: Vec<ScheduleAction>,
 }
 
+#[derive(ToSchema, Deserialize, Serialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum NativeInstanceType {
+    Container,
+    VirtualMachine,
+}
+
+impl NativeInstanceType {
+    pub fn incus_type(self) -> &'static str {
+        match self {
+            Self::Container => "container",
+            Self::VirtualMachine => "virtual-machine",
+        }
+    }
+}
+
+#[derive(ToSchema, Deserialize, Serialize, Clone, Debug, PartialEq, Eq)]
+pub struct NativeInstance {
+    pub kind: NativeInstanceType,
+    pub image: String,
+}
+
 nestify::nest! {
     #[derive(ToSchema, Deserialize, Serialize)]
     pub struct ServerConfiguration {
         pub uuid: uuid::Uuid,
+        #[serde(default)]
+        pub instance: Option<NativeInstance>,
         pub start_on_completion: Option<bool>,
 
         #[schema(inline)]
@@ -459,6 +483,7 @@ impl ServerConfiguration {
     pub fn mock(uuid: uuid::Uuid) -> Self {
         Self {
             uuid,
+            instance: None,
             start_on_completion: None,
             meta: ServerConfigurationMeta {
                 name: "Example Server".into(),

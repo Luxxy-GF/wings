@@ -3,6 +3,7 @@ mod client;
 mod configuration;
 mod image;
 mod instance;
+mod native;
 mod network;
 mod process;
 mod provision;
@@ -48,6 +49,9 @@ pub struct IncusExecutor {
     images: Arc<image::Images>,
     network: Arc<network::Network>,
     storage: Arc<Storage>,
+    native_storage: Arc<Storage>,
+    tundra_enabled: bool,
+    native_mounts: Arc<tokio::sync::Mutex<HashMap<uuid::Uuid, native::FileMount>>>,
     firewall: Arc<dyn FirewallBackend>,
     provisioning: Arc<tokio::sync::Mutex<()>>,
     owner: String,
@@ -57,6 +61,7 @@ impl IncusExecutor {
         let settings = config.load();
         let client = Client::new(&settings.runtime.incus)?;
         let owner = format!("wings:{}", settings.uuid);
+        let tundra_enabled = settings.tundra.enabled;
         let firewall: Arc<dyn FirewallBackend> = match settings.docker.firewall.backend {
             crate::server::firewall::FirewallBackendKind::Disabled => {
                 Arc::new(crate::server::firewall::noop::NoopFirewall::new(false))
@@ -83,6 +88,9 @@ impl IncusExecutor {
             images: Arc::new(image::Images::new(Arc::clone(&config), client.clone())),
             network,
             storage: Arc::new(Storage::new(client.clone(), Arc::clone(&config))),
+            native_storage: Arc::new(Storage::native(client.clone(), Arc::clone(&config))),
+            native_mounts: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            tundra_enabled,
             config,
             client,
             firewall,
@@ -188,12 +196,19 @@ impl IncusExecutor {
         let cfg = server.configuration.read().await;
         Self::validate_server(&cfg)?;
         let (mut instance, etag) = self.instance_with_etag(name).await?;
-        let image_environment: BTreeMap<String, String> = serde_json::from_str(
-            instance
-                .config
-                .get("user.wings.image-env")
-                .context("OCI environment metadata missing; recreate this stopped instance")?,
-        )?;
+        let image_environment: BTreeMap<String, String> = if cfg.instance.is_some() {
+            if let Some(root) = instance.devices.get_mut("root") {
+                root.insert("size".into(), format!("{}MiB", cfg.build.disk_space));
+            }
+            BTreeMap::new()
+        } else {
+            serde_json::from_str(
+                instance
+                    .config
+                    .get("user.wings.image-env")
+                    .context("OCI environment metadata missing; recreate this stopped instance")?,
+            )?
+        };
         instance
             .config
             .retain(|key, _| !key.starts_with("environment.") && !key.starts_with("limits."));
@@ -201,7 +216,11 @@ impl IncusExecutor {
             instance.config.insert(format!("environment.{key}"), value);
         }
         instance.config.extend(self.resources(&cfg, false)?);
-        for entry in cfg.environment(&self.config) {
+        for entry in if cfg.instance.is_some() {
+            Vec::new()
+        } else {
+            cfg.environment(&self.config)
+        } {
             let (key, value) = entry.split_once('=').context("invalid environment")?;
             instance
                 .config
@@ -240,7 +259,8 @@ impl IncusExecutor {
             .config
             .get("user.wings.ip")
             .context("instance address missing")?;
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        let deadline = tokio::time::Instant::now()
+            + Duration::from_secs(self.config.load().runtime.incus.operation_timeout_seconds);
         loop {
             let state: InstanceState = self
                 .client
@@ -434,7 +454,23 @@ impl ServerExecutor for IncusExecutor {
             Err(err) => return Err(err),
         }
         tokio::fs::create_dir_all(self.state_root()).await?;
+        if self.tundra_enabled {
+            let instances: Vec<Instance> = self.client.get("/1.0/instances?recursion=1").await?;
+            ensure!(
+                !instances
+                    .iter()
+                    .any(
+                        |instance| instance.config.get("user.wings.owner") == Some(&self.owner)
+                            && instance
+                                .config
+                                .get("user.wings.instance-kind")
+                                .is_some_and(|kind| kind == "virtual-machine")
+                    ),
+                "Tundra private networking does not support native VMs; disable Tundra and restart Wings"
+            );
+        }
         self.storage.boot().await?;
+        self.native_storage.boot().await?;
         self.images.boot().await?;
         self.network.boot().await?;
         self.firewall.boot().await?;
@@ -444,6 +480,9 @@ impl ServerExecutor for IncusExecutor {
         &self,
         server: &Server,
     ) -> anyhow::Result<(Arc<dyn ProcessHandle>, StatusReceiver)> {
+        if server.configuration.read().await.instance.is_some() {
+            return self.native_handle(server, false).await;
+        }
         let source = server
             .configuration
             .read()
@@ -468,11 +507,28 @@ impl ServerExecutor for IncusExecutor {
             .await
             .map_err(RecoveryError)?
             .context("Incus server does not exist")?;
+        if server
+            .configuration
+            .read()
+            .await
+            .instance
+            .as_ref()
+            .is_some_and(|instance| {
+                instance.kind == crate::server::configuration::NativeInstanceType::Container
+            })
+        {
+            self.mount_native_files(server)
+                .await
+                .map_err(RecoveryError)?;
+        }
         ensure!(
             instance.status == "Running" || instance.status == "Frozen",
             "Incus server is not running"
         );
         async {
+            if server.configuration.read().await.instance.is_some() {
+                return self.native_handle(server, true).await;
+            }
             self.verify_data_mount(server, &instance).await?;
             self.sync_server(server, &name).await?;
             process::Handle::connect(self.clone(), server, name, true, true).await
@@ -481,12 +537,41 @@ impl ServerExecutor for IncusExecutor {
         .map_err(|error| RecoveryError(error).into())
     }
     async fn cleanup_server_process(&self, server: &Server) -> anyhow::Result<()> {
+        if server.configuration.read().await.instance.is_some() {
+            return Ok(());
+        }
         let _guard = self.provisioning.lock().await;
         self.remove_instance(&Self::name(server.uuid)).await?;
         if server.suspended.load(std::sync::atomic::Ordering::SeqCst) {
             self.cleanup_owned_helpers(server.uuid).await?;
         }
         self.firewall.clear(server.uuid).await?;
+        Ok(())
+    }
+    async fn prepare_server_storage(&self, server: &Server) -> anyhow::Result<()> {
+        if server.configuration.read().await.instance.is_some() {
+            self.ensure_native(server).await?;
+            if server
+                .configuration
+                .read()
+                .await
+                .instance
+                .as_ref()
+                .is_some_and(|instance| {
+                    instance.kind == crate::server::configuration::NativeInstanceType::Container
+                })
+            {
+                self.mount_native_files(server).await?;
+            }
+        }
+        Ok(())
+    }
+    async fn delete_server_storage(&self, server: &Server) -> anyhow::Result<()> {
+        if server.configuration.read().await.instance.is_some() {
+            self.unmount_native_files(server).await?;
+            self.remove_instance(&Self::name(server.uuid)).await?;
+            self.firewall.clear(server.uuid).await?;
+        }
         Ok(())
     }
     async fn setup_installation_process(

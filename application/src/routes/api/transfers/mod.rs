@@ -125,6 +125,11 @@ mod post {
             }
 
             let server_data = state.config.client.server(subject).await?;
+            if server_data.settings.instance.is_some() {
+                return ApiResponse::error("native OS transfers require an Incus instance export")
+                    .with_status(StatusCode::BAD_REQUEST)
+                    .ok();
+            }
             let server = state
                 .server_manager
                 .create_server(

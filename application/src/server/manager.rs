@@ -341,7 +341,22 @@ impl ServerManager {
                             super::installation::ServerInstaller::new(&server, false, false, None)
                                 .await;
 
-                        installer.unset_installing(true).await.ok();
+                        let successful = match server
+                            .app_state
+                            .executor
+                            .prepare_server_storage(&server)
+                            .await
+                        {
+                            Ok(()) => true,
+                            Err(error) => {
+                                tracing::error!(server = %server.uuid, "failed to prepare server storage: {error:#}");
+                                server.log_daemon_with_prelude(&format!(
+                                    "Failed to prepare server storage: {error:#}"
+                                ));
+                                false
+                            }
+                        };
+                        installer.unset_installing(successful).await.ok();
                     }
                 });
             }

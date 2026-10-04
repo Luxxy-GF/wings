@@ -27,6 +27,29 @@ impl Storage {
             config: runtime.storage_config.clone(),
         }
     }
+    pub(super) fn native(client: Client, config: Arc<crate::config::Config>) -> Self {
+        let cfg = config.load();
+        let runtime = &cfg.runtime.incus;
+        let mut storage_config = runtime.native_storage_config.clone();
+        if runtime.native_storage_driver == "dir" {
+            storage_config.entry("source".into()).or_insert_with(|| {
+                cfg.system
+                    .root_directory
+                    .as_path(&cfg)
+                    .join("incus/storage-pools")
+                    .join(&runtime.native_storage_pool)
+                    .display()
+                    .to_string()
+            });
+        }
+        Self {
+            client,
+            pool: runtime.native_storage_pool.clone(),
+            owner: format!("wings:{}", cfg.uuid),
+            driver: runtime.native_storage_driver.clone(),
+            config: storage_config,
+        }
+    }
     pub(super) fn control_name(instance: &str) -> String {
         format!("wgc-{instance}")
     }
@@ -58,6 +81,17 @@ impl Storage {
             Ok((pool, _)) => pool,
             Err(err) if is_status(&err, StatusCode::NOT_FOUND) => {
                 validate_driver(&self.driver)?;
+                if self.driver == "dir"
+                    && let Some(source) = self.config.get("source")
+                {
+                    ensure!(
+                        std::path::Path::new(source).is_absolute(),
+                        "Incus dir storage source must be an absolute path"
+                    );
+                    tokio::fs::create_dir_all(source)
+                        .await
+                        .context("creating Incus dir storage source")?;
+                }
                 let mut config = self.config.clone();
                 config.insert("user.wings.owner".into(), self.owner.clone());
                 let body = json!({

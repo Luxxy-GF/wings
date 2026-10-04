@@ -6,6 +6,10 @@ use std::collections::BTreeMap;
 impl IncusExecutor {
     pub(super) fn validate_server(config: &ServerConfiguration) -> anyhow::Result<()> {
         ensure!(
+            config.instance.is_none() || config.mounts.is_empty(),
+            "extra mounts are not supported for native OS instances"
+        );
+        ensure!(
             !config.allocations.force_outgoing_ip,
             "Incus force_outgoing_ip requires an explicit SNAT design; unsupported"
         );
@@ -93,6 +97,16 @@ impl IncusExecutor {
                     _ => anyhow::bail!("invalid swap limit"),
                 },
             );
+        }
+        if config.instance.as_ref().is_some_and(|instance| {
+            instance.kind == crate::server::configuration::NativeInstanceType::VirtualMachine
+        }) {
+            result.remove("limits.cpu.allowance");
+            result.remove("limits.memory.swap");
+            result.remove("limits.processes");
+            result
+                .entry("limits.cpu".into())
+                .or_insert_with(|| ((config.build.cpu_limit.max(100) + 99) / 100).to_string());
         }
         Ok(result)
     }

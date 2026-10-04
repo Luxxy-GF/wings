@@ -243,6 +243,7 @@ pub fn encode_mode(mode: u32) -> compact_str::CompactString {
 }
 
 pub struct Filesystem {
+    pub native_instance: bool,
     uuid: uuid::Uuid,
     app_state: crate::routes::State,
 
@@ -282,8 +283,10 @@ impl Filesystem {
         sender: tokio::sync::broadcast::Sender<crate::server::websocket::WebsocketMessage>,
         resource_usage: tokio::sync::watch::Sender<crate::server::resources::ResourceUsage>,
         config: Arc<crate::config::Config>,
-        deny_list: &[compact_str::CompactString],
+        server_configuration: &crate::server::configuration::ServerConfiguration,
     ) -> Self {
+        let native_instance = server_configuration.instance.is_some();
+        let deny_list = &server_configuration.egg.file_denylist;
         let base_path = config.data_path(uuid);
 
         let disk_checker_state_dirty = Arc::new(AtomicBool::new(true));
@@ -308,7 +311,8 @@ impl Filesystem {
         let disk_check_completed = Arc::new(tokio::sync::Notify::new());
         let last_disk_check = Arc::new(AtomicU64::new(0));
 
-        Self {
+        let filesystem = Self {
+            native_instance,
             uuid,
             app_state,
             disk_checker_rescan: Arc::clone(&disk_checker_rescan),
@@ -352,7 +356,11 @@ impl Filesystem {
                 .build(),
             operations: operations::OperationManager::new(sender.clone(), Arc::clone(&config)),
             uploads: uploads::UploadManager::new(sender),
+        };
+        if native_instance {
+            filesystem.disk_checker.abort();
         }
+        filesystem
     }
 
     #[inline]
@@ -559,11 +567,15 @@ impl Filesystem {
 
     #[inline]
     pub fn get_disk_limiter<'a>(&'a self) -> Box<dyn limiter::DiskLimiterExt + 'a> {
-        self.config
-            .load()
-            .system
-            .disk_limiter_mode
-            .get_limiter(self)
+        if self.native_instance {
+            limiter::DiskLimiterMode::None.get_limiter(self)
+        } else {
+            self.config
+                .load()
+                .system
+                .disk_limiter_mode
+                .get_limiter(self)
+        }
     }
 
     #[inline]
@@ -1503,7 +1515,7 @@ impl Filesystem {
     }
 
     pub fn chown_path(&self, path: impl AsRef<Path>) -> Result<(), std::io::Error> {
-        if self.chown_refused.load(Ordering::Relaxed) {
+        if self.native_instance || self.chown_refused.load(Ordering::Relaxed) {
             return Ok(());
         }
 
@@ -1511,7 +1523,7 @@ impl Filesystem {
     }
 
     pub fn chown_file(&self, file: &std::fs::File) -> Result<(), std::io::Error> {
-        if self.chown_refused.load(Ordering::Relaxed) {
+        if self.native_instance || self.chown_refused.load(Ordering::Relaxed) {
             return Ok(());
         }
 
@@ -1533,7 +1545,7 @@ impl Filesystem {
         }
     }
     pub async fn async_chown_path(&self, path: impl AsRef<Path>) -> Result<(), std::io::Error> {
-        if self.chown_refused.load(Ordering::Relaxed) {
+        if self.native_instance || self.chown_refused.load(Ordering::Relaxed) {
             return Ok(());
         }
 
@@ -1558,7 +1570,7 @@ impl Filesystem {
         &self,
         path: impl AsRef<Path>,
     ) -> Result<(), anyhow::Error> {
-        if self.chown_refused.load(Ordering::Relaxed) {
+        if self.native_instance || self.chown_refused.load(Ordering::Relaxed) {
             return Ok(());
         }
 
@@ -1668,12 +1680,15 @@ impl Filesystem {
         }
 
         let config = self.config.clone();
+        let native_instance = self.native_instance;
         let cap_filesystem = self.cap_filesystem.clone();
 
         tokio::task::spawn_blocking(move || {
             match cap_filesystem.create_dir(&path) {
                 Ok(_) => {
-                    Self::chown_impl(&config, &cap_filesystem, &path)?;
+                    if !native_instance {
+                        Self::chown_impl(&config, &cap_filesystem, &path)?;
+                    }
                     return Ok(());
                 }
                 Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => return Ok(()),
@@ -1686,7 +1701,10 @@ impl Filesystem {
                 progress.push(component);
 
                 match cap_filesystem.create_dir(&progress) {
-                    Ok(_) => Self::chown_impl(&config, &cap_filesystem, &progress)?,
+                    Ok(_) if !native_instance => {
+                        Self::chown_impl(&config, &cap_filesystem, &progress)?
+                    }
+                    Ok(_) => {}
                     Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
                     Err(err) => return Err(err),
                 }
@@ -1698,6 +1716,12 @@ impl Filesystem {
     }
 
     pub async fn setup(&self) {
+        if self.native_instance {
+            if let Err(error) = tokio::fs::create_dir_all(&self.base_path).await {
+                tracing::error!(%error, "could not create native file mount directory");
+            }
+            return;
+        }
         let limiter = self.get_disk_limiter();
 
         if let Err(err) = limiter.setup().await {
@@ -1725,6 +1749,9 @@ impl Filesystem {
     }
 
     pub async fn attach(&self) {
+        if self.native_instance {
+            return;
+        }
         if let Err(err) = self.get_disk_limiter().attach().await {
             tracing::error!(
                 path = %self.base_path.display(),
@@ -1734,6 +1761,17 @@ impl Filesystem {
         }
 
         self.open_cap_filesystem().await;
+    }
+
+    pub(crate) async fn connect_native_root(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(self.native_instance, "not a native instance filesystem");
+        self.close();
+        self.open_cap_filesystem().await;
+        anyhow::ensure!(
+            !self.is_uninitialized(),
+            "native instance filesystem is unavailable"
+        );
+        Ok(())
     }
 
     async fn open_cap_filesystem(&self) {
@@ -1770,7 +1808,7 @@ impl Filesystem {
 
         self.cap_filesystem.inner.store(Some(Arc::new(dir)));
 
-        if self.app_state.config.load().system.disk_check_use_inotify {
+        if !self.native_instance && self.app_state.config.load().system.disk_check_use_inotify {
             tokio::spawn({
                 let state = self.app_state.clone();
                 let server_notifier = self.server_notifier.clone();
@@ -1799,6 +1837,13 @@ impl Filesystem {
     }
 
     pub async fn destroy(&self) {
+        if self.native_instance {
+            self.close();
+            if let Err(error) = tokio::fs::remove_dir(&self.base_path).await {
+                tracing::warn!(%error, "could not remove native file mount directory");
+            }
+            return;
+        }
         self.disk_checker.abort();
         self.app_state
             .inotify_manager

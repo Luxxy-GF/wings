@@ -237,11 +237,29 @@ impl Client {
         Ok(())
     }
 
-    pub(super) async fn console(&self, name: &str) -> anyhow::Result<(String, Value)> {
+    pub(super) async fn console(
+        &self,
+        name: &str,
+        native: bool,
+    ) -> anyhow::Result<(String, Value)> {
+        let (endpoint, body) = if native {
+            (
+                "exec",
+                json!({"command":["/bin/sh", "-l"], "interactive":true, "wait-for-websocket":true, "user":0, "group":0, "cwd":"/root", "environment":{"TERM":"xterm-256color"}}),
+            )
+        } else {
+            (
+                "console",
+                json!({"type":"console", "width":120, "height":40}),
+            )
+        };
         let response = self
             .http
-            .post(self.url(&format!("/1.0/instances/{}/console", segment(name)), true)?)
-            .json(&json!({"type": "console", "width": 120, "height": 40}))
+            .post(self.url(
+                &format!("/1.0/instances/{}/{endpoint}", segment(name)),
+                true,
+            )?)
+            .json(&body)
             .send()
             .await?;
         let (envelope, _) = Self::decode(response).await?;

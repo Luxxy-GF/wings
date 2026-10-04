@@ -63,13 +63,15 @@ impl Instance {
 pub(super) struct InstanceState {
     pub status: String,
     #[serde(default)]
-    pub pid: u32,
+    pub pid: i64,
     #[serde(default, deserialize_with = "crate::deserialize::deserialize_nullable")]
-    pub cpu: BTreeMap<String, u64>,
+    pub cpu: BTreeMap<String, i64>,
     #[serde(default, deserialize_with = "crate::deserialize::deserialize_nullable")]
-    pub memory: BTreeMap<String, u64>,
+    pub memory: BTreeMap<String, i64>,
     #[serde(default, deserialize_with = "crate::deserialize::deserialize_nullable")]
     pub network: BTreeMap<String, NetworkState>,
+    #[serde(default, deserialize_with = "crate::deserialize::deserialize_nullable")]
+    pub disk: BTreeMap<String, BTreeMap<String, i64>>,
     #[serde(default)]
     pub started_at: Option<String>,
 }

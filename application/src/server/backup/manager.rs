@@ -113,6 +113,10 @@ impl BackupManager {
         uuid: uuid::Uuid,
         ignore: compact_str::CompactString,
     ) -> Result<RawServerBackup, anyhow::Error> {
+        anyhow::ensure!(
+            !server.filesystem.native_instance,
+            "native OS backups require an Incus instance export; server-file archives are not supported"
+        );
         tracing::info!(
             server = %server.uuid,
             backup = %uuid,
@@ -610,6 +614,10 @@ impl BackupManager {
         truncate_directory: bool,
         download_url: Option<compact_str::CompactString>,
     ) -> Result<(), anyhow::Error> {
+        anyhow::ensure!(
+            !server.filesystem.native_instance,
+            "server-file backups cannot be restored over a native OS filesystem"
+        );
         if let Some(state) = server.locked_state() {
             return Err(anyhow::anyhow!(
                 "server is in a locked state ({state}), cannot restore backup"

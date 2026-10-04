@@ -316,6 +316,10 @@ impl OutgoingServerTransfer {
         delete_backups: bool,
         multiplex_streams: usize,
     ) -> Result<(), anyhow::Error> {
+        anyhow::ensure!(
+            !self.server.filesystem.native_instance,
+            "native OS transfers require an Incus instance export; server-file transfers are not supported"
+        );
         let backup_manager = Arc::clone(backup_manager);
         let bytes_archived = Arc::clone(&self.bytes_archived);
         let bytes_sent = Arc::clone(&self.bytes_sent);

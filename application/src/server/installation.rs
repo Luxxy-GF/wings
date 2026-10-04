@@ -362,6 +362,10 @@ impl ServerInstaller {
     }
 
     pub async fn start(self: &mut Arc<Self>, force: bool) -> Result<(), anyhow::Error> {
+        anyhow::ensure!(
+            !self.server.filesystem.native_instance,
+            "native OS instances do not run egg installation scripts"
+        );
         if let Some(state) = self.server.locked_state() {
             return Err(anyhow::anyhow!(
                 "server is in a locked state ({state}), cannot start installation process"

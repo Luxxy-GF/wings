@@ -3,6 +3,7 @@ use utoipa_axum::{router::OpenApiRouter, routes};
 
 mod backups;
 mod config;
+mod images;
 mod ips;
 mod logs;
 mod overview;
@@ -25,6 +26,15 @@ mod get {
         kernel_version: String,
         os: &'static str,
         version: &'a str,
+        runtime: RuntimeCapabilities,
+    }
+
+    #[derive(ToSchema, Serialize)]
+    struct RuntimeCapabilities {
+        backend: crate::config::RuntimeBackend,
+        system_containers: bool,
+        virtual_machines: bool,
+        image_server: Option<String>,
     }
 
     #[utoipa::path(get, path = "/", responses(
@@ -37,6 +47,22 @@ mod get {
             kernel_version: sysinfo::System::kernel_long_version(),
             os: std::env::consts::OS,
             version: &state.version,
+            runtime: {
+                let config = state.config.load();
+                let incus = config.runtime.backend == crate::config::RuntimeBackend::Incus;
+                RuntimeCapabilities {
+                    backend: config.runtime.backend,
+                    system_containers: incus,
+                    virtual_machines: incus
+                        && !config.tundra.enabled
+                        && std::fs::OpenOptions::new()
+                            .read(true)
+                            .write(true)
+                            .open("/dev/kvm")
+                            .is_ok(),
+                    image_server: incus.then(|| config.runtime.incus.image_server.clone()),
+                }
+            },
         })
         .ok()
     }
@@ -47,6 +73,7 @@ pub fn router(state: &State) -> OpenApiRouter<State> {
         .routes(routes!(get::route))
         .nest("/overview", overview::router(state))
         .nest("/ips", ips::router(state))
+        .nest("/images", images::router(state))
         .nest("/logs", logs::router(state))
         .nest("/upgrade", upgrade::router(state))
         .nest("/config", config::router(state))

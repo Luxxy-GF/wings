@@ -313,6 +313,10 @@ impl IncusExecutor {
             .async_chown_path_recursive(&server.filesystem.base_path)
             .await
             .context("preparing Incus helper data permissions")?;
+        ensure!(
+            server.configuration.read().await.instance.is_none(),
+            "native OS instances do not run egg installation or script helpers"
+        );
         let image = self
             .images
             .ensure(&script.container_image, server, installation)

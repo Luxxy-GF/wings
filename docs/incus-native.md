@@ -1,0 +1,25 @@
+# Native Incus operating systems
+
+This branch extends the Incus application-container backend with persistent system containers and virtual machines. The panel's server creation form discovers node capabilities and offers an instance type and OS image selector. Application containers remain the default.
+
+Use Incus 7.0 LTS. Install `sshfs` and `fuse3` on the Wings host for guest file access. Virtual machines also require the full Incus package with QEMU, working KVM and an Incus agent in the guest. Installing only `incus-base` does not provide the VM runtime. Images from the default repository normally include the agent.
+
+```yaml
+runtime:
+  backend: incus
+  incus:
+    image_server: https://images.linuxcontainers.org
+    native_storage_pool: wings-native
+    native_storage_driver: dir
+    native_storage_config: {}
+```
+
+Wings creates the native pool automatically. With `dir`, its default source is `/var/lib/calagopus-wings/incus/storage-pools/wings-native`, following the configured Wings root directory. Incus manages VM `root.img` files beneath this pool. System containers use directories. Other Incus root-disk storage drivers can be selected through `native_storage_driver` and `native_storage_config`; block-backed drivers manage their own volumes rather than exposing an image file. Existing pools retain their configuration.
+
+Guest root disks persist across stops, restarts, and daemon restarts. Explicit server deletion removes the owned Incus instance. The configured server disk limit sets the native root disk size. Container filesystem quota enforcement with `dir` requires project quotas on the backing filesystem; choose Btrfs, ZFS, or another quota-capable driver for enforced container disk limits. VM disk capacity is enforced by its virtual block device.
+
+The console opens an interactive root shell through Incus exec. The panel file manager and Wings SFTP expose the guest root filesystem through Incus SFTP without rewriting OS ownership. VM file access and shell sessions require the guest to be running with its agent available. Guest pseudo-filesystems are excluded by the built-in OS template.
+
+Allocations, bridge networking, port publication, and the existing Incus firewall implementation are shared with application containers. CPU and memory limits map to Incus instance limits; VM CPU limits are rounded up to a whole vCPU. Egg startup commands and installer scripts do not run inside native OS instances.
+
+Install the companion panel branch and apply its database migrations before creating OS instances. The migration adds the native instance configuration and a built-in operating-system template. Instance type and image are fixed at creation. Tundra private networking is not supported for native OS instances. VM creation is disabled on nodes that enable Tundra, whose namespace adapter currently handles containers only. Full native backup/export, migration, extra mounts, and OS reinstallation are not implemented in this branch; ordinary game-data backup and transfer operations are rejected for native instances. Application-container backup and transfer behavior is unchanged.

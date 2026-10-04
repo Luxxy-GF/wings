@@ -2801,6 +2801,10 @@ impl super::ServerExecutor for DockerExecutor {
         &self,
         server: &super::super::Server,
     ) -> Result<(Arc<dyn super::ProcessHandle>, StatusReceiver), anyhow::Error> {
+        anyhow::ensure!(
+            server.configuration.read().await.instance.is_none(),
+            "native OS instances require an Incus node"
+        );
         let image = server.configuration.read().await.container.image.clone();
 
         self.pull_image(&image, server, false).await?;

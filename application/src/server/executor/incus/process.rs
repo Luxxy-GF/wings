@@ -68,6 +68,7 @@ fn console_input(data: &[u8]) -> Vec<u8> {
 
 pub(super) struct Handle {
     name: String,
+    native: bool,
     executor: IncusExecutor,
     server: Weak<crate::server::InnerServer>,
     started: Arc<AtomicBool>,
@@ -75,6 +76,7 @@ pub(super) struct Handle {
     lines: broadcast::Sender<Arc<compact_str::CompactString>>,
     limited: broadcast::Sender<Arc<compact_str::CompactString>>,
     log_path: PathBuf,
+    console_abort: tokio::task::AbortHandle,
     tasks: Vec<tokio::task::JoinHandle<()>>,
 }
 impl Drop for Handle {
@@ -92,6 +94,7 @@ impl Handle {
         attached: bool,
         runtime: bool,
     ) -> anyhow::Result<(Arc<dyn ProcessHandle>, StatusReceiver)> {
+        let native = runtime && server.configuration.read().await.instance.is_some();
         let (stdin, stdin_rx) = mpsc::channel(150);
         let capacity = executor.config.load().system.websocket_log_count.max(1);
         let (lines, _) = broadcast::channel(capacity * 2);
@@ -114,6 +117,7 @@ impl Handle {
             lines.clone(),
             limited.clone(),
             log_path.clone(),
+            native,
         ));
         let monitor = tokio::spawn(monitor_task(
             executor.clone(),
@@ -126,6 +130,7 @@ impl Handle {
         Ok((
             Arc::new(Self {
                 name,
+                native,
                 executor,
                 server: weak,
                 started,
@@ -133,10 +138,19 @@ impl Handle {
                 lines,
                 limited,
                 log_path,
+                console_abort: console.abort_handle(),
                 tasks: vec![console, monitor],
             }),
             status_rx,
         ))
+    }
+
+    async fn stop_native(&self, force: bool) -> anyhow::Result<()> {
+        self.console_abort.abort();
+        if let Some(server) = self.server.upgrade() {
+            self.executor.unmount_native_files(&server).await?;
+        }
+        self.executor.client.state(&self.name, "stop", force).await
     }
 }
 
@@ -147,6 +161,7 @@ async fn console_task(
     lines: broadcast::Sender<Arc<compact_str::CompactString>>,
     limited: broadcast::Sender<Arc<compact_str::CompactString>>,
     path: PathBuf,
+    native: bool,
 ) {
     let mut line_buffer = crate::io::line_buffer::LineBuffer::new();
     let mut line_count = 0;
@@ -171,7 +186,7 @@ async fn console_task(
     };
     loop {
         let connection = async {
-            let (operation, fds) = executor.client.console(&name).await?;
+            let (operation, fds) = executor.client.console(&name, native).await?;
             let data_secret = fds
                 .get("0")
                 .and_then(Value::as_str)
@@ -300,7 +315,7 @@ async fn monitor_task(
             Ok(state) => {
                 if runtime && let Some(server) = server.upgrade() {
                     let now = std::time::Instant::now();
-                    let cpu_usage = state.cpu.get("usage").copied().unwrap_or(0);
+                    let cpu_usage = state.cpu.get("usage").copied().unwrap_or(0).max(0) as u64;
                     let percent = cpu.map_or(0.0, |(before, time)| {
                         cpu_usage.saturating_sub(before) as f64
                             / now.duration_since(time).as_nanos().max(1) as f64
@@ -309,8 +324,19 @@ async fn monitor_task(
                     cpu = Some((cpu_usage, now));
                     let build = server.configuration.read().await;
                     server.resource_usage.send_modify(|usage| {
-                        usage.memory_bytes = state.memory.get("usage").copied().unwrap_or(0);
-                        usage.memory_limit_bytes = state.memory.get("total").copied().unwrap_or(0);
+                        if build.instance.is_some() {
+                            usage.disk_bytes = state
+                                .disk
+                                .get("root")
+                                .and_then(|disk| disk.get("usage"))
+                                .copied()
+                                .unwrap_or(0)
+                                .max(0) as u64;
+                        }
+                        usage.memory_bytes =
+                            state.memory.get("usage").copied().unwrap_or(0).max(0) as u64;
+                        usage.memory_limit_bytes =
+                            state.memory.get("total").copied().unwrap_or(0).max(0) as u64;
                         usage.cpu_absolute = percent;
                         usage.cpu_limit_absolute = if build.build.cpu_limit > 0 {
                             build.build.cpu_limit as u32
@@ -360,6 +386,20 @@ async fn monitor_task(
                         return;
                     }
 
+                    let native = server
+                        .upgrade()
+                        .is_some_and(|server| server.filesystem.native_instance);
+                    if native && let Some(server) = server.upgrade() {
+                        let is_vm = server.configuration.read().await.instance.as_ref().is_some_and(|instance| instance.kind == crate::server::configuration::NativeInstanceType::VirtualMachine);
+                        let files = if is_vm {
+                            executor.unmount_native_files(&server).await
+                        } else {
+                            executor.mount_native_files(&server).await
+                        };
+                        if let Err(error) = files {
+                            tracing::warn!(%error, instance = %name, "could not update stopped guest filesystem access");
+                        }
+                    }
                     let exit = executor
                         .client
                         .read_file(
@@ -368,11 +408,14 @@ async fn monitor_task(
                                 .file_path(&Storage::control_name(&name), "process/exit"),
                         )
                         .await;
-                    let code = exit
-                        .ok()
-                        .and_then(|data| String::from_utf8(data).ok())
-                        .and_then(|s| s.trim().parse::<i32>().ok())
-                        .unwrap_or(-1);
+                    let code = if native {
+                        0
+                    } else {
+                        exit.ok()
+                            .and_then(|data| String::from_utf8(data).ok())
+                            .and_then(|s| s.trim().parse::<i32>().ok())
+                            .unwrap_or(-1)
+                    };
                     if name.starts_with("wgx-")
                         && let Err(error) = executor.remove_instance(&name).await
                     {
@@ -444,11 +487,20 @@ impl ProcessHandle for Handle {
         Ok(())
     }
     async fn start(&self) -> anyhow::Result<()> {
-        self.executor
-            .client
-            .state(&self.name, "start", false)
-            .await?;
+        if !self.native || self.executor.instance(&self.name).await?.status != "Running" {
+            self.executor
+                .client
+                .state(&self.name, "start", false)
+                .await?;
+        }
         self.started.store(true, Ordering::SeqCst);
+        if self.native
+            && let Some(server) = self.server.upgrade()
+            && let Err(error) = self.executor.mount_native_files(&server).await
+        {
+            let _ = self.executor.client.state(&self.name, "stop", true).await;
+            return Err(error);
+        }
         if self.name.starts_with("wgs-")
             && let Err(err) = self.executor.publish(&self.name).await
         {
@@ -465,6 +517,9 @@ impl ProcessHandle for Handle {
         Ok(())
     }
     async fn stop(&self) -> anyhow::Result<()> {
+        if self.native {
+            return self.stop_native(false).await;
+        }
         if self.name.starts_with("wgs-")
             && let Some(server) = self.server.upgrade()
         {
@@ -525,6 +580,9 @@ impl ProcessHandle for Handle {
         self.executor.client.state(&self.name, "stop", false).await
     }
     async fn kill(&self) -> anyhow::Result<()> {
+        if self.native {
+            return self.stop_native(true).await;
+        }
         self.executor.client.state(&self.name, "stop", true).await
     }
 }

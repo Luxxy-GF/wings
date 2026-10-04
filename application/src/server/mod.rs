@@ -191,7 +191,7 @@ impl Server {
             websocket_tx.clone(),
             resource_usage.clone(),
             Arc::clone(&app_state.config),
-            &configuration.egg.file_denylist,
+            &configuration,
         );
 
         let activity = activity::ActivityManager::new(configuration.uuid, &app_state.config);
@@ -776,6 +776,10 @@ impl Server {
         process_configuration: configuration::process::ProcessConfiguration,
         skip_pending_restart_check: bool,
     ) {
+        if self.configuration.read().await.instance != configuration.instance {
+            tracing::error!(server = %self.uuid, "changing an instance type or OS image requires recreating the server");
+            return;
+        }
         self.filesystem
             .update_ignored(&configuration.egg.file_denylist)
             .await;
@@ -1243,12 +1247,13 @@ impl Server {
                             }
                         }
 
-                        if server.filesystem.is_full().await {
+                        if !server.filesystem.native_instance && server.filesystem.is_full().await {
                             return Err(anyhow::anyhow!(
                                 "Disk space is full, cannot start the server."
                             ));
                         }
 
+                        if !server.filesystem.native_instance {
                         server.log_daemon_with_prelude("Updating process configuration files...");
                         if let Err(err) = server.process_configuration
                             .read()
@@ -1262,7 +1267,8 @@ impl Server {
                             );
                         }
 
-                        if server.app_state.config.load().system.check_permissions_on_boot {
+                        }
+                        if !server.filesystem.native_instance && server.app_state.config.load().system.check_permissions_on_boot {
                             let walk_needed = !server.filesystem.write_tracking_active()
                                 || server.filesystem.chown_state_dirty.swap(false, std::sync::atomic::Ordering::Relaxed);
 
@@ -1296,6 +1302,9 @@ impl Server {
                         };
 
                         process_handle.start().await?;
+                        if server.filesystem.native_instance {
+                            server.state.set_state(state::ServerState::Running).await;
+                        }
 
                         Ok(())
                     },
@@ -1666,6 +1675,10 @@ impl Server {
         self.set_suspended(true).await;
         self.kill(true).await.ok();
         self.destroy_container().await;
+        if let Err(error) = self.app_state.executor.delete_server_storage(self).await {
+            tracing::error!(%error, server = %self.uuid, "could not delete server runtime storage");
+            return;
+        }
         self.configuration
             .read()
             .await

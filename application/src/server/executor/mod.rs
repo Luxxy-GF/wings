@@ -113,6 +113,14 @@ pub trait ServerExecutor: Send + Sync {
     ) -> Result<(Arc<dyn ProcessHandle>, StatusReceiver), anyhow::Error>;
     async fn cleanup_server_process(&self, server: &super::Server) -> Result<(), anyhow::Error>;
 
+    async fn prepare_server_storage(&self, _server: &super::Server) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn delete_server_storage(&self, _server: &super::Server) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     async fn setup_installation_process(
         &self,
         server: &super::Server,
