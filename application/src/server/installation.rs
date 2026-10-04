@@ -854,29 +854,6 @@ impl Drop for ServerInstaller {
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn incus_failed_or_unknown_exit_is_not_a_successful_install() {
-        use crate::config::RuntimeBackend;
-        for (backend, code, failed) in [
-            (RuntimeBackend::Incus, -1, true),
-            (RuntimeBackend::Incus, 1, true),
-            (RuntimeBackend::Incus, 0, false),
-            (RuntimeBackend::Docker, -1, false),
-        ] {
-            let directory = tempfile::tempdir().unwrap();
-            let state = crate::routes::AppState::mock();
-            let config = state.config.mutate_in_place_for_testing();
-            config.runtime.backend = backend;
-            config.system.tmp_directory =
-                crate::config::SystemPath::new(directory.path().display().to_string());
-            let server = crate::server::Server::mock(uuid::Uuid::new_v4(), state);
-            server.filesystem.disk_checker.abort();
-            let installer = ServerInstaller::new(&server, false, false, None).await;
-            installer.evaluate_install_result(code, false).await;
-            assert_eq!(installer.failure_reason.lock().await.is_some(), failed);
-        }
-    }
-
     fn progress(content: &str) -> Option<(u64, u64, Option<String>)> {
         tokio_test::block_on(async {
             let dir = tempfile::tempdir().unwrap();

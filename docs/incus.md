@@ -37,7 +37,7 @@ cargo +1.99.0 build --locked --release -p wings-rs --bin wings-rs
 ./target/release/wings-rs --help
 ```
 
-The first release build downloads dependencies and compiles bundled native libraries; allow several minutes and sufficient RAM. Building does not install or restart Wings or Incus. Configure the backend and run the smoke test before replacing an existing service.
+The first release build downloads dependencies and compiles bundled native libraries; allow several minutes and sufficient RAM. Building does not install or restart Wings or Incus. Configure the backend and check server startup before replacing an existing service.
 
 If the build cannot obtain its bundled `fusequota` helper automatically, download the official release and pass its absolute path to the build. Existing compiled dependencies are reused:
 
@@ -117,7 +117,7 @@ Existing bridges are not readdressed automatically. Nodes already using `10.76.0
 
 The project owns its images, profiles, and private control volumes. It uses `features.networks=false` to share a Wings-owned managed bridge in Incus's default project. Wings creates that bridge with NAT/DHCP and assigns private instance addresses, with MAC/IP filtering and NIC port isolation.
 
-Disable Wings's machine-ID mounts for initial hardware tests. The default product-UUID target `/sys/class/dmi/id/product_uuid` includes a sysfs symlink on physical hosts, which LXC refuses as a bind-mount target. Private process files are placed in an image-user-owned child directory inside the control volume: Incus 7.0's file API does not change permissions or ownership when asked to create a directory that already exists, including the volume root.
+Disable Wings's machine-ID mounts on physical hosts. The default product-UUID target `/sys/class/dmi/id/product_uuid` includes a sysfs symlink on physical hosts, which LXC refuses as a bind-mount target. Private process files are placed in an image-user-owned child directory inside the control volume: Incus 7.0's file API does not change permissions or ownership when asked to create a directory that already exists, including the volume root.
 
 ## Allocation proxy devices
 
@@ -206,84 +206,14 @@ Cleanup runs at startup and hourly. The default retention is 30 days since the l
 
 ## Current limitations
 
-This is an experimental implementation following the PR's architecture, with incomplete feature parity. On 2026-10-03, the complete live smoke test passed against Incus 7.0.1 in a disposable Debian VM with a Btrfs pool, using `python:3.13-alpine`. It covered OCI import, real TCP/UDP forward traffic, console reconnect and command stop with exit code 7, host data ownership/persistence, installer progress/status files, script exit code 9, and owned-resource cleanup. On 2026-10-04, the same full test passed with the non-root `ghcr.io/pterodactyl/yolks:python_3.11` image after the control-directory and state-monitor fixes.
+This is an experimental implementation following the PR's architecture, with incomplete feature parity.
 
 - IPv6, remote Incus, clusters/OVN, forced outgoing-IP SNAT, device passthrough, custom seccomp, OOM-disable, and CPU boosts remain unsupported and are rejected when requested.
-- **Non-root OCI startup has been smoke-tested with `ghcr.io/pterodactyl/yolks:python_3.11`.** Console I/O, control-file writes, forwarding, and helper execution passed. Full game eggs and their installer scripts still require hardware validation; this remains an experimental backend.
-- Native Incus `raw.idmap` is an instance-wide mapping, unlike Proxmox's per-mount `mpN` ID maps. The live tests verified both guest root and the non-root Python yolk mapped to host data UID 1000; Extra directories must be accessible to the mapped Wings data UID/GID; the executor does not recursively change administrator-owned mount contents.
+- Full game eggs and their installer scripts still require hardware validation.
+- Native Incus `raw.idmap` is an instance-wide mapping, unlike Proxmox's per-mount `mpN` ID maps. Extra directories must be accessible to the mapped Wings data UID/GID; the executor does not recursively change administrator-owned mount contents.
 - Repository-scoped credential keys, token/helper-based authentication overrides, and private-registry proxy combinations need separate validation; the implemented credential map uses exact registry host/port keys.
 - Console replay completeness, XFS/ZFS data quotas, snapshot/remote backup adapters, multiplex transfers, and automated backend migration need separate validation.
 - I/O priority supports Docker weights 10 or multiples of 100 through 1000. Other weights are rejected.
-- Console input waits five seconds after WebSocket attachment, but Incus does not acknowledge native relay readiness. Reconnect input was intermittently lost in the slow QEMU/TCG lab, including with an additional 15-second test delay; a later command through the official client succeeded. Early-input reliability remains a limitation requiring hardware checks.
+- Console input waits five seconds after WebSocket attachment, but Incus does not acknowledge native relay readiness. Early reconnect input can be lost on slow hosts. Early-input reliability remains a limitation requiring hardware checks.
 - The supervisor records exit codes. Forced kills can leave an unknown code (`-1`); there is no inferred OOM flag.
 - `used_ports` reflects Incus proxies and remaining legacy forwards, but does not completely represent host-service conflicts or unrelated NAT rules.
-
-## Validation
-
-Local Incus regression tests: **32 passed, 4 live tests ignored**. The quality refactor also checks operation failures, malformed error responses, API path constraints, console handshake deadlines, preserved instance settings, recovery ownership checks, and reclamation of unused image locks. Before the proxy migration change, the full live lifecycle/helper test passed separately with the root Python image and the non-root Python yolk. Incus installers with a nonzero or unknown exit code now report failure even if no status file was written. Direct REST checks also passed for managed bridge/forward CRUD, shared-IP entries, collision/subnet rejection, unattached custom-volume file access, quota configuration, and cleanup. Earlier checks covered quota configuration; the 2026-10-04 Btrfs test below also verified write-quota enforcement.
-
-On 2026-10-04, the focused `live_incus_allocation_proxies_and_cleanup` test passed against Incus 7.0.1 with `python:3.13-alpine` and a Btrfs pool. It verified concrete and wildcard TCP/UDP traffic, client source-IP preservation, migration of a running instance, preservation of unrelated forward entries, allocation update/removal and overlap rejection, used-port reporting, Incus API stop, host file ownership/persistence after deletion, installer status/progress, script exit code 9, and owned-resource cleanup. Production Clippy passed with warnings denied. Rechecking the full console test encountered intermittent reconnect-input loss, including with an extra 15-second settling delay; that limitation remains unresolved.
-
-On 2026-10-04, extended Btrfs and FUSE runs passed with an 8 MiB game-data limit. A guest attempted 32 MiB of writes and received a quota/full-disk error. It verified allowlisted read-only/write mounts, the private hosts file, Tundra Incus ownership/project checks and TCP/UDP namespace listeners, and installation into a deliberately root-owned data directory. Real Incus export/import progress reached the console. The FUSE run also verified that the quota mount was active before attaching data to Incus, installer/script-helper completion, and owned-resource cleanup. Tundra regression tests: **181 passed, 2 ignored**; Wings Tundra tests: **8 passed, 2 ignored**.
-
-On 2026-10-04, the expanded tests also verified fresh executor/filesystem reattachment after an Incus daemon restart, unchanged game PID, FUSE mount identity, and restored TCP/UDP publication. A real local backup/restore and checksummed HTTP node transfer passed with source UID/GID 1000 and destination UID/GID 1001, preserving file contents, mode and symlinks; a 16 MiB transfer into an 8 MiB destination was rejected. These checks passed with Btrfs and FUSE. A private HTTPS registry fixture verified manifest/config/layer authentication with a password containing spaces and punctuation, using a trusted test CA and normal TLS verification. The full FUSE lifecycle/helper run passed with that registry, including stopped-image protection and deletion of expired, unused, owned images. The wrapper unit test separately checks credential/CA preservation when Incus replaces the Skopeo environment for a proxy.
-
-A real VM reboot test passed after verifying the kernel boot ID changed. Incus left the game stopped (`boot.autostart=false`), and Wings’s normal `ServerManager::boot` path autostarted it from the saved running state and panel policy. Persistent files, rebuilt FUSE quota mounts, and TCP/UDP allocations passed.
-
-After the quality refactor, the focused lifecycle/helper test passed again on Incus 7.0.1 with FUSE quotas and the private HTTPS registry. It covered allocation proxies, daemon reattachment, backups/transfers, destination ownership, helper exit status, and image cleanup. All **20** existing `LineBuffer` tests also passed; Incus console output now uses that shared Wings implementation. Production Clippy passed with warnings denied.
-
-The standalone Tundra workspace suite passed: **301 passed, 4 ignored**. The broader Wings suite on the cloud host reported **794 passed, 10 failed, 22 ignored**. The same ten failures reproduced in the baseline build: eight inotify tests fail when run with the full suite but pass in isolation, and two TCP congestion-control tests fail on the cloud host but pass on the VM's Linux kernel. All eight inotify tests also passed on that VM. The complete single-process cloud-host suite therefore remains failing; these baseline failures are separate from the successful Incus integration checks.
-
-Two-node private-network validation used the upstream Tundra test panel and verified TCP/UDP through QUIC, `.tunnel` names, ACL revocation/restoration, and adoption after a native Incus restart. The production panel UI was not exercised. Tundra's native runtime source is maintained separately in [Luxxy-GF/tundra](https://github.com/Luxxy-GF/tundra); Wings uses the original `calagopus/tundra.git` dependency for `tundra-common` and pins the Incus node crate to the fork revision.
-
-Automatic storage setup passed on Incus 7.0.1 with a previously missing `dir` pool at the native `/var/lib/incus/storage-pools/` location and a `/16` bridge. The full focused lifecycle test exercised FUSE game-data quotas, TCP/UDP allocations, daemon reattachment, authenticated OCI import, backups/transfers, helpers, and cleanup. The focused Btrfs backup/transfer test also passed using the pre-existing pool, including native quota rejection. ZFS, LVM, and Ceph pool creation have not been live-tested in this lab.
-
-Run the local regression tests with:
-
-```sh
-cargo test --locked -p wings-rs incus
-```
-
-For an initial hardware smoke test, use a spare Linux node with Incus 7.0.1, a disposable storage pool, the required tools, and the UID/GID delegation above. Run the following as root from this checkout, supplying the node's real IPv4 address. The test creates its own random project and bridge and retains the selected pool. If the named pool is missing, it creates a `dir` pool automatically; remove that disposable pool manually after testing:
-
-```sh
-INCUS_TEST_POOL=your-test-pool \
-INCUS_TEST_LISTEN_IP=your-node-ipv4 \
-cargo test --locked -p wings-rs live_incus_allocation_proxies_and_cleanup -- --ignored --nocapture
-```
-
-The expanded backup/transfer fixture maps source UID/GID 1000 to destination UID/GID 1001 on the same test node. Delegate both test IDs to the Incus daemon account before running it; for root, add `root:1000:1` and `root:1001:1` to both `/etc/subuid` and `/etc/subgid` alongside the normal subordinate ranges, then restart Incus. Production nodes need delegation for their configured Wings account.
-
-FUSE control sockets must fit Linux’s Unix-socket path limit. Use a short `INCUS_TEST_DATA_ROOT`; for reboot tests it must be persistent, such as `/var/tmp/wings-test`. The default temporary directory is unsuitable for reboot checkpoints.
-
-Use `INCUS_TEST_CIDR` if the default `10.237.19.0/24` conflicts with your network. Test from the node first; public ingress and upstream routing need separate hardware checks.
-
-```sh
-cargo fmt --all -- --check
-cargo clippy -p wings-rs --bin wings-rs -- -D warnings
-cargo test -p wings-rs incus -- --skip live_incus_lifecycle_volume_console_and_forwards
-```
-
-A focused networking/helper test uses the Incus stop API and checks allocation proxies, legacy-forward migration, conflict rejection, persistent data and cleanup independently of console input:
-
-```sh
-INCUS_TEST_POOL=your-test-pool INCUS_TEST_LISTEN_IP=your-node-ipv4 \
-  cargo test -p wings-rs live_incus_allocation_proxies_and_cleanup -- --ignored --nocapture
-```
-
-The full console test also accepts `INCUS_TEST_CONSOLE_SETTLE_SECONDS` (maximum 60 seconds) for diagnosis on slow emulated hosts. Additional settling did not eliminate the observed intermittent reconnect-input failure; it is not a runtime readiness fix.
-
-The ignored live test uses an explicitly selected disposable Incus host/pool. It creates a random project/bridge, imports an OCI image, tests TCP/UDP forwarding, reconnects the console, checks exit status and stopped-server host-file access, and deletes its owned resources. It retains the supplied storage pool.
-
-```sh
-INCUS_TEST_POOL=test-btrfs \
-INCUS_TEST_LISTEN_IP=192.0.2.10 \
-INCUS_TEST_CIDR=10.237.19.1/24 \
-cargo test -p wings-rs live_incus_lifecycle_volume_console_and_forwards -- --ignored --nocapture
-```
-
-To exercise write-quota enforcement and mounts, use the focused test with `INCUS_TEST_QUOTA=btrfs` and `INCUS_TEST_DATA_ROOT=/path/on/btrfs`, or `INCUS_TEST_QUOTA=fuse` on a host supporting the bundled FUSE helper. The test creates its own data directory below the supplied root and tests an 8 MiB quota.
-
-Optional overrides: `INCUS_TEST_SOCKET`, `INCUS_TEST_PORT`, and `INCUS_TEST_IMAGE` (default `python:3.13-alpine`). `INCUS_TEST_KEEP_FAILURE=1` explicitly retains failed test resources and their temporary data for inspection; remove those owned resources after debugging.
-
-The former experimental `wgv-*` data volumes are not migrated or deleted by this host-directory implementation. If any exist from earlier live use, stop their instances, back up and restore their data to the normal Wings directory with correct ownership, then verify through Wings before switching allocations.

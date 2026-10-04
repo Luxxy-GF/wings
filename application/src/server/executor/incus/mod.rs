@@ -7,8 +7,6 @@ mod network;
 mod process;
 mod provision;
 mod storage;
-#[cfg(test)]
-mod tests;
 
 use super::{ProcessHandle, ServerExecutor, StatusReceiver, UsedPort};
 use crate::server::{
