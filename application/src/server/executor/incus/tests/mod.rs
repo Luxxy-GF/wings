@@ -1,4 +1,5 @@
 use super::*;
+use reqwest::StatusCode;
 
 #[test]
 fn stopped_state_accepts_null_statistics_without_hiding_invalid_data() -> anyhow::Result<()> {
@@ -71,6 +72,9 @@ fn docker_remains_default() -> anyhow::Result<()> {
     let config: crate::config::InnerConfig =
         serde_norway::from_str("runtime:\n  backend: incus\n  incus:\n    project: test-node\n")?;
     assert_eq!(config.runtime.incus.project, "test-node");
+    assert_eq!(config.runtime.incus.storage_driver, "dir");
+    assert!(config.runtime.incus.storage_config.is_empty());
+    assert_eq!(config.runtime.incus.ipv4_address, "10.76.0.1/16");
     Ok(())
 }
 
@@ -394,6 +398,105 @@ async fn recovery_checks_ownership_before_preparing_the_filesystem() -> anyhow::
     Ok(())
 }
 
+#[tokio::test]
+async fn storage_creates_missing_pool_with_driver_options() -> anyhow::Result<()> {
+    let config = crate::config::Config::mock();
+    config
+        .mutate_in_place_for_testing()
+        .runtime
+        .incus
+        .storage_driver = "btrfs".into();
+    config
+        .mutate_in_place_for_testing()
+        .runtime
+        .incus
+        .storage_config = BTreeMap::from([("size".into(), "50GiB".into())]);
+    let config = Arc::new(config);
+    let fixture = MockIncus::with_bodies(vec![
+        (
+            "GET /1.0/storage-pools/wings ",
+            StatusCode::NOT_FOUND,
+            json!({"type":"error","error":"missing","error_code":404}),
+            None,
+        ),
+        (
+            "POST /1.0/storage-pools ",
+            StatusCode::OK,
+            json!({"type":"sync","metadata":{}}),
+            Some(json!({
+                "name":"wings", "driver":"btrfs", "description":format!("wings:{}", config.load().uuid),
+                "config":{"size":"50GiB", "user.wings.owner":format!("wings:{}", config.load().uuid)}
+            })),
+        ),
+        (
+            "GET /1.0/storage-pools/wings ",
+            StatusCode::OK,
+            json!({"type":"sync","metadata":{"driver":"btrfs","status":"Created"}}),
+            None,
+        ),
+    ])?;
+    Storage::new(fixture.client.clone(), config).boot().await?;
+    fixture.finish().await
+}
+
+#[tokio::test]
+async fn storage_reuses_existing_driver_without_changing_pool() -> anyhow::Result<()> {
+    for driver in ["dir", "btrfs", "zfs", "lvm", "ceph"] {
+        let fixture = MockIncus::new(vec![(
+            "GET /1.0/storage-pools/wings ",
+            StatusCode::OK,
+            json!({"type":"sync","metadata":{"driver":driver,"status":"Created"}}),
+        )])?;
+        Storage::new(
+            fixture.client.clone(),
+            Arc::new(crate::config::Config::mock()),
+        )
+        .boot()
+        .await?;
+        fixture.finish().await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn storage_rejects_unusable_pools_and_preserves_access_errors() -> anyhow::Result<()> {
+    for pool in [
+        json!({"driver":"cephfs","status":"Created"}),
+        json!({"driver":"cephobject","status":"Created"}),
+        json!({"driver":"zfs","status":"Pending"}),
+    ] {
+        let fixture = MockIncus::new(vec![(
+            "GET /1.0/storage-pools/wings ",
+            StatusCode::OK,
+            json!({"type":"sync","metadata":pool}),
+        )])?;
+        assert!(
+            Storage::new(
+                fixture.client.clone(),
+                Arc::new(crate::config::Config::mock())
+            )
+            .boot()
+            .await
+            .is_err()
+        );
+        fixture.finish().await?;
+    }
+    let fixture = MockIncus::new(vec![(
+        "GET /1.0/storage-pools/wings ",
+        StatusCode::FORBIDDEN,
+        json!({"type":"error","error":"denied","error_code":403}),
+    )])?;
+    let error = Storage::new(
+        fixture.client.clone(),
+        Arc::new(crate::config::Config::mock()),
+    )
+    .boot()
+    .await
+    .unwrap_err();
+    assert!(client::is_status(&error, StatusCode::FORBIDDEN));
+    fixture.finish().await
+}
+
 struct MockIncus {
     client: Client,
     task: tokio::task::JoinHandle<anyhow::Result<()>>,
@@ -402,6 +505,17 @@ struct MockIncus {
 
 impl MockIncus {
     fn new(responses: Vec<(&'static str, reqwest::StatusCode, Value)>) -> anyhow::Result<Self> {
+        Self::with_bodies(
+            responses
+                .into_iter()
+                .map(|(path, status, response)| (path, status, response, None))
+                .collect(),
+        )
+    }
+
+    fn with_bodies(
+        responses: Vec<(&'static str, reqwest::StatusCode, Value, Option<Value>)>,
+    ) -> anyhow::Result<Self> {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let directory = tempfile::tempdir()?;
@@ -413,7 +527,7 @@ impl MockIncus {
         })?;
         let task = tokio::spawn(async move {
             tokio::time::timeout(Duration::from_secs(5), async move {
-                for (expected, status, response) in responses {
+                for (expected, status, response, expected_body) in responses {
                     let (mut stream, _) = listener.accept().await?;
                     let mut request = Vec::new();
                     let mut buffer = [0; 1024];
@@ -427,6 +541,20 @@ impl MockIncus {
                         "unexpected Incus request: {}",
                         String::from_utf8_lossy(&request)
                     );
+                    if let Some(expected_body) = expected_body {
+                        let header_end = request.windows(4).position(|bytes| bytes == b"\r\n\r\n").context("request headers")? + 4;
+                        let headers = String::from_utf8_lossy(&request[..header_end]);
+                        let length: usize = headers.lines().find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            if name.eq_ignore_ascii_case("content-length") { value.trim().parse().ok() } else { None }
+                        }).context("request content length")?;
+                        while request.len() < header_end + length {
+                            let size = stream.read(&mut buffer).await?;
+                            ensure!(size > 0, "Incus request ended before its body");
+                            request.extend_from_slice(&buffer[..size]);
+                        }
+                        assert_eq!(serde_json::from_slice::<Value>(&request[header_end..header_end + length])?, expected_body);
+                    }
                     let body = serde_json::to_vec(&response)?;
                     let headers = format!(
                         "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",

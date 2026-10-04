@@ -54,7 +54,7 @@ cargo +1.99.0 build --locked --release -p wings-rs --bin wings-rs
 ### Host requirements
 
 - Linux and **Incus 7.0.1 or a later 7.0 LTS maintenance release**. The daemon version and required API extensions are checked; feature releases such as 7.1 are rejected.
-- A root Wings service with local Incus socket access, an existing btrfs/ZFS pool, the Incus client, `skopeo`, and host `nftables`.
+- A root Wings service with local Incus socket access, storage-driver prerequisites, the Incus client, `skopeo`, and host `nftables`.
 - A non-root Wings data UID/GID, with host directories owned by that account. The instance itself remains unprivileged with isolated ID maps. Helpers run as container root mapped to the Wings data account.
 - When `newuidmap`/`newgidmap` are installed, delegate the Wings data IDs to the Incus daemon account (normally root) in `/etc/subuid` and `/etc/subgid`, in addition to its normal subordinate ranges. For UID/GID 1000, the additional entries are `root:1000:1` in each file. Restart Incus after changing its ID-map delegation.
 - OCI images containing `/bin/sh`, used by the argv-preserving process supervisor.
@@ -69,11 +69,11 @@ runtime:
     socket: /var/lib/incus/unix.socket
     project: wings
     storage_pool: wings
+    storage_driver: dir
+    storage_config: {}
     root_disk_size: 10GiB
     network: wingsbr0
-    ipv4_address: 10.76.0.1/24
-    # Optional concrete address for advertising wildcard allocations.
-    # Does not restrict proxy listening; panel allocation IPs control that.
+    ipv4_address: 10.76.0.1/16
     listen_addresses: []
     operation_timeout_seconds: 120
     image_import_timeout_seconds: 1800
@@ -92,6 +92,28 @@ docker:
   firewall:
     backend: nftables
 ```
+
+Wings creates a missing storage pool automatically before importing images. The default `dir` driver uses Incus's normal storage directory, usually `/var/lib/incus/storage-pools/wings`. The default bridge subnet is `10.76.0.1/16`. Existing pools are reused with their actual driver; Wings does not change their configuration or delete them. `storage_driver` and `storage_config` apply only when creating a missing pool.
+
+All container-capable storage drivers provided by the installed Incus daemon can be selected, including `dir`, `btrfs`, `zfs`, `lvm`, and `ceph`. Incus validates the driver, its prerequisites, and its options. `cephfs` and `cephobject` cannot provide container root disks and are rejected. These are Incus storage drivers, rather than Docker image storage drivers.
+
+`storage_config` passes string values directly to Incus's [storage-pool configuration API](https://linuxcontainers.org/incus/docs/main/reference/storage_drivers/). For example, to create a Btrfs loop-backed pool:
+
+```yaml
+runtime:
+  backend: incus
+  incus:
+    storage_pool: wings
+    storage_driver: btrfs
+    storage_config:
+      size: "50GiB"
+```
+
+For an existing ZFS pool or LVM volume group, set `storage_driver` to `zfs` or `lvm` and `storage_config.source` to its name. Other driver options, including Ceph cluster and pool settings, use the same mapping. Install the selected driver's host tools before starting Wings. Leaving `source` unset with `dir` uses the native Incus storage location; setting it selects another directory.
+
+Incus applies `root_disk_size` and the control-volume quota through the selected driver. With `dir`, these limits are enforced only if the backing filesystem supports and enables project quotas; otherwise Incus skips them. Server files remain in the Wings data directory and use Wings's configured disk limiter, independently of the Incus storage driver.
+
+Existing bridges are not readdressed automatically. Nodes already using `10.76.0.1/24` should retain that explicit `ipv4_address` until a planned subnet migration. A different configured subnet produces an error without changing the bridge or its running containers.
 
 The project owns its images, profiles, and private control volumes. It uses `features.networks=false` to share a Wings-owned managed bridge in Incus's default project. Wings creates that bridge with NAT/DHCP and assigns private instance addresses, with MAC/IP filtering and NIC port isolation.
 
@@ -139,7 +161,7 @@ Like the upstream Docker implementation, private frontend ports must not collide
 
 Panel mounts go through the same normalized-path and `allowed_mounts` checks used by Docker. Incus disk devices preserve `read_only`; administrator-provided files/directories must already have permissions suitable for the image user. The image UID/GID is mapped to the Wings host data account for the whole instance. Extra mounts are not automatically owned or charged to the server data quota.
 
-The persistent data directory remains outside the disposable Incus root disk. `runtime.incus.root_disk_size` limits the image/system disk; it does not limit files in `/home/container`. Choose Wings's existing filesystem limiter to enforce the panel's game-data disk limit:
+The persistent data directory remains outside the disposable Incus root disk. `runtime.incus.root_disk_size` requests a quota for the image/system disk, subject to the driver capability described above; it does not limit files in `/home/container`. Choose Wings's existing filesystem limiter to enforce the panel's game-data disk limit:
 
 ```yaml
 system:
@@ -198,7 +220,7 @@ This is an experimental implementation following the PR's architecture, with inc
 
 ## Validation
 
-Local Incus and installation regression tests: **30 passed, 4 live tests ignored**. The quality refactor also checks operation failures, malformed error responses, API path constraints, console handshake deadlines, preserved instance settings, recovery ownership checks, and reclamation of unused image locks. Before the proxy migration change, the full live lifecycle/helper test passed separately with the root Python image and the non-root Python yolk. Incus installers with a nonzero or unknown exit code now report failure even if no status file was written. Direct REST checks also passed for managed bridge/forward CRUD, shared-IP entries, collision/subnet rejection, unattached custom-volume file access, quota configuration, and cleanup. Earlier checks covered quota configuration; the 2026-10-04 Btrfs test below also verified write-quota enforcement.
+Local Incus regression tests: **32 passed, 4 live tests ignored**. The quality refactor also checks operation failures, malformed error responses, API path constraints, console handshake deadlines, preserved instance settings, recovery ownership checks, and reclamation of unused image locks. Before the proxy migration change, the full live lifecycle/helper test passed separately with the root Python image and the non-root Python yolk. Incus installers with a nonzero or unknown exit code now report failure even if no status file was written. Direct REST checks also passed for managed bridge/forward CRUD, shared-IP entries, collision/subnet rejection, unattached custom-volume file access, quota configuration, and cleanup. Earlier checks covered quota configuration; the 2026-10-04 Btrfs test below also verified write-quota enforcement.
 
 On 2026-10-04, the focused `live_incus_allocation_proxies_and_cleanup` test passed against Incus 7.0.1 with `python:3.13-alpine` and a Btrfs pool. It verified concrete and wildcard TCP/UDP traffic, client source-IP preservation, migration of a running instance, preservation of unrelated forward entries, allocation update/removal and overlap rejection, used-port reporting, Incus API stop, host file ownership/persistence after deletion, installer status/progress, script exit code 9, and owned-resource cleanup. Production Clippy passed with warnings denied. Rechecking the full console test encountered intermittent reconnect-input loss, including with an extra 15-second settling delay; that limitation remains unresolved.
 
@@ -214,13 +236,15 @@ The standalone Tundra workspace suite passed: **301 passed, 4 ignored**. The bro
 
 Two-node private-network validation used the upstream Tundra test panel and verified TCP/UDP through QUIC, `.tunnel` names, ACL revocation/restoration, and adoption after a native Incus restart. The production panel UI was not exercised. Tundra's native runtime source is maintained separately in [Luxxy-GF/tundra](https://github.com/Luxxy-GF/tundra); Wings uses the original `calagopus/tundra.git` dependency for `tundra-common` and pins the Incus node crate to the fork revision.
 
+Automatic storage setup passed on Incus 7.0.1 with a previously missing `dir` pool at the native `/var/lib/incus/storage-pools/` location and a `/16` bridge. The full focused lifecycle test exercised FUSE game-data quotas, TCP/UDP allocations, daemon reattachment, authenticated OCI import, backups/transfers, helpers, and cleanup. The focused Btrfs backup/transfer test also passed using the pre-existing pool, including native quota rejection. ZFS, LVM, and Ceph pool creation have not been live-tested in this lab.
+
 Run the local regression tests with:
 
 ```sh
 cargo test --locked -p wings-rs incus
 ```
 
-For an initial hardware smoke test, use a spare Linux node with Incus 7.0.1, an existing Btrfs/ZFS test pool, the required tools, and the UID/GID delegation above. Run the following as root from this checkout, supplying the node's real IPv4 address. The test creates its own random project and bridge and retains your existing pool:
+For an initial hardware smoke test, use a spare Linux node with Incus 7.0.1, a disposable storage pool, the required tools, and the UID/GID delegation above. Run the following as root from this checkout, supplying the node's real IPv4 address. The test creates its own random project and bridge and retains the selected pool. If the named pool is missing, it creates a `dir` pool automatically; remove that disposable pool manually after testing:
 
 ```sh
 INCUS_TEST_POOL=your-test-pool \
