@@ -39,6 +39,18 @@ cargo +1.99.0 build --locked --release -p wings-rs --bin wings-rs
 
 The first release build downloads dependencies and compiles bundled native libraries; allow several minutes and sufficient RAM. Building does not install or restart Wings or Incus. Configure the backend and run the smoke test before replacing an existing service.
 
+If the build cannot obtain its bundled `fusequota` helper automatically, download the official release and pass its absolute path to the build. Existing compiled dependencies are reused:
+
+```sh
+mkdir -p target
+curl -fL --retry 3 \
+  https://github.com/calagopus/fusequota/releases/download/a39bc56/fusequota-x86_64-linux \
+  -o "$PWD/target/fusequota-x86_64-linux"
+FUSEQUOTA_BINARY_PATH="$PWD/target/fusequota-x86_64-linux" \
+FUSEQUOTA_RELEASE=a39bc56 \
+cargo +1.99.0 build --locked --release -p wings-rs --bin wings-rs
+```
+
 ### Host requirements
 
 - Linux and **Incus 7.0.1 or a later 7.0 LTS maintenance release**. The daemon version and required API extensions are checked; feature releases such as 7.1 are rejected.
@@ -68,6 +80,8 @@ runtime:
     incus_path: incus
     skopeo_path: skopeo
 system:
+  machine_id:
+    enabled: false
   user:
     uid: 1000
     gid: 1000
@@ -79,6 +93,8 @@ docker:
 ```
 
 The project owns its images, profiles, and private control volumes. It uses `features.networks=false` to share a Wings-owned managed bridge in Incus's default project. Wings creates that bridge with NAT/DHCP and assigns private instance addresses, with MAC/IP filtering and NIC port isolation.
+
+Disable Wings's machine-ID mounts for initial hardware tests. The default product-UUID target `/sys/class/dmi/id/product_uuid` includes a sysfs symlink on physical hosts, which LXC refuses as a bind-mount target. Private process files are placed in an image-user-owned child directory inside the control volume: Incus 7.0's file API does not change permissions or ownership when asked to create a directory that already exists, including the volume root.
 
 ## Network forwards
 
@@ -105,7 +121,7 @@ This is an experimental implementation following the PR's architecture, with inc
 
 ## Validation
 
-Local Incus tests: **17 passed**. The full live lifecycle/helper test: **1 passed**. Direct REST checks also passed for managed bridge/forward CRUD, shared-IP entries, collision/subnet rejection, unattached custom-volume file access, quota configuration, and cleanup. Quota configuration was checked; quota-overflow enforcement was not tested.
+Local Incus and installation regression tests: **19 passed**. The full live lifecycle/helper test: **1 passed**. Direct REST checks also passed for managed bridge/forward CRUD, shared-IP entries, collision/subnet rejection, unattached custom-volume file access, quota configuration, and cleanup. Quota configuration was checked; quota-overflow enforcement was not tested.
 
 For an initial hardware smoke test, use a spare Linux node with Incus 7.0.1, an existing Btrfs/ZFS test pool, the required tools, and the UID/GID delegation above. Run the following as root from this checkout, supplying the node's real IPv4 address. The test creates its own random project and bridge and retains your existing pool:
 
@@ -120,7 +136,7 @@ Use `INCUS_TEST_CIDR` if the default `10.237.19.0/24` conflicts with your networ
 ```sh
 cargo fmt --all -- --check
 cargo clippy -p wings-rs --bin wings-rs -- -D warnings
-cargo test -p wings-rs server::executor::incus -- --skip live_incus_lifecycle_volume_console_and_forwards
+cargo test -p wings-rs incus -- --skip live_incus_lifecycle_volume_console_and_forwards
 ```
 
 The ignored live test uses an explicitly selected disposable Incus host/pool. It creates a random project/bridge, imports an OCI image, tests TCP/UDP forwarding, reconnects the console, checks exit status and stopped-server host-file access, and deletes its owned resources. It retains the supplied storage pool.

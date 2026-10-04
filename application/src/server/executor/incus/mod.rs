@@ -295,7 +295,7 @@ impl IncusExecutor {
         );
         result.insert(
             "oci.entrypoint".into(),
-            process::encode_argv(&["/bin/sh".into(), "/opt/wings-control/launch".into()])?,
+            process::encode_argv(&["/bin/sh".into(), "/opt/wings-control/process/launch".into()])?,
         );
         result.insert(
             "oci.cwd".into(),
@@ -454,12 +454,19 @@ impl IncusExecutor {
             ),
         );
         self.client.request(Method::PUT, &Self::instance_path(name), Some(&json!({"config": instance.config, "devices": instance.devices, "profiles": []})), etag.as_deref(), true).await?;
+        // Incus ignores ownership/mode for an existing directory, including the
+        // volume root. A new private child gets the image user and mode applied.
         self.client
-            .directory(&self.storage.file_path(&control, ""), uid, gid, "0700")
+            .directory(
+                &self.storage.file_path(&control, "process"),
+                uid,
+                gid,
+                "0700",
+            )
             .await?;
         self.client
             .write_file(
-                &self.storage.file_path(&control, "launch"),
+                &self.storage.file_path(&control, "process/launch"),
                 instance
                     .config
                     .get("user.wings.launch")
@@ -473,7 +480,7 @@ impl IncusExecutor {
             .await?;
         self.client
             .write_file(
-                &self.storage.file_path(&control, "exit"),
+                &self.storage.file_path(&control, "process/exit"),
                 Vec::new(),
                 uid,
                 gid,

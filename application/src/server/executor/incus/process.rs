@@ -20,15 +20,15 @@ use tokio_tungstenite::tungstenite::Message;
 // The real image entrypoint remains argv, never interpolated into a host shell.
 // Control files live in a separate Incus volume, outside panel-visible server data.
 pub const SUPERVISOR: &str = concat!(
-    "rm -f /opt/wings-control/exit; exec 3<&0; ",
+    "rm -f /opt/wings-control/process/exit; exec 3<&0; ",
     r#""$@" <&3 3<&- & child=$!; exec 3<&-; "#,
-    r#"printf '%s\n' "$child" > /opt/wings-control/pid; "#,
+    r#"printf '%s\n' "$child" > /opt/wings-control/process/pid; "#,
     r#"trap 'kill -TERM "$child" 2>/dev/null' TERM; "#,
     r#"trap 'kill -INT "$child" 2>/dev/null' INT; "#,
     r#"trap 'kill -QUIT "$child" 2>/dev/null' QUIT; "#,
     r#"while :; do wait "$child"; code=$?; kill -0 "$child" 2>/dev/null || break; done; "#,
-    r#"printf '%s\n' "$code" > /opt/wings-control/exit.tmp; "#,
-    r#"mv /opt/wings-control/exit.tmp /opt/wings-control/exit; exit "$code""#,
+    r#"printf '%s\n' "$code" > /opt/wings-control/process/exit.tmp; "#,
+    r#"mv /opt/wings-control/process/exit.tmp /opt/wings-control/process/exit; exit "$code""#,
 );
 
 pub fn encode_argv(args: &[String]) -> anyhow::Result<String> {
@@ -262,6 +262,10 @@ async fn console_task(
                     }
                 }
             }
+            Err(err) if super::client::is_status(&err, reqwest::StatusCode::NOT_FOUND) => {
+                // Deleted helpers will never acquire another console.
+                return;
+            }
             Err(err) => {
                 tracing::debug!(instance = %name, error = %err, "Incus console not yet available; retrying");
             }
@@ -282,6 +286,8 @@ async fn monitor_task(
     let mut running_announced = false;
     let mut cpu = None::<(u64, std::time::Instant)>;
     loop {
+        // A stopped response requested before start completed is not an exit.
+        let start_acknowledged = started.load(Ordering::SeqCst);
         let state = executor
             .client
             .get::<InstanceState>(&format!("/1.0/instances/{}/state", segment(&name)))
@@ -348,7 +354,6 @@ async fn monitor_task(
                     match state.status.as_str() {
                         "Running" => {
                             running_announced = true;
-                            started.store(true, Ordering::SeqCst);
                             if status.send(ProcessStatus::Running).await.is_err() {
                                 return;
                             }
@@ -358,7 +363,7 @@ async fn monitor_task(
                     }
                     previous = state.status.clone();
                 }
-                if state.status == "Stopped" && started.load(Ordering::SeqCst) {
+                if state.status == "Stopped" && start_acknowledged {
                     // A successful start can finish between polls. Installer consumers require
                     // an acknowledged start before a final stop; do not lose fast jobs.
                     if !running_announced && status.send(ProcessStatus::Running).await.is_err() {
@@ -370,7 +375,7 @@ async fn monitor_task(
                         .read_file(
                             &executor
                                 .storage
-                                .file_path(&Storage::control_name(&name), "exit"),
+                                .file_path(&Storage::control_name(&name), "process/exit"),
                         )
                         .await;
                     let code = exit
@@ -503,7 +508,7 @@ impl ProcessHandle for Handle {
                             &self
                                 .executor
                                 .storage
-                                .file_path(&Storage::control_name(&self.name), "pid"),
+                                .file_path(&Storage::control_name(&self.name), "process/pid"),
                         )
                         .await?;
                     let pid: u32 = std::str::from_utf8(&pid)?.trim().parse()?;
@@ -528,6 +533,85 @@ impl ProcessHandle for Handle {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn stopped_snapshot_before_start_acknowledgement_is_not_an_exit() -> anyhow::Result<()> {
+        use tokio::io::AsyncReadExt;
+        let directory = tempfile::tempdir()?;
+        let socket = directory.path().join("incus.sock");
+        let listener = tokio::net::UnixListener::bind(&socket)?;
+        let started = Arc::new(AtomicBool::new(false));
+        let acknowledged = Arc::clone(&started);
+        let fixture = tokio::spawn(async move {
+            for (index, (expected, body)) in [
+                (
+                    "GET /1.0/instances/wgi%2Dtest/state",
+                    r#"{"type":"sync","metadata":{"status":"Stopped"}}"#,
+                ),
+                (
+                    "GET /1.0/instances/wgi%2Dtest/state",
+                    r#"{"type":"sync","metadata":{"status":"Running"}}"#,
+                ),
+                (
+                    "GET /1.0/instances/wgi%2Dtest/state",
+                    r#"{"type":"sync","metadata":{"status":"Stopped"}}"#,
+                ),
+                (
+                    "GET /1.0/storage-pools/wings/volumes/custom/wgc%2Dwgi%2Dtest/files",
+                    "7\n",
+                ),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let (mut stream, _) = listener.accept().await?;
+                let mut request = Vec::new();
+                let mut buffer = [0; 1024];
+                while !request.windows(4).any(|part| part == b"\r\n\r\n") {
+                    let count = stream.read(&mut buffer).await?;
+                    ensure!(count > 0, "request closed before headers");
+                    request.extend_from_slice(&buffer[..count]);
+                }
+                ensure!(
+                    String::from_utf8_lossy(&request).starts_with(expected),
+                    "stale stopped snapshot was treated as an exit"
+                );
+                if index == 0 {
+                    // Complete start while the pre-start GET is still in flight.
+                    acknowledged.store(true, Ordering::SeqCst);
+                }
+                stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await?;
+            }
+            Ok::<_, anyhow::Error>(())
+        });
+        let mut executor = IncusExecutor::new(Arc::new(crate::config::Config::mock()))?;
+        executor.client = super::super::client::Client::new(&crate::config::IncusRuntime {
+            socket: socket.display().to_string(),
+            ..Default::default()
+        })?;
+        let (status, mut events) = mpsc::channel(8);
+        let monitor = tokio::spawn(monitor_task(
+            executor,
+            "wgi-test".into(),
+            started,
+            status,
+            Weak::new(),
+            false,
+        ));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            assert!(matches!(events.recv().await, Some(ProcessStatus::Running)));
+            assert!(matches!(
+                events.recv().await,
+                Some(ProcessStatus::Stopped { exit_code: 7, .. })
+            ));
+            fixture.await??;
+            monitor.await?;
+            Ok::<_, anyhow::Error>(())
+        })
+        .await??;
+        Ok(())
+    }
+
     #[test]
     fn console_enter_normalizes_lf_and_crlf_without_changing_control_bytes() {
         assert_eq!(console_input(b"stop\n"), b"stop\r");
@@ -538,7 +622,7 @@ mod tests {
     async fn supervisor_preserves_stdin_and_records_fast_exit() -> anyhow::Result<()> {
         let directory = tempfile::tempdir()?;
         let script = SUPERVISOR.replace(
-            "/opt/wings-control",
+            "/opt/wings-control/process",
             &directory.path().display().to_string(),
         );
         let mut child = tokio::process::Command::new("/bin/sh")
