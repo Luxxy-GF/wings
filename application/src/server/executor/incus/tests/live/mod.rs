@@ -1,282 +1,36 @@
 use super::*;
 
-#[test]
-fn stopped_state_accepts_null_statistics_without_hiding_invalid_data() -> anyhow::Result<()> {
-    let state: InstanceState = serde_json::from_value(json!({
-        "status": "Stopped", "pid": 0, "cpu": null, "memory": null, "network": null
-    }))?;
-    assert!(state.cpu.is_empty() && state.memory.is_empty() && state.network.is_empty());
-    assert!(
-        serde_json::from_value::<InstanceState>(json!({
-            "status": "Running", "cpu": {"usage": "invalid"}
-        }))
-        .is_err()
-    );
-    Ok(())
-}
+mod backup;
+mod recovery;
 
-#[test]
-fn requires_lts_and_capabilities() -> anyhow::Result<()> {
-    let extensions = [
-        "instance_oci",
-        "instance_oci_entrypoint",
-        "oci_network_config",
-        "network_forward",
-        "proxy_nat",
-        "file_storage_volume",
-    ]
-    .map(str::to_owned);
-    verify_version("7.0.1", &extensions)?;
-    verify_version("7.0.2-distro1", &extensions)?;
-    assert!(verify_version("7.0", &extensions).is_err());
-    assert!(verify_version("7.0.0", &extensions).is_err());
-    assert!(verify_version("7.1", &extensions).is_err());
-    assert!(verify_version("6.0.5", &extensions).is_err());
-    assert!(verify_version("7.0.1", &[]).is_err());
-    Ok(())
-}
-
-#[tokio::test]
-async fn unix_transport_waits_for_async_operation_and_scopes_project() -> anyhow::Result<()> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let dir = tempfile::tempdir()?;
-    let socket = dir.path().join("incus.sock");
-    let listener = tokio::net::UnixListener::bind(&socket)?;
-    let server = tokio::spawn(async move {
-        for (expected, response) in [
-            (
-                "POST /1.0/instances?project=wings",
-                json!({"type": "async", "operation": "/1.0/operations/job", "metadata": {}}),
-            ),
-            (
-                "GET /1.0/operations/job/wait?project=wings&timeout=120",
-                json!({"type": "sync", "metadata": {"status_code": 200, "metadata": {"result": "done"}}}),
-            ),
-        ] {
-            let (mut stream, _) = listener.accept().await?;
-            let mut request = Vec::new();
-            let mut buffer = [0; 1024];
-            loop {
-                let size = stream.read(&mut buffer).await?;
-                if size == 0 {
-                    break;
-                }
-                request.extend_from_slice(buffer.get(..size).unwrap_or_default());
-                if request.windows(4).any(|w| w == b"\r\n\r\n") {
-                    break;
-                }
-            }
-            ensure!(
-                String::from_utf8_lossy(&request).starts_with(expected),
-                "unexpected Incus request"
-            );
-            let body = serde_json::to_vec(&response)?;
-            stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).as_bytes()).await?;
-            stream.write_all(&body).await?;
-        }
-        Ok::<_, anyhow::Error>(())
-    });
-    let config = crate::config::IncusRuntime {
-        socket: socket.display().to_string(),
-        ..Default::default()
-    };
-    let client = Client::new(&config)?;
-    let result = client
-        .mutate(Method::POST, "/1.0/instances", json!({"name": "test"}))
-        .await?;
-    assert_eq!(
-        result.pointer("/metadata/result").and_then(Value::as_str),
-        Some("done")
-    );
-    server.await??;
-    Ok(())
-}
-
-#[test]
-fn docker_remains_default() -> anyhow::Result<()> {
-    let config: crate::config::InnerConfig = serde_norway::from_str("{}")?;
-    assert_eq!(
-        config.runtime.backend,
-        crate::config::RuntimeBackend::Docker
-    );
-    let config: crate::config::InnerConfig =
-        serde_norway::from_str("runtime:\n  backend: incus\n  incus:\n    project: test-node\n")?;
-    assert_eq!(config.runtime.incus.project, "test-node");
-    Ok(())
-}
-
-#[tokio::test]
-async fn cpu_and_io_limits_use_hard_incus_limits() -> anyhow::Result<()> {
-    let config = Arc::new(crate::config::Config::mock());
-    let executor = IncusExecutor::new(config)?;
-    let mut server = ServerConfiguration::mock(uuid::Uuid::new_v4());
-    server.build.cpu_limit = 250;
-    server.build.memory_limit = 512;
-    server.build.overhead_memory = 64;
-    server.build.swap = 0;
-    let resources = executor.resources(&server, false)?;
-    assert_eq!(
-        resources.get("limits.cpu.allowance").map(String::as_str),
-        Some("250ms/100ms")
-    );
-    assert_eq!(
-        resources.get("limits.memory").map(String::as_str),
-        Some("576MiB")
-    );
-    assert_eq!(
-        resources.get("limits.memory.swap").map(String::as_str),
-        Some("false")
-    );
-    assert_eq!(
-        resources.get("limits.disk.priority").map(String::as_str),
-        Some("5")
-    );
-    server.build.memory_limit = 0;
-    server.build.overhead_memory = 64;
-    server.build.cpu_limit = 0;
-    let resources = executor.resources(&server, false)?;
-    assert!(!resources.contains_key("limits.memory"));
-    assert!(!resources.contains_key("limits.cpu.allowance"));
-    Ok(())
-}
-
-#[tokio::test]
-async fn entrypoint_override_retains_image_command_arguments() -> anyhow::Result<()> {
-    let executor = IncusExecutor::new(Arc::new(crate::config::Config::mock()))?;
-    let mut server = ServerConfiguration::mock(uuid::Uuid::new_v4());
-    server.entrypoint = Some(vec!["/replacement".into(), "arg with space".into()]);
-    let image = image::Image {
-        uid: 1000,
-        gid: 1000,
-        fingerprint: "test".into(),
-        digest: "test".into(),
-        args: vec!["/original".into(), "--flag".into()],
-        cmd: vec!["--flag".into()],
-        environment: BTreeMap::from([
-            ("PATH".into(), "/image/bin".into()),
-            ("JAVA_HOME".into(), "/image/java".into()),
-        ]),
-    };
-    let process = executor.process_config(&server, &image, false, None)?;
-    assert!(process.get("user.wings.launch").is_some_and(|value| {
-        value
-            .trim_end()
-            .ends_with("'/replacement' 'arg with space' '--flag'")
-    }));
-    assert_eq!(
-        process.get("environment.JAVA_HOME").map(String::as_str),
-        Some("/image/java")
-    );
-    assert_eq!(process.get("oci.uid").map(String::as_str), Some("1000"));
-    assert_eq!(process.get("oci.gid").map(String::as_str), Some("1000"));
-    let installer = executor.process_config(
-        &server,
-        &image,
-        true,
-        Some(vec!["/bin/sh".into(), "/mnt/install.sh".into()]),
-    )?;
-    assert!(
-        installer
-            .get("user.wings.launch")
-            .is_some_and(|value| value.trim_end().ends_with("'/bin/sh' '/mnt/install.sh'"))
-    );
-    assert_eq!(installer.get("oci.uid").map(String::as_str), Some("0"));
-    assert_eq!(installer.get("oci.gid").map(String::as_str), Some("0"));
-    Ok(())
-}
-
-#[test]
-fn wildcard_allocations_are_preserved_for_nat_proxies() -> anyhow::Result<()> {
-    let mut server = ServerConfiguration::mock(uuid::Uuid::new_v4());
-    server
-        .allocations
-        .mappings
-        .insert("0.0.0.0".into(), vec![25565]);
-    assert_eq!(
-        network::allocations(&server, &[])?.get(&"0.0.0.0".parse()?),
-        Some(&BTreeSet::from([25565]))
-    );
-    let ip: IpAddr = "192.0.2.10".parse()?;
-    assert_eq!(
-        network::allocations(&server, &[ip])?.get(&"0.0.0.0".parse()?),
-        Some(&BTreeSet::from([25565]))
-    );
-    let spec = firewall_spec(&server, "10.76.0.2".parse()?, &[ip])?;
-    assert!(spec.bindings.iter().all(|binding| binding.ip.is_none()));
-    server
-        .allocations
-        .mappings
-        .insert("192.0.2.20".into(), vec![25566]);
-    assert!(network::allocations(&server, &[ip])?.contains_key(&"192.0.2.20".parse()?));
-    server
-        .allocations
-        .mappings
-        .insert("192.0.2.20".into(), vec![25565]);
-    assert!(network::allocations(&server, &[ip]).is_err());
-    server.allocations.mappings.remove("192.0.2.20");
-    server.allocations.mappings.insert("::".into(), vec![25565]);
-    assert!(network::allocations(&server, &[ip]).is_err());
-    Ok(())
-}
-
-#[tokio::test]
-async fn api_errors_keep_status_for_conditional_retries() -> anyhow::Result<()> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let dir = tempfile::tempdir()?;
-    let socket = dir.path().join("incus.sock");
-    let listener = tokio::net::UnixListener::bind(&socket)?;
-    let server = tokio::spawn(async move {
-        let (mut stream, _) = listener.accept().await?;
-        let mut buffer = [0; 1024];
-        let _ = stream.read(&mut buffer).await?;
-        let body = r#"{"type":"error","error_code":412,"error":"ETag mismatch"}"#;
-        stream.write_all(format!("HTTP/1.1 412 Precondition Failed\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await?;
-        Ok::<_, anyhow::Error>(())
-    });
-    let config = crate::config::IncusRuntime {
-        socket: socket.display().to_string(),
-        ..Default::default()
-    };
-    let client = Client::new(&config)?;
-    let result = client
-        .request(
-            Method::PUT,
-            "/1.0/networks/test/forwards/192.0.2.10",
-            Some(&json!({})),
-            Some("old"),
-            true,
-        )
-        .await;
-    assert!(result.is_err());
-    if let Err(err) = result {
-        assert!(client::is_status(
-            &err,
-            reqwest::StatusCode::PRECONDITION_FAILED
-        ));
-    }
-    server.await??;
-    Ok(())
-}
+use backup::live_backup_and_transfer;
 
 #[tokio::test]
 #[ignore = "requires an explicitly configured disposable Incus 7.0.x node"]
 async fn live_incus_lifecycle_volume_console_and_forwards() -> anyhow::Result<()> {
-    live_incus_lifecycle(true, false).await
+    live_incus_lifecycle(LiveTest::Console).await
 }
 
 #[tokio::test]
 #[ignore = "requires an explicitly configured disposable Incus 7.0.x node"]
 async fn live_incus_allocation_proxies_and_cleanup() -> anyhow::Result<()> {
-    live_incus_lifecycle(false, false).await
+    live_incus_lifecycle(LiveTest::Allocations).await
 }
 
 #[tokio::test]
 #[ignore = "requires an explicitly configured disposable Incus 7.0.x node"]
 async fn live_incus_backup_transfer_and_limits() -> anyhow::Result<()> {
-    live_incus_lifecycle(false, true).await
+    live_incus_lifecycle(LiveTest::Transfer).await
 }
 
-async fn live_incus_lifecycle(test_console: bool, transfer_only: bool) -> anyhow::Result<()> {
+#[derive(Clone, Copy)]
+enum LiveTest {
+    Console,
+    Allocations,
+    Transfer,
+}
+
+async fn live_incus_lifecycle(case: LiveTest) -> anyhow::Result<()> {
     use tokio::io::AsyncReadExt;
     use tracing_subscriber::{Layer, layer::SubscriberExt, util::SubscriberInitExt};
     let _ = tracing_subscriber::registry()
@@ -477,13 +231,13 @@ for line in sys.stdin:
         if !quota.is_empty() {
             server.filesystem.update_disk_limit(8 * 1024 * 1024).await;
         }
-        if transfer_only {
+        if matches!(case, LiveTest::Transfer) {
             executor.prepare_data_mount(&server).await?;
             return live_backup_and_transfer(&server, &executor, &temp, !quota.is_empty()).await;
         }
         let (handle, _status) = executor.setup_server_process(&server).await?;
         eprintln!("Live resources: project={project} instance={}", IncusExecutor::name(server.uuid));
-        eprintln!("PASS OCI import and host-directory instance creation");
+
         handle.start().await?;
         let mut tcp = tokio::time::timeout(Duration::from_secs(20), async {
             loop {
@@ -502,13 +256,13 @@ for line in sys.stdin:
         let mut reply = [0; 6];
         tokio::time::timeout(Duration::from_secs(10), udp.recv_from(&mut reply)).await??;
         ensure!(&reply == b"udp-ok", "UDP forward failed");
-        eprintln!("PASS concrete-address TCP/UDP NAT proxy traffic");
+
         ensure!(std::fs::read_to_string(read_write.join("result"))? == "mount-ok", "writable extra mount failed");
         ensure!(!read_only.join("forbidden").exists(), "read-only extra mount changed");
-        eprintln!("PASS allowlisted read-only/read-write mounts with mapped ownership");
+
         if !quota.is_empty() {
             ensure!(std::fs::read_to_string(server.filesystem.base_path.join("quota-result"))? == "quota-ok", "data quota did not reject an over-limit guest write");
-            eprintln!("PASS {quota} game-data quota enforcement inside Incus");
+
         }
         if let Ok(checkpoint) = std::env::var("INCUS_TEST_REBOOT_CHECKPOINT") {
             let root = executor.config.resolve_as_path(|cfg| &cfg.system.root_directory);
@@ -520,7 +274,7 @@ for line in sys.stdin:
                 "listen": listen, "port": port});
             tokio::fs::write(&checkpoint, serde_json::to_vec(&record)?).await?;
             tokio::fs::set_permissions(&checkpoint, std::os::unix::fs::PermissionsExt::from_mode(0o600)).await?;
-            eprintln!("PASS reboot checkpoint prepared at {checkpoint}");
+
             return Ok(());
         }
         let adapter = tundra_node::IncusAdapter::with_runtime(
@@ -553,7 +307,7 @@ for line in sys.stdin:
         ensure!(&data == b"private-udp", "private UDP frontend unreachable inside Incus");
         ensure!(inside.wait_with_output().await?.status.success(), "private frontend client failed");
         drop((tcp_frontend, udp_frontend, host_tcp, host_udp));
-        eprintln!("PASS Tundra Incus adoption, ownership isolation, and real TCP/UDP namespace frontends");
+
 
         let desired = BTreeMap::from([(listen, BTreeSet::from([port]))]);
         let name = IncusExecutor::name(server.uuid);
@@ -587,7 +341,7 @@ for line in sys.stdin:
         let mut stream = tokio::net::TcpStream::connect(SocketAddr::new(listen, port)).await?;
         stream.read_exact(&mut reply).await?;
         ensure!(&reply == b"tcp-ok", "migration lost running-server TCP publication");
-        eprintln!("PASS migration of running instance and preservation of unrelated forwarding rules");
+
         {
             let mut config = server.configuration.write().await;
             config.allocations.mappings.clear();
@@ -616,7 +370,7 @@ for line in sys.stdin:
         executor.network.sync(server.uuid, "", &BTreeMap::new()).await?;
         ensure!(tokio::net::TcpStream::connect(SocketAddr::new(listen, port)).await.is_err(), "removed proxy still accepts traffic");
         executor.sync_server(&server, &name).await?;
-        eprintln!("PASS wildcard TCP/UDP traffic, client IP preservation, allocation update/removal, and overlap rejection");
+
         drop(handle);
         let before: InstanceState = executor.client.get(&format!("{}/state", IncusExecutor::instance_path(&name))).await?;
         if std::env::var("INCUS_TEST_RESTART_DAEMON").as_deref() == Ok("1") {
@@ -644,8 +398,8 @@ for line in sys.stdin:
         tokio::time::timeout(Duration::from_secs(10), udp.recv_from(&mut reply)).await??;
         ensure!(&reply == b"udp-ok", "UDP publication failed after recovery");
         ensure!(std::fs::read_to_string(server.filesystem.base_path.join("persist"))? == "volume-data", "recovery changed game data");
-        eprintln!("PASS fresh executor/filesystem reattachment, quota mount identity, unchanged PID, and TCP/UDP publication");
-        if test_console {
+
+        if matches!(case, LiveTest::Console) {
             let settle: u64 = std::env::var("INCUS_TEST_CONSOLE_SETTLE_SECONDS")
                 .unwrap_or_else(|_| "0".into()).parse()?;
             ensure!(settle <= 60, "test console settling delay must be at most 60 seconds");
@@ -653,7 +407,7 @@ for line in sys.stdin:
             reattached.stop().await?;
             let exit = tokio::time::timeout(Duration::from_secs(60), async {
                 while let Some(status) = status.recv().await {
-                    if let super::super::ProcessStatus::Stopped { exit_code, .. } = status {
+                    if let crate::server::executor::ProcessStatus::Stopped { exit_code, .. } = status {
                         return Ok::<_, anyhow::Error>(exit_code);
                     }
                 }
@@ -661,11 +415,11 @@ for line in sys.stdin:
             })
             .await??;
             ensure!(exit == 7, "game exit code was not preserved");
-            eprintln!("PASS console reconnect, stdin stop, and exit code 7");
+
         } else {
             reattached.kill().await?;
             let _ = wait_live_exit(&mut status).await?;
-            eprintln!("PASS Incus API stop with proxy devices attached");
+
         }
         drop(reattached);
         age_image_cache(&executor)?;
@@ -689,7 +443,7 @@ for line in sys.stdin:
                 == 1000,
             "container writes were not mapped to the host data account"
         );
-        eprintln!("PASS host data ownership and persistence after instance cleanup");
+
         live_backup_and_transfer(&server, &executor, &temp, !quota.is_empty()).await?;
         std::os::unix::fs::chown(&server.filesystem.base_path, Some(0), Some(0))?;
         let image = server.configuration.read().await.container.image.clone();
@@ -737,13 +491,13 @@ for line in sys.stdin:
         executor.cleanup_owned_helpers(server.uuid).await?;
         age_image_cache(&executor)?;
         ensure!(executor.images.cleanup().await? > 0, "unused owned images were not collected");
-        eprintln!("PASS image cleanup protects stopped instances and removes expired unused owned images");
+
         ensure!(
             tokio::fs::read_to_string(server.filesystem.base_path.join("scripted")).await?
                 == "scripted",
             "script data did not persist"
         );
-        eprintln!("PASS installer status/progress mounts and script-helper fast exit");
+
         Ok::<_, anyhow::Error>(())
     }
     .await;
@@ -825,372 +579,12 @@ fn age_image_cache(executor: &IncusExecutor) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn live_backup_and_transfer(
-    source: &Server,
-    executor: &IncusExecutor,
-    temp: &tempfile::TempDir,
-    quota: bool,
-) -> anyhow::Result<()> {
-    use crate::server::backup::{BackupCreateExt, BackupFindExt, adapters::wings::WingsBackup};
-    use crate::server::filesystem::archive::create::ArchiveProgress;
-    use sha2::Digest;
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
-    use std::sync::atomic::AtomicU64;
-
-    let backups = executor
-        .config
-        .resolve_as_path(|cfg| &cfg.system.backup_directory);
-    tokio::fs::create_dir_all(&backups).await?;
-    let data = source.filesystem.base_path.join("backup-fixture");
-    std::fs::create_dir_all(&data)?;
-    std::fs::write(data.join("payload"), b"backup-and-transfer-data")?;
-    std::fs::set_permissions(data.join("payload"), std::fs::Permissions::from_mode(0o640))?;
-    std::os::unix::fs::symlink("payload", data.join("link"))?;
-    source
-        .filesystem
-        .async_chown_path_recursive("backup-fixture")
-        .await?;
-    let backup_id = uuid::Uuid::new_v4();
-    WingsBackup::create(
-        source,
-        backup_id,
-        ArchiveProgress::default(),
-        Arc::new(AtomicU64::new(0)),
-        crate::server::filesystem::ignore_list::IgnoreList::empty(),
-        "".into(),
-    )
-    .await?;
-    let backup = WingsBackup::find(&source.app_state, backup_id)
-        .await?
-        .context("created backup missing")?;
-    let (_, backup_path) = WingsBackup::get_first_file_name(&executor.config, backup_id).await?;
-
-    let destination_id = uuid::Uuid::new_v4();
-    let mut settings = ServerConfiguration::mock(destination_id);
-    settings.container.image = source.configuration.read().await.container.image.clone();
-    settings.build.disk_space = 8;
-    settings.build.cpu_limit = 100;
-    settings.build.memory_limit = 128;
-    settings.build.overhead_memory = 0;
-    settings.build.swap = 0;
-    settings.entrypoint = Some(vec!["python3".into(), "-c".into(), "import os; assert open('/home/container/backup-fixture/payload').read()=='backup-and-transfer-data'; assert os.readlink('/home/container/backup-fixture/link')=='payload'; open('/home/container/destination-write','w').write('mapped-write-ok'); import time; time.sleep(3600)".into()]);
-    let panel_settings = serde_json::to_value(&settings)?;
-    let process = json!({"startup": {"done": []}, "stop": {"type": "signal", "value": "SIGTERM"}, "configs": []});
-    let panel = axum::Router::new()
-        .route(
-            "/api/remote/servers/{server}",
-            axum::routing::get(
-                move |axum::extract::Path(server): axum::extract::Path<uuid::Uuid>| {
-                    let mut settings = panel_settings.clone();
-                    let process = process.clone();
-                    settings["uuid"] = json!(server);
-                    async move {
-                        axum::Json(json!({"settings": settings, "process_configuration": process}))
-                    }
-                },
-            ),
-        )
-        .fallback(axum::routing::post(|| async {
-            axum::http::StatusCode::NO_CONTENT
-        }));
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-    let panel_address = listener.local_addr()?;
-    let panel_task = tokio::spawn(async move { axum::serve(listener, panel).await });
-    let mut destination = crate::routes::AppState::mock();
-    {
-        let cfg = destination.config.mutate_in_place_for_testing();
-        *cfg = serde_json::from_value(serde_json::to_value(&**executor.config.load())?)?;
-        cfg.system.data_directory = crate::config::SystemPath::new(
-            temp.path().join("destination-data").display().to_string(),
-        );
-        cfg.system.user.uid = 1001;
-        cfg.system.user.gid = 1001;
-        cfg.remote = format!("http://{panel_address}");
-    }
-    tokio::fs::create_dir_all(
-        destination
-            .config
-            .resolve_as_path(|cfg| &cfg.system.data_directory),
-    )
-    .await?;
-    let client = crate::remote::client::Client::new(&destination.config.load(), false);
-    Arc::get_mut(
-        &mut Arc::get_mut(&mut destination)
-            .context("shared destination state")?
-            .config,
-    )
-    .context("shared destination config")?
-    .client = client;
-    let target_executor = IncusExecutor::new(destination.config.clone())?;
-    Arc::get_mut(&mut destination)
-        .context("shared destination state")?
-        .executor = Arc::new(target_executor.clone());
-    let (router, _) = crate::routes::api::transfers::router(&destination).split_for_parts();
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-    let address = listener.local_addr()?;
-    let route_state = destination.clone();
-    let route_task =
-        tokio::spawn(async move { axum::serve(listener, router.with_state(route_state)).await });
-    let now = chrono::Utc::now().timestamp();
-    let token = jsonwebtoken::encode(
-        &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256),
-        &json!({"scope":"transfer", "sub":destination_id, "iss":"panel", "aud":["wings"], "exp":now+300, "iat":now, "jti":uuid::Uuid::new_v4()}),
-        &jsonwebtoken::EncodingKey::from_secret(destination.config.load().token.as_bytes()),
-    )?;
-    let bytes = tokio::fs::read(&backup_path).await?;
-    let checksum = hex::encode(sha2::Sha256::digest(&bytes));
-    let form = reqwest::multipart::Form::new()
-        .part(
-            "archive",
-            reqwest::multipart::Part::bytes(bytes).file_name(
-                backup_path
-                    .file_name()
-                    .context("backup filename")?
-                    .to_string_lossy()
-                    .to_string(),
-            ),
-        )
-        .text("checksum", checksum);
-    let outcome = async {
-        let response = reqwest::Client::builder()
-            .no_proxy()
-            .build()?
-            .post(format!("http://{address}/"))
-            .bearer_auth(token)
-            .multipart(form)
-            .send()
-            .await?;
-        ensure!(
-            response.status().is_success(),
-            "incoming transfer failed: {}",
-            response.text().await?
-        );
-        let target = destination
-            .server_manager
-            .get_server(destination_id)
-            .await
-            .context("incoming transfer did not register destination server")?;
-        target.filesystem.disk_checker.abort();
-        let path = target.filesystem.base_path.join("backup-fixture/payload");
-        ensure!(std::fs::read(&path)? == b"backup-and-transfer-data", "transferred contents changed");
-        let metadata = path.metadata()?;
-        ensure!(metadata.uid() == 1001 && metadata.gid() == 1001, "transfer retained the source host owner");
-        ensure!(metadata.permissions().mode() & 0o777 == 0o640, "transfer changed permissions");
-        ensure!(std::fs::read_link(target.filesystem.base_path.join("backup-fixture/link"))? == std::path::Path::new("payload"), "transfer changed symlink");
-        std::fs::write(&path, "changed-after-transfer")?;
-        backup.restore(&target, ArchiveProgress::default(), Arc::new(AtomicU64::new(0)), None).await?;
-        ensure!(std::fs::read(&path)? == b"backup-and-transfer-data", "backup restore did not restore contents");
-        ensure!(path.metadata()?.uid() == 1001, "backup restore retained source ownership");
-        target.filesystem.async_chown_path_recursive(&target.filesystem.base_path).await?;
-        let (handle, mut status) = target_executor.setup_server_process(&target).await?;
-        handle.start().await?;
-        tokio::time::timeout(Duration::from_secs(30), async {
-            loop {
-                if target.filesystem.base_path.join("destination-write").is_file() { break; }
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
-        }).await.context("restored-data verifier did not write its completion marker")?;
-        handle.kill().await?;
-        wait_live_exit(&mut status).await?;
-        ensure!(std::fs::read_to_string(target.filesystem.base_path.join("destination-write"))? == "mapped-write-ok", "destination mapped user could not write");
-        target_executor.cleanup_server_process(&target).await?;
-        eprintln!("PASS local backup restore and checksummed node HTTP transfer preserve files, mode, symlink, destination UID/GID, and Incus access");
-        if quota {
-            let oversized_id = uuid::Uuid::new_v4();
-            let mut archive = tar::Builder::new(Vec::new());
-            let payload = vec![0u8; 16 * 1024 * 1024];
-            let mut header = tar::Header::new_gnu(); header.set_size(payload.len() as u64); header.set_mode(0o640); header.set_cksum();
-            archive.append_data(&mut header, "over-limit", payload.as_slice())?;
-            let bytes = archive.into_inner()?;
-            let checksum = hex::encode(sha2::Sha256::digest(&bytes));
-            let token = jsonwebtoken::encode(&jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256),
-                &json!({"scope":"transfer", "sub":oversized_id, "iss":"panel", "aud":["wings"], "exp":now+300, "iat":now, "jti":uuid::Uuid::new_v4()}),
-                &jsonwebtoken::EncodingKey::from_secret(destination.config.load().token.as_bytes()))?;
-            let form = reqwest::multipart::Form::new().part("archive", reqwest::multipart::Part::bytes(bytes).file_name("archive.tar")).text("checksum", checksum);
-            let response = reqwest::Client::builder().no_proxy().build()?.post(format!("http://{address}/")).bearer_auth(token).multipart(form).send().await?;
-            ensure!(response.status() == reqwest::StatusCode::EXPECTATION_FAILED, "oversized node transfer was accepted: {}", response.status());
-            eprintln!("PASS actual node transfer HTTP receiver rejects over-limit data");
-        }
-        Ok::<_, anyhow::Error>(())
-    }.await;
-    route_task.abort();
-    panel_task.abort();
-    for server in destination.server_manager.get_servers().await.iter() {
-        if outcome.is_err() {
-            if let Ok(buffer) = target_executor
-                .client
-                .console_buffer(&IncusExecutor::name(server.uuid))
-                .await
-            {
-                eprintln!(
-                    "Destination guest console: {}",
-                    String::from_utf8_lossy(&buffer)
-                );
-            }
-        }
-        let _ = target_executor.cleanup_server_process(server).await;
-        server.filesystem.disk_checker.abort();
-        if !server.filesystem.is_uninitialized() {
-            server.filesystem.get_disk_limiter().destroy().await?;
-        }
-        server.filesystem.close();
-    }
-    outcome
-}
-
-#[tokio::test]
-#[ignore = "requires a checkpoint from the disposable live test and a real VM reboot"]
-async fn live_incus_node_reboot_recovery() -> anyhow::Result<()> {
-    use tokio::io::AsyncReadExt;
-    let checkpoint =
-        std::env::var("INCUS_TEST_REBOOT_RESUME").context("set INCUS_TEST_REBOOT_RESUME")?;
-    let record: Value = serde_json::from_slice(&tokio::fs::read(&checkpoint).await?)?;
-    ensure!(
-        record["boot_id"].as_str()
-            != Some(&std::fs::read_to_string("/proc/sys/kernel/random/boot_id")?),
-        "the node was not rebooted"
-    );
-    let mut state = crate::routes::AppState::mock();
-    *state.config.mutate_in_place_for_testing() = serde_json::from_value(record["config"].clone())?;
-    let panel_settings = record["settings"].clone();
-    let panel = axum::Router::new().route("/api/remote/servers/{server}", axum::routing::get(move || {
-        let settings = panel_settings.clone();
-        async move { axum::Json(json!({"settings": settings, "process_configuration": {"startup": {"done": ["READY"]}, "stop": {"type": "command", "value": "stop"}, "configs": []}})) }
-    }));
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-    state.config.mutate_in_place_for_testing().remote =
-        format!("http://{}", listener.local_addr()?);
-    let panel_task = tokio::spawn(async move { axum::serve(listener, panel).await });
-    let client = crate::remote::client::Client::new(&state.config.load(), false);
-    Arc::get_mut(
-        &mut Arc::get_mut(&mut state)
-            .context("shared reboot state")?
-            .config,
-    )
-    .context("shared reboot config")?
-    .client = client;
-    let executor = IncusExecutor::new(state.config.clone())?;
-    ensure!(
-        state
-            .config
-            .load()
-            .runtime
-            .incus
-            .project
-            .starts_with("wings-test-"),
-        "not a disposable test project"
-    );
-    Arc::get_mut(&mut state)
-        .context("shared recovery fixture")?
-        .executor = Arc::new(executor.clone());
-    executor.boot().await?;
-    let settings: ServerConfiguration = serde_json::from_value(record["settings"].clone())?;
-    let uuid = settings.uuid;
-    let name = IncusExecutor::name(uuid);
-    ensure!(
-        executor.instance(&name).await?.status == "Stopped",
-        "Incus autostarted the fixture instead of Wings"
-    );
-    state.server_manager.boot(&state, vec![crate::remote::servers::RawServer {
-        settings,
-        process_configuration: serde_json::from_value(json!({"startup": {"done": ["READY"]}, "stop": {"type": "command", "value": "stop"}, "configs": []}))?,
-    }]).await;
-    let server = state
-        .server_manager
-        .get_server(uuid)
-        .await
-        .context("reboot server was not recovered")?;
-    let address = SocketAddr::new(
-        record["listen"]
-            .as_str()
-            .context("checkpoint listen address")?
-            .parse()?,
-        record["port"]
-            .as_u64()
-            .context("checkpoint port")?
-            .try_into()?,
-    );
-    let outcome = async {
-        let mut stream = tokio::time::timeout(Duration::from_secs(120), async {
-            loop {
-                if let Ok(stream) = tokio::net::TcpStream::connect(address).await { return stream }
-                tokio::time::sleep(Duration::from_millis(250)).await;
-            }
-        }).await.context("Wings did not restart the saved running server")?;
-        let mut reply = [0;6]; stream.read_exact(&mut reply).await?;
-        ensure!(&reply == b"tcp-ok", "TCP allocation failed after node reboot");
-        let udp = tokio::net::UdpSocket::bind("0.0.0.0:0").await?;
-        udp.send_to(b"reboot", address).await?;
-        tokio::time::timeout(Duration::from_secs(10), udp.recv_from(&mut reply)).await??;
-        ensure!(&reply == b"udp-ok", "UDP allocation failed after node reboot");
-        let (handle, mut status) = executor.attach_server_process(&server).await?;
-        handle.kill().await?; wait_live_exit(&mut status).await?;
-        ensure!(std::fs::read_to_string(server.filesystem.base_path.join("persist"))? == "volume-data", "node reboot lost game data");
-        eprintln!("PASS real node reboot: saved-state autostart, persistent files, rebuilt quota mount, and TCP/UDP allocations");
-        Ok::<_, anyhow::Error>(())
-    }.await;
-    server.filesystem.disk_checker.abort();
-    panel_task.abort();
-    executor.cleanup_server_process(&server).await?;
-    server.filesystem.get_disk_limiter().destroy().await?;
-    server.filesystem.close();
-    let images: Vec<Value> = executor.client.get("/1.0/images?recursion=1").await?;
-    for image in images {
-        executor
-            .client
-            .mutate(
-                Method::DELETE,
-                &format!(
-                    "/1.0/images/{}",
-                    segment(
-                        image["fingerprint"]
-                            .as_str()
-                            .context("test image fingerprint")?
-                    )
-                ),
-                json!({}),
-            )
-            .await?;
-    }
-    let mut global = executor.client.clone();
-    global.project = "default".into();
-    global
-        .mutate(
-            Method::DELETE,
-            &format!(
-                "/1.0/networks/{}",
-                segment(&state.config.load().runtime.incus.network)
-            ),
-            json!({}),
-        )
-        .await?;
-    executor
-        .client
-        .request(
-            Method::DELETE,
-            &format!(
-                "/1.0/projects/{}",
-                segment(&state.config.load().runtime.incus.project)
-            ),
-            None,
-            None,
-            false,
-        )
-        .await?;
-    tokio::fs::remove_dir_all(
-        executor
-            .config
-            .resolve_as_path(|cfg| &cfg.system.root_directory),
-    )
-    .await?;
-    tokio::fs::remove_file(checkpoint).await?;
-    outcome
-}
-
-async fn wait_live_exit(status: &mut super::super::StatusReceiver) -> anyhow::Result<i32> {
+async fn wait_live_exit(
+    status: &mut crate::server::executor::StatusReceiver,
+) -> anyhow::Result<i32> {
     tokio::time::timeout(Duration::from_secs(30), async {
         while let Some(status) = status.recv().await {
-            if let super::super::ProcessStatus::Stopped { exit_code, .. } = status {
+            if let crate::server::executor::ProcessStatus::Stopped { exit_code, .. } = status {
                 return Ok(exit_code);
             }
         }
