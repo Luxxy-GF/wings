@@ -1,0 +1,64 @@
+[workspace]
+resolver = "3"
+members = ["tundra-common", "tundra-node"]
+default-members = ["tundra-node"]
+package.rust-version = "1.97.0"
+package.license = "MIT"
+package.version = "1.0.1"
+package.edition = "2024"
+
+[workspace.dependencies]
+serde = { version = "1.0.138", features = ["derive"] }
+serde_json = { version = "1.0.139", features = ["preserve_order"] }
+reqwest = { version = "0.13.0", features = ["hickory-dns", "json"] }
+tokio = { version = "1.43.0", features = ["net", "signal"] }
+uuid = { version = "1.16.0", features = ["serde", "v4"] }
+rustls = { version = "0.23.27", features = ["aws-lc-rs"] }
+bytes = "1"
+sha2 = "0.11.0"
+hex = "0.4.3"
+compact_str = { version = "0.10.0", features = ["serde"] }
+futures = "0.3.31"
+tracing = { version = "0.1.41", features = ["max_level_debug"] }
+tracing-subscriber = { version = "0.3.19", features = ["chrono", "env-filter"] }
+anyhow = "1.0.98"
+axum = { version = "0.8.1", features = ["http2", "ws"] }
+axum-server = { version = "0.8.0", features = ["tls-rustls"] }
+bollard = "0.21.0"
+rusqlite = { version = "0.40.0", features = ["bundled", "fallible_uint"] }
+rand = "0.10.0"
+base64 = "0.23.0"
+ed25519-dalek = { version = "3.0.0", features = ["rand_core", "pkcs8", "pem"] }
+jsonwebtoken = { version = "11.0.0", features = ["aws_lc_rs"] }
+postcard = { version = "1.1.3", features = ["use-std"] }
+quinn = { version = "0.11.11", default-features = false, features = ["runtime-tokio", "rustls-aws-lc-rs", "log"] }
+rustls-pki-types = "1.15.1"
+rcgen = { version = "0.14.8", features = ["x509-parser"] }
+nix = { version = "0.31.3", features = ["sched", "fs", "resource", "process", "signal"] }
+tokio-tungstenite = { version = "0.30.0", features = ["rustls-tls-webpki-roots", "connect", "handshake"] }
+serde_norway = "0.9.42"
+socket2 = "0.6.5"
+x509-parser = "0.18.1"
+time = "0.3.55"
+tokio-test = "0.4.5"
+parking_lot = "0.12.5"
+
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.dev]
+# only enable when needed, slows down compile times significantly
+debug = false
+
+[profile.release.package."*"]
+opt-level = "s"
+codegen-units = 1
+strip = true
+
+[profile.release]
+opt-level = "s"
+lto = "fat"
+codegen-units = 1
+strip = true
+# too much of a coward to enable
+# panic = "abort"

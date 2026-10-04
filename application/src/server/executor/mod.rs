@@ -42,10 +42,6 @@ pub async fn create_runtime(config: Arc<crate::config::Config>) -> anyhow::Resul
         RuntimeBackend::Incus => {
             #[cfg(target_os = "linux")]
             {
-                anyhow::ensure!(
-                    !config.load().tundra.enabled,
-                    "Incus Tundra daemon provisioning is not yet supported; disable tundra.enabled"
-                );
                 tracing::info!("initializing Incus LXC runtime");
                 Ok(Runtime {
                     executor: Arc::new(incus::IncusExecutor::new(Arc::clone(&config))?),

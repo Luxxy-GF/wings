@@ -2,6 +2,7 @@
 resolver = "3"
 members = ["application", "pbs-client", "unrar-rs"]
 default-members = ["application"]
+exclude = ["vendor/tundra"]
 package.rust-version = "1.99.0"
 
 [workspace.dependencies]

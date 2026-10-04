@@ -546,11 +546,7 @@ async fn main_rt() {
 
     #[cfg(unix)]
     let tundra = if config.load().tundra.enabled {
-        let docker = match docker.as_ref() {
-            Some(docker) => Arc::clone(docker),
-            None => exit_error!("Tundra requires a compatible runtime daemon provider"),
-        };
-        match crate::tundra::TundraManager::create(&config, docker) {
+        match crate::tundra::TundraManager::create(&config, docker.clone()) {
             Ok(tundra) => Some(tundra),
             Err(err) => exit_error!("failed to set up the tundra control plane: {:?}", err),
         }
@@ -1037,6 +1033,19 @@ async fn main_rt() {
 }
 
 fn main() {
+    #[cfg(target_os = "linux")]
+    if std::env::var_os("WINGS_TUNDRA_CHILD").is_some() {
+        let result = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("failed to build Tundra runtime")
+            .block_on(tundra_node::run());
+        if let Err(err) = result {
+            eprintln!("Tundra stopped: {err:#}");
+            std::process::exit(1);
+        }
+        return;
+    }
     let thread_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
     tokio::runtime::Builder::new_multi_thread()

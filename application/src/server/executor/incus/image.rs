@@ -42,11 +42,63 @@ async fn tail(
     Ok(output)
 }
 
-struct ProcessGroup(Option<rustix::process::Pid>);
-impl Drop for ProcessGroup {
-    fn drop(&mut self) {
-        if let Some(pid) = self.0 {
-            let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
+fn report_progress(server: &crate::server::Server, installation: bool, message: &str) {
+    if installation {
+        server.log_daemon_install(format!("[Incus image] {message}").into());
+    } else {
+        server.log_daemon_with_prelude(&format!("[Incus image] {message}"));
+    }
+}
+
+/// Incus CLI progress consists of carriage-return updates rather than lines.
+/// Bound each update, drain all output, and never forward terminal control bytes.
+async fn read_stdout(
+    mut stream: impl tokio::io::AsyncRead + Unpin,
+    progress: Option<(&crate::server::Server, bool)>,
+) -> std::io::Result<Vec<u8>> {
+    let Some((server, installation)) = progress else {
+        return tail(stream, false).await;
+    };
+    let mut line = Vec::new();
+    let mut previous = String::new();
+    let mut last = tokio::time::Instant::now() - Duration::from_secs(1);
+    let mut buffer = [0; 8192];
+    let started = tokio::time::Instant::now();
+    let mut heartbeat = tokio::time::interval(Duration::from_secs(15));
+    heartbeat.tick().await;
+    loop {
+        let count = tokio::select! {
+            count = stream.read(&mut buffer) => count?,
+            _ = heartbeat.tick() => {
+                if last.elapsed() >= Duration::from_secs(15) {
+                    report_progress(server, installation,
+                        &format!("Image operation still running ({} seconds elapsed)...", started.elapsed().as_secs()));
+                }
+                continue;
+            }
+        };
+        for byte in buffer.get(..count).unwrap_or_default() {
+            if *byte == b'\r' || *byte == b'\n' {
+                let message = String::from_utf8_lossy(&line).trim().to_string();
+                if !message.is_empty()
+                    && message != previous
+                    && last.elapsed() >= Duration::from_secs(1)
+                {
+                    report_progress(server, installation, &message);
+                    previous = message;
+                    last = tokio::time::Instant::now();
+                }
+                line.clear();
+            } else if !byte.is_ascii_control() && line.len() < 4096 {
+                line.push(*byte);
+            }
+        }
+        if count == 0 {
+            let message = String::from_utf8_lossy(&line).trim().to_string();
+            if !message.is_empty() && message != previous {
+                report_progress(server, installation, &message);
+            }
+            return Ok(Vec::new());
         }
     }
 }
@@ -56,6 +108,25 @@ pub async fn run(
     args: &[String],
     timeout: Duration,
     env: Option<&BTreeMap<String, String>>,
+) -> anyhow::Result<Vec<u8>> {
+    run_with_progress(executable, args, timeout, env, None).await
+}
+
+struct ProcessGroup(Option<rustix::process::Pid>);
+impl Drop for ProcessGroup {
+    fn drop(&mut self) {
+        if let Some(pid) = self.0 {
+            let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
+        }
+    }
+}
+
+async fn run_with_progress(
+    executable: &str,
+    args: &[String],
+    timeout: Duration,
+    env: Option<&BTreeMap<String, String>>,
+    progress: Option<(&crate::server::Server, bool)>,
 ) -> anyhow::Result<Vec<u8>> {
     let mut command = tokio::process::Command::new(executable);
     command
@@ -79,7 +150,11 @@ pub async fn run(
     let stdout = child.stdout.take().context("subprocess stdout missing")?;
     let stderr = child.stderr.take().context("subprocess stderr missing")?;
     let result = tokio::time::timeout(timeout, async {
-        tokio::try_join!(child.wait(), tail(stdout, false), tail(stderr, true))
+        tokio::try_join!(
+            child.wait(),
+            read_stdout(stdout, progress),
+            tail(stderr, true)
+        )
     })
     .await;
     let (status, stdout, stderr) = match result {
@@ -183,7 +258,17 @@ impl Images {
         tokio::fs::create_dir_all(self.root()).await?;
         Ok(())
     }
-    pub async fn ensure(&self, source: &str) -> anyhow::Result<Image> {
+    pub async fn ensure(
+        &self,
+        source: &str,
+        server: &crate::server::Server,
+        installation: bool,
+    ) -> anyhow::Result<Image> {
+        report_progress(
+            server,
+            installation,
+            "Checking OCI image manifest and local cache...",
+        );
         let cfg = self.config.load().runtime.incus.clone();
         let reference = source.trim_end_matches('~').to_string();
         let key = format!("pull:{reference}");
@@ -264,6 +349,7 @@ impl Images {
                 .await?
                 .is_some()
         {
+            report_progress(server, installation, "Using cached Incus image.");
             return Ok(image);
         }
         let spec: Value = serde_json::from_slice(
@@ -317,10 +403,14 @@ impl Images {
         // fingerprint with its alias, then fails to find it in the OCI cache.
         // Export/import retains the official conversion path without that bug.
         let archive = directory.path().join("image.tar.gz");
-        run(
+        report_progress(
+            server,
+            installation,
+            "Pulling and converting OCI image with Incus...",
+        );
+        run_with_progress(
             &cfg.incus_path,
             &[
-                "--quiet".into(),
                 "image".into(),
                 "export".into(),
                 format!("oci:{base}@{digest}"),
@@ -328,6 +418,7 @@ impl Images {
             ],
             timeout,
             Some(&env),
+            Some((server, installation)),
         )
         .await?;
         // Incus uses this converted OCI spec at start; it does not populate
@@ -335,10 +426,14 @@ impl Images {
         let user_archive = archive.clone();
         let (uid, gid) =
             tokio::task::spawn_blocking(move || converted_user(&user_archive)).await??;
-        run(
+        report_progress(
+            server,
+            installation,
+            "Importing converted image into Incus...",
+        );
+        run_with_progress(
             &cfg.incus_path,
             &[
-                "--quiet".into(),
                 "image".into(),
                 "import".into(),
                 archive.display().to_string(),
@@ -351,6 +446,7 @@ impl Images {
             ],
             timeout,
             Some(&env),
+            Some((server, installation)),
         )
         .await?;
         let alias: Value = self
@@ -374,6 +470,7 @@ impl Images {
         let temporary = path.with_extension(format!("{}.tmp", uuid::Uuid::new_v4()));
         tokio::fs::write(&temporary, serde_json::to_vec(&image)?).await?;
         tokio::fs::rename(temporary, path).await?;
+        report_progress(server, installation, "Incus image is ready.");
         Ok(image)
     }
 }
@@ -408,6 +505,51 @@ pub fn parse_reference(value: &str) -> anyhow::Result<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn cli_progress_is_bounded_and_reaches_the_install_console() -> anyhow::Result<()> {
+        use tokio::io::AsyncWriteExt;
+        let server =
+            crate::server::Server::mock(uuid::Uuid::new_v4(), crate::routes::AppState::mock());
+        server.filesystem.disk_checker.abort();
+        let mut messages = server.websocket.subscribe();
+        let (mut writer, reader) = tokio::io::duplex(1024);
+        let producer = async {
+            writer.write_all(b"\rDownloading OCI image\r").await?;
+            // Progress output may exceed the JSON command's 64 KiB capture limit.
+            writer.write_all(&vec![b'x'; 128 * 1024]).await?;
+            writer.write_all(b"\r\x00Image import done").await?;
+            writer.shutdown().await
+        };
+        let (_, output) = tokio::try_join!(producer, read_stdout(reader, Some((&server, true))))?;
+        assert!(output.is_empty());
+        let first = messages.try_recv()?;
+        let last = messages.try_recv()?;
+        assert!(matches!(
+            first.event,
+            crate::server::websocket::WebsocketEvent::ServerInstallOutput
+        ));
+        assert!(
+            first
+                .args
+                .iter()
+                .any(|arg| arg.contains("Downloading OCI image"))
+        );
+        assert!(
+            last.args
+                .iter()
+                .any(|arg| arg.contains("Image import done"))
+        );
+        assert!(
+            first
+                .args
+                .iter()
+                .chain(last.args.iter())
+                .all(|arg| arg.len() < 4200 && !arg.contains('\0'))
+        );
+        Ok(())
+    }
+
     #[test]
     fn reads_converted_user_and_rejects_invalid_numeric_ids() -> anyhow::Result<()> {
         for (config, expected) in [

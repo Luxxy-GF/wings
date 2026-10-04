@@ -53,8 +53,6 @@ impl Instance {
 #[derive(Clone, Debug, Deserialize)]
 pub struct InstanceState {
     pub status: String,
-    #[serde(default)]
-    pub pid: i64,
     #[serde(default, deserialize_with = "crate::deserialize::deserialize_nullable")]
     pub cpu: BTreeMap<String, u64>,
     #[serde(default, deserialize_with = "crate::deserialize::deserialize_nullable")]
@@ -398,7 +396,7 @@ impl IncusExecutor {
                     .unwrap_or_else(|| value.to_string()),
             );
         }
-        let data_source = server.filesystem.get_base_fs_mount_path().await;
+        let data_source = self.prepare_data_mount(server).await?;
         ensure!(
             data_source.is_absolute() && data_source.is_dir(),
             "Wings server directory must be initialized before creating an Incus instance"
@@ -424,10 +422,20 @@ impl IncusExecutor {
                     source.is_absolute() && source.exists(),
                     "Incus mount source is missing"
                 );
+                let target = if mount.target == "/etc/hosts" {
+                    // Incus 7.0 overlays /etc/hosts after disk devices. Stage the
+                    // file through Incus, then bind it last relative to the rootfs.
+                    // This also works with private host parent directories.
+                    config.insert("raw.lxc".into(),
+                        "lxc.mount.entry = opt/wings-private-hosts etc/hosts none bind,ro,relative,create=file 0 0\n".into());
+                    "/opt/wings-private-hosts"
+                } else {
+                    mount.target.as_str()
+                };
                 let device = serde_json::Map::from_iter([
                     ("type".into(), "disk".into()),
                     ("source".into(), mount.source.to_string().into()),
-                    ("path".into(), mount.target.to_string().into()),
+                    ("path".into(), target.to_string().into()),
                     ("readonly".into(), mount.read_only.to_string().into()),
                 ]);
                 devices
@@ -503,6 +511,53 @@ impl IncusExecutor {
             self.sync_server(server, name).await?;
         }
         Ok(())
+    }
+
+    async fn prepare_data_mount(&self, server: &Server) -> anyhow::Result<PathBuf> {
+        use crate::server::filesystem::limiter::DiskLimiterMode;
+        ensure!(
+            !server.filesystem.is_uninitialized(),
+            "Wings server filesystem is not initialized"
+        );
+        let mode = self.config.load().system.disk_limiter_mode;
+        let limiter = server.filesystem.get_disk_limiter();
+        limiter
+            .attach()
+            .await
+            .context("attaching the server disk limiter")?;
+        // Installation and script helpers need the same data quota as game processes.
+        limiter
+            .startup()
+            .await
+            .context("starting the server disk limiter")?;
+        let source = server.filesystem.get_base_fs_mount_path().await;
+        if mode == DiskLimiterMode::FuseQuota {
+            let fuse = crate::server::filesystem::limiter::fuse_quota::FuseQuotaLimiter {
+                filesystem: &server.filesystem,
+            };
+            tokio::time::timeout(
+                Duration::from_secs(self.config.load().runtime.incus.operation_timeout_seconds),
+                async {
+                    loop {
+                        // Do not bind the empty directory beneath a FUSE mount while
+                        // its daemon starts: that would bypass the game-data quota.
+                        let mounted = rustix::fs::statfs(&source)
+                            .is_ok_and(|stat| stat.f_type == 0x6573_5546);
+                        if mounted && fuse.is_socket_functional().await {
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                },
+            )
+            .await
+            .context("waiting for the quota filesystem to mount")?;
+        }
+        limiter
+            .update_disk_limit(server.filesystem.disk_limit() as u64)
+            .await
+            .context("applying the server data quota")?;
+        Ok(source)
     }
     async fn sync_server(
         &self,
@@ -622,7 +677,18 @@ impl IncusExecutor {
         script: &crate::server::installation::InstallationScript,
         installation: bool,
     ) -> anyhow::Result<(Arc<dyn ProcessHandle>, StatusReceiver)> {
-        let image = self.images.ensure(&script.container_image).await?;
+        // OCI root is mapped to the configured Wings account, not host root.
+        // Repair server-owned data before a helper tries to write /mnt/server.
+        server.log_daemon_install("[Incus] Preparing server data permissions...".into());
+        server
+            .filesystem
+            .async_chown_path_recursive(&server.filesystem.base_path)
+            .await
+            .context("preparing Incus helper data permissions")?;
+        let image = self
+            .images
+            .ensure(&script.container_image, server, installation)
+            .await?;
         let name = if installation {
             format!("wgi-{}", server.uuid)
         } else {
@@ -876,7 +942,7 @@ impl ServerExecutor for IncusExecutor {
             .container
             .image
             .to_string();
-        let image = self.images.ensure(&source).await?;
+        let image = self.images.ensure(&source, server, false).await?;
         let name = Self::name(server.uuid);
         self.create(server, &name, &image, None, false, &HashMap::new())
             .await?;
@@ -950,37 +1016,16 @@ impl ServerExecutor for IncusExecutor {
             port,
         )))
     }
-    async fn resolve_published_address(&self, server: &Server) -> Option<IpAddr> {
-        let cfg = server.configuration.read().await;
-        let address: IpAddr = cfg.allocations.default.as_ref()?.ip.parse().ok()?;
-        if address.is_unspecified() {
-            self.config
-                .load()
-                .runtime
-                .incus
-                .listen_addresses
-                .iter()
-                .copied()
-                .find(|candidate| candidate.is_ipv4() == address.is_ipv4())
-        } else {
-            Some(address)
-        }
+    async fn resolve_published_address(&self, _server: &Server) -> Option<IpAddr> {
+        // Tundra dials the inspected private IP from the host, like Docker bridge mode.
+        None
     }
     async fn container_refs(&self, servers: &[Server]) -> HashMap<uuid::Uuid, String> {
-        let mut result = HashMap::new();
-        for server in servers {
-            let name = Self::name(server.uuid);
-            if self.instance(&name).await.is_ok()
-                && let Ok(state) = self
-                    .client
-                    .get::<InstanceState>(&format!("{}/state", Self::instance_path(&name)))
-                    .await
-                && state.pid > 0
-            {
-                result.insert(server.uuid, format!("pid:{}", state.pid));
-            }
-        }
-        result
+        // Stable instance names allow Tundra to refresh the PID after recreation.
+        servers
+            .iter()
+            .map(|server| (server.uuid, Self::name(server.uuid)))
+            .collect()
     }
     async fn used_ports(&self, ips: &[IpAddr]) -> anyhow::Result<HashMap<IpAddr, Vec<UsedPort>>> {
         self.network.used_ports(ips).await
