@@ -1,6 +1,7 @@
 use super::super::{ProcessHandle, ProcessStatus, StatusReceiver};
 use super::{IncusExecutor, InstanceState, client::segment, storage::Storage};
 use anyhow::{Context, ensure};
+use base64::Engine;
 use futures::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use std::{
@@ -72,7 +73,8 @@ pub(super) struct Handle {
     executor: IncusExecutor,
     server: Weak<crate::server::InnerServer>,
     started: Arc<AtomicBool>,
-    stdin: mpsc::Sender<Vec<u8>>,
+    stdin: mpsc::Sender<ConsoleInput>,
+    terminal: Option<broadcast::Sender<Arc<compact_str::CompactString>>>,
     lines: broadcast::Sender<Arc<compact_str::CompactString>>,
     limited: broadcast::Sender<Arc<compact_str::CompactString>>,
     log_path: PathBuf,
@@ -99,6 +101,7 @@ impl Handle {
         let capacity = executor.config.load().system.websocket_log_count.max(1);
         let (lines, _) = broadcast::channel(capacity * 2);
         let (limited, _) = broadcast::channel(capacity);
+        let terminal = native.then(|| broadcast::channel(256).0);
         let (status, status_rx) = mpsc::channel(8);
         let started = Arc::new(AtomicBool::new(attached));
         let log_path = executor
@@ -113,9 +116,12 @@ impl Handle {
         let console = tokio::spawn(console_task(
             executor.clone(),
             name.clone(),
-            stdin_rx,
-            lines.clone(),
-            limited.clone(),
+            ConsoleChannels {
+                stdin: stdin_rx,
+                lines: lines.clone(),
+                limited: limited.clone(),
+                terminal: terminal.clone(),
+            },
             log_path.clone(),
             native,
         ));
@@ -135,6 +141,7 @@ impl Handle {
                 server: weak,
                 started,
                 stdin,
+                terminal,
                 lines,
                 limited,
                 log_path,
@@ -154,20 +161,44 @@ impl Handle {
     }
 }
 
+enum ConsoleInput {
+    Data(Vec<u8>),
+    Resize(u16, u16),
+}
+
+struct ConsoleChannels {
+    stdin: mpsc::Receiver<ConsoleInput>,
+    lines: broadcast::Sender<Arc<compact_str::CompactString>>,
+    limited: broadcast::Sender<Arc<compact_str::CompactString>>,
+    terminal: Option<broadcast::Sender<Arc<compact_str::CompactString>>>,
+}
+
 async fn console_task(
     executor: IncusExecutor,
     name: String,
-    mut stdin: mpsc::Receiver<Vec<u8>>,
-    lines: broadcast::Sender<Arc<compact_str::CompactString>>,
-    limited: broadcast::Sender<Arc<compact_str::CompactString>>,
+    channels: ConsoleChannels,
     path: PathBuf,
     native: bool,
 ) {
+    let ConsoleChannels {
+        mut stdin,
+        lines,
+        limited,
+        terminal,
+    } = channels;
+    let mut dimensions = (120, 40);
     let mut line_buffer = crate::io::line_buffer::LineBuffer::new();
     let mut line_count = 0;
     let mut interval = std::time::Instant::now();
     let mut initial_replay = true;
     let mut emit = |chunk: &[u8]| {
+        if let Some(terminal) = &terminal {
+            for chunk in chunk.chunks(8192) {
+                let _ = terminal.send(Arc::new(
+                    base64::prelude::BASE64_STANDARD.encode(chunk).into(),
+                ));
+            }
+        }
         line_buffer.extend(chunk);
         while let Some(bytes) = line_buffer.next_line() {
             let line = Arc::new(compact_str::CompactString::from_utf8_lossy(bytes));
@@ -203,7 +234,7 @@ async fn console_task(
             control
                 .send(Message::Text(
                     json!({
-                        "command": "window-resize", "args": {"width": "120", "height": "40"}
+                        "command": "window-resize", "args": {"width": dimensions.0.to_string(), "height": dimensions.1.to_string()}
                     })
                     .to_string()
                     .into(),
@@ -215,7 +246,8 @@ async fn console_task(
         match connection {
             Ok((mut data, mut control)) => {
                 tracing::debug!(instance = %name, "Incus console websockets connected");
-                let input_ready = tokio::time::sleep(Duration::from_secs(5));
+                let input_ready =
+                    tokio::time::sleep(Duration::from_secs(if native { 0 } else { 5 }));
                 tokio::pin!(input_ready);
                 let mut accept_input = false;
                 let log = tokio::fs::OpenOptions::new()
@@ -247,7 +279,15 @@ async fn console_task(
                         }
                         command = stdin.recv(), if accept_input => {
                             let Some(command) = command else { return; };
-                            if data.send(Message::Binary(command.into())).await.is_err() { break; }
+                            match command {
+                                ConsoleInput::Data(command) => {
+                                    if data.send(Message::Binary(command.into())).await.is_err() { break; }
+                                }
+                                ConsoleInput::Resize(cols, rows) => {
+                                    dimensions = (cols, rows);
+                                    if control.send(Message::Text(json!({"command":"window-resize","args":{"width":cols.to_string(),"height":rows.to_string()}}).to_string().into())).await.is_err() { break; }
+                                }
+                            }
                             tracing::debug!(instance = %name, "Incus console input frame sent");
                         }
                         message = data.next() => {
@@ -446,6 +486,23 @@ impl ProcessHandle for Handle {
     ) -> anyhow::Result<Box<dyn tokio::io::AsyncRead + Send + Unpin>> {
         if let Some(lines) = lines {
             let data = tokio::fs::read(&self.log_path).await?;
+            if self.native {
+                if lines == 0 {
+                    return Ok(Box::new(tokio::io::empty()));
+                }
+                let start = data
+                    .iter()
+                    .enumerate()
+                    .rev()
+                    .filter(|(_, byte)| **byte == b'\n')
+                    .nth(lines)
+                    .map_or(0, |(index, _)| index + 1);
+                return Ok(Box::new(std::io::Cursor::new(
+                    data.get(start..)
+                        .context("invalid terminal log offset")?
+                        .to_vec(),
+                )));
+            }
             let text = String::from_utf8_lossy(&data);
             let selected = text
                 .lines()
@@ -464,9 +521,31 @@ impl ProcessHandle for Handle {
     async fn send_stdin(&self, data: Vec<u8>) -> anyhow::Result<()> {
         ensure!(data.len() <= 65536, "console input exceeds 64 KiB");
         self.stdin
-            .send(console_input(&data))
+            .send(ConsoleInput::Data(console_input(&data)))
             .await
             .context("Incus console closed")
+    }
+    async fn send_terminal_input(&self, data: Vec<u8>) -> anyhow::Result<()> {
+        ensure!(self.native && data.len() <= 65536, "invalid terminal input");
+        self.stdin
+            .send(ConsoleInput::Data(data))
+            .await
+            .context("Incus console closed")
+    }
+    async fn resize_terminal(&self, cols: u16, rows: u16) -> anyhow::Result<()> {
+        ensure!(
+            self.native && (2..=500).contains(&cols) && (1..=200).contains(&rows),
+            "invalid terminal dimensions"
+        );
+        self.stdin
+            .send(ConsoleInput::Resize(cols, rows))
+            .await
+            .context("Incus console closed")
+    }
+    async fn subscribe_terminal_output(
+        &self,
+    ) -> anyhow::Result<Option<broadcast::Receiver<Arc<compact_str::CompactString>>>> {
+        Ok(self.terminal.as_ref().map(|terminal| terminal.subscribe()))
     }
     async fn subscribe_stdout_lines(
         &self,

@@ -738,6 +738,33 @@ impl Server {
         None
     }
 
+    pub async fn get_terminal_output(
+        &self,
+    ) -> Option<tokio::sync::broadcast::Receiver<Arc<compact_str::CompactString>>> {
+        let handle = self.process_handle.read().await.clone()?;
+        handle.subscribe_terminal_output().await.ok().flatten()
+    }
+
+    pub async fn send_terminal_input(&self, data: Vec<u8>) -> anyhow::Result<()> {
+        let handle = self
+            .process_handle
+            .read()
+            .await
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("server has no active process"))?;
+        handle.send_terminal_input(data).await
+    }
+
+    pub async fn resize_terminal(&self, cols: u16, rows: u16) -> anyhow::Result<()> {
+        let handle = self
+            .process_handle
+            .read()
+            .await
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("server has no active process"))?;
+        handle.resize_terminal(cols, rows).await
+    }
+
     pub async fn get_stdout_lines(
         &self,
     ) -> Option<tokio::sync::broadcast::Receiver<Arc<compact_str::CompactString>>> {

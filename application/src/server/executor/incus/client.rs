@@ -245,7 +245,7 @@ impl Client {
         let (endpoint, body) = if native {
             (
                 "exec",
-                json!({"command":["/bin/sh", "-l"], "interactive":true, "wait-for-websocket":true, "user":0, "group":0, "cwd":"/root", "environment":{"TERM":"xterm-256color"}}),
+                json!({"command":["/bin/sh", "-c", "if [ -x /bin/bash ]; then exec /bin/bash -l; else exec /bin/sh -l; fi"], "interactive":true, "wait-for-websocket":true, "user":0, "group":0, "cwd":"/root", "environment":{"TERM":"xterm-256color"}}),
             )
         } else {
             (

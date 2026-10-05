@@ -353,7 +353,9 @@ pub async fn handle_ws(
                             continue;
                         }
 
-                        if let Some(mut stdout) = server.get_stdout_lines_ratelimited().await {
+                        let native = server.filesystem.native_instance;
+                        let stdout = if native { server.get_terminal_output().await } else { server.get_stdout_lines_ratelimited().await };
+                        if let Some(mut stdout) = stdout {
                             loop {
                                 match stdout.recv().await {
                                     Ok(stdout) => {
@@ -368,7 +370,7 @@ pub async fn handle_ws(
 
                                         websocket_handler.send_message(
                                             websocket::WebsocketMessage::builder(
-                                                websocket::WebsocketEvent::ServerConsoleOutput,
+                                                if native { websocket::WebsocketEvent::ServerTerminalOutput } else { websocket::WebsocketEvent::ServerConsoleOutput },
                                             )
                                             .arg(stdout.to_compact_string())
                                             .build(),

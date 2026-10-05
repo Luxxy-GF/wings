@@ -78,6 +78,18 @@ pub trait ProcessHandle: Send + Sync {
     ) -> Result<Box<dyn tokio::io::AsyncRead + Send + Unpin>, anyhow::Error>;
 
     async fn send_stdin(&self, data: Vec<u8>) -> Result<(), anyhow::Error>;
+    async fn send_terminal_input(&self, _data: Vec<u8>) -> anyhow::Result<()> {
+        anyhow::bail!("interactive terminal input is not supported")
+    }
+    async fn resize_terminal(&self, _cols: u16, _rows: u16) -> anyhow::Result<()> {
+        anyhow::bail!("interactive terminal resizing is not supported")
+    }
+    async fn subscribe_terminal_output(
+        &self,
+    ) -> anyhow::Result<Option<tokio::sync::broadcast::Receiver<Arc<compact_str::CompactString>>>>
+    {
+        Ok(None)
+    }
     async fn subscribe_stdout_lines_ratelimited(
         &self,
     ) -> Result<tokio::sync::broadcast::Receiver<Arc<compact_str::CompactString>>, anyhow::Error>;

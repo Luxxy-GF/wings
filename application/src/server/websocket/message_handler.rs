@@ -5,6 +5,8 @@ use crate::server::{
     collab::CollabError,
     permissions::Permission,
 };
+use anyhow::Context;
+use base64::Engine;
 use compact_str::ToCompactString;
 use futures::StreamExt;
 use serde_json::json;
@@ -95,6 +97,34 @@ pub async fn handle_message(
                 }
                 drop(socket_jwt);
 
+                if server.filesystem.native_instance {
+                    use tokio::io::AsyncReadExt;
+                    let mut reader = server
+                        .logs(Some(state.config.load().system.websocket_log_count))
+                        .await;
+                    let mut buffer = [0; 8192];
+                    loop {
+                        let count = reader.read(&mut buffer).await?;
+                        if count == 0 {
+                            break;
+                        }
+                        websocket_handler
+                            .send_message(
+                                WebsocketMessage::builder(WebsocketEvent::ServerTerminalOutput)
+                                    .arg(
+                                        base64::prelude::BASE64_STANDARD.encode(
+                                            buffer
+                                                .get(..count)
+                                                .context("invalid terminal read size")?,
+                                        ),
+                                    )
+                                    .build(),
+                            )
+                            .await;
+                    }
+                    return Ok(());
+                }
+
                 let mut log_stream = server
                     .logs_lines(Some(state.config.load().system.websocket_log_count))
                     .await;
@@ -108,6 +138,37 @@ pub async fn handle_message(
                         )
                         .await;
                 }
+            }
+        }
+        WebsocketEvent::TerminalInput | WebsocketEvent::TerminalResize => {
+            if !server.filesystem.native_instance {
+                return Ok(());
+            }
+            let allowed = if matches!(message.event, WebsocketEvent::TerminalInput) {
+                websocket_handler
+                    .has_permission(Permission::ControlConsole)
+                    .await?
+            } else {
+                websocket_handler
+                    .has_calagopus_permission_or(Permission::ControlReadConsole, true)
+                    .await?
+            };
+            if !allowed {
+                return Ok(());
+            }
+            let result = if matches!(message.event, WebsocketEvent::TerminalInput) {
+                match message.args.first() {
+                    Some(data) => server.send_terminal_input(data.as_bytes().to_vec()).await,
+                    None => return Ok(()),
+                }
+            } else {
+                let (Some(cols), Some(rows)) = (message.args.first(), message.args.get(1)) else {
+                    return Ok(());
+                };
+                server.resize_terminal(cols.parse()?, rows.parse()?).await
+            };
+            if let Err(error) = result {
+                tracing::debug!(server = %server.uuid, %error, "could not update native terminal");
             }
         }
         WebsocketEvent::SetState => {

@@ -80,6 +80,10 @@ pub enum WebsocketEvent {
     SendServerLogs,
     #[serde(rename = "send command")]
     SendCommand,
+    #[serde(rename = "terminal input")]
+    TerminalInput,
+    #[serde(rename = "terminal resize")]
+    TerminalResize,
     #[serde(rename = "send stats")]
     SendStats,
     #[serde(rename = "send status")]
@@ -104,6 +108,8 @@ pub enum WebsocketEvent {
     ServerCustomEvent,
     #[serde(rename = "console output")]
     ServerConsoleOutput,
+    #[serde(rename = "terminal output")]
+    ServerTerminalOutput,
     #[serde(rename = "install output")]
     ServerInstallOutput,
     #[serde(rename = "image pull progress")]
@@ -207,7 +213,7 @@ impl WebsocketEvent {
             | Self::ServerInstallCompleted
             | Self::ServerTransferStatus => BroadcastPermission::Authenticated,
 
-            Self::ServerConsoleOutput | Self::ServerDaemonMessage => {
+            Self::ServerConsoleOutput | Self::ServerTerminalOutput | Self::ServerDaemonMessage => {
                 BroadcastPermission::CalagopusOr(Permission::ControlReadConsole, true)
             }
 
@@ -249,6 +255,8 @@ impl WebsocketEvent {
             | Self::SetState
             | Self::SendServerLogs
             | Self::SendCommand
+            | Self::TerminalInput
+            | Self::TerminalResize
             | Self::SendStats
             | Self::SendStatus
             | Self::Error

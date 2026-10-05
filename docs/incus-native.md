@@ -18,7 +18,9 @@ Wings creates the native pool automatically. With `dir`, its default source is `
 
 Guest root disks persist across stops, restarts, and daemon restarts. Explicit server deletion removes the owned Incus instance. The configured server disk limit sets the native root disk size. Container filesystem quota enforcement with `dir` requires project quotas on the backing filesystem; choose Btrfs, ZFS, or another quota-capable driver for enforced container disk limits. VM disk capacity is enforced by its virtual block device.
 
-The console opens an interactive root shell through Incus exec. The panel file manager and Wings SFTP expose the guest root filesystem through Incus SFTP without rewriting OS ownership. VM file access and shell sessions require the guest to be running with its agent available. Guest pseudo-filesystems are excluded by the built-in OS template.
+The console opens an interactive root terminal through Incus exec, using Bash when available and otherwise the image's `/bin/sh`. The companion panel streams terminal bytes without waiting for a newline, so installation confirmations and shell prompts appear immediately. Click inside the terminal to type, use Enter to accept a default answer, or Ctrl+C to interrupt the current command. The command box also remains available. Resizing the console or changing its font size updates the guest's terminal dimensions. Both Wings and the panel must be updated for this protocol.
+
+The panel file manager and Wings SFTP expose the guest root filesystem through Incus SFTP without rewriting OS ownership. VM file access and shell sessions require the guest to be running with its agent available. Guest pseudo-filesystems are excluded by the built-in OS template.
 
 Allocations, bridge networking, port publication, and the existing Incus firewall implementation are shared with application containers. CPU and memory limits map to Incus instance limits; VM CPU limits are rounded up to a whole vCPU. Egg startup commands and installer scripts do not run inside native OS instances.
 
