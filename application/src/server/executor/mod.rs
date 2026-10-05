@@ -106,6 +106,9 @@ pub trait ProcessHandle: Send + Sync {
 
 #[async_trait::async_trait]
 pub trait ServerExecutor: Send + Sync {
+    async fn incus_network_inventory(&self) -> anyhow::Result<serde_json::Value> {
+        anyhow::bail!("direct networking requires Incus")
+    }
     async fn boot(&self) -> Result<(), anyhow::Error>;
 
     async fn reconcile_firewall(

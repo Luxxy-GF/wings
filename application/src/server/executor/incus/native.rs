@@ -20,6 +20,12 @@ impl IncusExecutor {
             .as_ref()
             .context("missing native instance configuration")?;
         validate_config(native)?;
+        if native.network.is_some() {
+            ensure!(
+                !self.tundra_enabled && !self.config.load().tundra.enabled,
+                "direct networking cannot use Tundra private networking"
+            );
+        }
         ensure!(
             !native.image.is_empty()
                 && native.image.len() <= 255
@@ -72,10 +78,18 @@ impl IncusExecutor {
                 instance.config.get("user.wings.native-image") == Some(&native.image),
                 "changing an OS image requires an explicit reinstall"
             );
+            super::external::check_network(&instance, native.network.as_ref())?;
             return Ok(());
         }
+        ensure!(
+            !server.suspended.load(std::sync::atomic::Ordering::SeqCst),
+            "cannot create an instance for a suspended or deleted server"
+        );
         let instances: Vec<Instance> = self.client.get("/1.0/instances?recursion=1").await?;
-        let ip = self.network.allocate(&instances).await?;
+        let ip = match &native.network {
+            Some(network) => network.address,
+            None => self.network.allocate(&instances).await?,
+        };
         let mut config = self.resources(&cfg, false)?;
         config.extend(BTreeMap::from([
             ("boot.autostart".into(), "false".into()),
@@ -100,7 +114,7 @@ impl IncusExecutor {
             "user.wings.instance-config".into(),
             serde_json::to_string(&native.config.keys().collect::<Vec<_>>())?,
         );
-        let devices = Devices::from([
+        let mut devices = Devices::from([
             (
                 "root".into(),
                 BTreeMap::from([
@@ -123,6 +137,31 @@ impl IncusExecutor {
                 ]),
             ),
         ]);
+        if let Some(network) = &native.network {
+            let mut network = network.clone();
+            network
+                .mac
+                .get_or_insert_with(|| super::external::mac(server.uuid));
+            network.mac = network.mac.map(|mac| mac.to_ascii_lowercase());
+            let device = super::external::device(&network).await?;
+            ensure!(
+                !instances
+                    .iter()
+                    .any(
+                        |instance| instance.config.get("user.wings.ip") == Some(&ip.to_string())
+                            || instance.effective_devices().values().any(|device| device
+                                .get("hwaddr")
+                                .is_some_and(|mac| Some(mac.to_ascii_lowercase())
+                                    == network.mac.as_ref().map(|mac| mac.to_ascii_lowercase())))
+                    ),
+                "IP or MAC address is already in use in this Incus project"
+            );
+            config.insert(
+                "user.wings.external-network".into(),
+                serde_json::to_string(&network)?,
+            );
+            devices.insert("eth0".into(), device);
+        }
         let body = json!({"name":name, "type":native.kind.incus_type(), "profiles":[], "config":config, "devices":devices,
             "source":{"type":"image", "mode":"pull", "protocol":"simplestreams", "server":runtime.image_server, "alias":native.image}});
         drop(cfg);
@@ -312,6 +351,14 @@ struct ConfigOption {
 pub(super) fn validate_config(
     instance: &crate::server::configuration::NativeInstance,
 ) -> anyhow::Result<()> {
+    if let Some(network) = &instance.network {
+        network.validate()?;
+        ensure!(
+            !instance.config.contains_key("cloud-init.network-config")
+                && !instance.config.contains_key("user.network-config"),
+            "IP pools manage guest network configuration"
+        );
+    }
     static OPTIONS: std::sync::LazyLock<Vec<ConfigOption>> = std::sync::LazyLock::new(|| {
         serde_json::from_str(include_str!("native-options.json"))
             .expect("invalid Incus option catalog")

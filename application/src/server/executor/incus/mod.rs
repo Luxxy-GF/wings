@@ -1,6 +1,7 @@
 mod auth;
 mod client;
 mod configuration;
+mod external;
 mod image;
 mod instance;
 mod native;
@@ -197,6 +198,7 @@ impl IncusExecutor {
         Self::validate_server(&cfg)?;
         let (mut instance, etag) = self.instance_with_etag(name).await?;
         if let Some(native) = &cfg.instance {
+            external::check_network(&instance, native.network.as_ref())?;
             let previous: Vec<String> = instance
                 .config
                 .get("user.wings.instance-config")
@@ -267,7 +269,9 @@ impl IncusExecutor {
             server: Some(Arc::downgrade(server)),
         });
         drop(cfg);
-        self.firewall.sync(&spec).await?;
+        if !instance.config.contains_key("user.wings.external-network") {
+            self.firewall.sync(&spec).await?;
+        }
         self.update_instance(&instance, etag.as_deref()).await?;
         drop(_guard);
         if instance.status == "Running" {
@@ -277,6 +281,10 @@ impl IncusExecutor {
     }
     async fn publish(&self, name: &str) -> anyhow::Result<()> {
         let instance = self.instance(name).await?;
+        if let Some(value) = instance.config.get("user.wings.external-network") {
+            let network = serde_json::from_str(value)?;
+            return external::configure(&self.client, name, &network).await;
+        }
         let uuid: uuid::Uuid = instance
             .config
             .get("user.wings.server")
@@ -379,6 +387,10 @@ fn firewall_spec(
 
 #[async_trait::async_trait]
 impl ServerExecutor for IncusExecutor {
+    async fn incus_network_inventory(&self) -> anyhow::Result<Value> {
+        let _guard = self.provisioning.lock().await;
+        external::network_inventory(&self.client, &self.owner).await
+    }
     async fn boot(&self) -> anyhow::Result<()> {
         let runtime = self.config.load().runtime.incus.clone();
         ensure!(
@@ -591,6 +603,7 @@ impl ServerExecutor for IncusExecutor {
     }
     async fn delete_server_storage(&self, server: &Server) -> anyhow::Result<()> {
         if server.configuration.read().await.instance.is_some() {
+            let _guard = self.provisioning.lock().await;
             self.unmount_native_files(server).await?;
             self.remove_instance(&Self::name(server.uuid)).await?;
             self.firewall.clear(server.uuid).await?;
@@ -630,6 +643,10 @@ impl ServerExecutor for IncusExecutor {
     ) -> anyhow::Result<Option<SocketAddr>> {
         let instance = self.instance(&Self::name(server.uuid)).await?;
         ensure!(
+            !instance.config.contains_key("user.wings.external-network"),
+            "the host cannot reach macvlan guests directly"
+        );
+        ensure!(
             instance.status == "Running",
             "Incus target instance is not running"
         );
@@ -642,8 +659,16 @@ impl ServerExecutor for IncusExecutor {
             port,
         )))
     }
-    async fn resolve_published_address(&self, _server: &Server) -> Option<IpAddr> {
-        None
+    async fn resolve_published_address(&self, server: &Server) -> Option<IpAddr> {
+        server
+            .configuration
+            .read()
+            .await
+            .instance
+            .as_ref()?
+            .network
+            .as_ref()
+            .map(|network| network.address.into())
     }
     async fn container_refs(&self, servers: &[Server]) -> HashMap<uuid::Uuid, String> {
         servers
@@ -682,6 +707,10 @@ impl ServerExecutor for IncusExecutor {
                 self.network.sync(uuid, "", &BTreeMap::new()).await?;
                 continue;
             };
+            if instance.config.contains_key("user.wings.external-network") {
+                Self::validate_server(settings)?;
+                continue;
+            }
             let ip: IpAddr = instance
                 .config
                 .get("user.wings.ip")

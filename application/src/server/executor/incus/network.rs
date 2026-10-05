@@ -179,6 +179,7 @@ fn check_proxy_conflicts(
 }
 
 pub(super) struct Network {
+    enabled: bool,
     client: Client,
     name: String,
     owner: String,
@@ -191,6 +192,7 @@ impl Network {
         Self {
             client,
             name: cfg.network.clone(),
+            enabled: cfg.bridge_enabled,
             owner: format!("wings:{node}"),
             cidr: cfg.ipv4_address.clone(),
             timeout: Duration::from_secs(cfg.operation_timeout_seconds),
@@ -201,6 +203,9 @@ impl Network {
         format!("/1.0/networks/{}", segment(&self.name))
     }
     pub(super) async fn boot(&self) -> anyhow::Result<()> {
+        if !self.enabled {
+            return Ok(());
+        }
         ipv4_pool(&self.cidr)?;
         let mut global = self.client.clone();
         global.project = "default".into();
@@ -256,6 +261,10 @@ impl Network {
         Ok(())
     }
     pub(super) async fn allocate(&self, instances: &[Instance]) -> anyhow::Result<Ipv4Addr> {
+        ensure!(
+            self.enabled,
+            "bridge networking is disabled; select an IP pool for this native instance"
+        );
         let (network, broadcast, gateway) = ipv4_pool(&self.cidr)?;
         let mut used: BTreeSet<u32> = instances
             .iter()
@@ -361,6 +370,10 @@ impl Network {
         target: &str,
         desired: &BTreeMap<IpAddr, BTreeSet<u16>>,
     ) -> anyhow::Result<()> {
+        if !self.enabled {
+            ensure!(desired.is_empty(), "bridge networking is disabled");
+            return Ok(());
+        }
         let _guard = self.lock.lock().await;
         let name = format!("wgs-{server}");
         let path = format!("/1.0/instances/{}", segment(&name));
@@ -455,6 +468,9 @@ impl Network {
     ) -> anyhow::Result<HashMap<IpAddr, Vec<super::super::UsedPort>>> {
         let mut result: HashMap<IpAddr, Vec<super::super::UsedPort>> =
             ips.iter().map(|ip| (*ip, Vec::new())).collect();
+        if !self.enabled {
+            return Ok(result);
+        }
         let instances = self.all_instances().await?;
         for instance in instances {
             let server = if instance.config.get("user.wings.owner") == Some(&self.owner) {

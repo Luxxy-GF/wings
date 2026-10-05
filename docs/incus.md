@@ -217,3 +217,23 @@ This is an experimental implementation following the PR's architecture, with inc
 - Console input waits five seconds after WebSocket attachment, but Incus does not acknowledge native relay readiness. Early reconnect input can be lost on slow hosts. Early-input reliability remains a limitation requiring hardware checks.
 - The supervisor records exit codes. Forced kills can leave an unknown code (`-1`); there is no inferred OOM flag.
 - `used_ports` reflects Incus proxies and remaining legacy forwards, but does not completely represent host-service conflicts or unrelated NAT rules.
+
+### External IPv4 pools
+
+The `xyz.luxxy.incus` panel extension supports node IP pools for Linux native containers and VMs. Pool settings select a parent NIC, optional VLAN/MTU/GVRP, subnet, gateway, and DNS. Containers use macvlan; VMs use macvtap. Addresses and optional provider MACs are reserved by the panel and sent through authenticated extension metadata. These interfaces use no NAT or port allocations.
+
+For a node using only direct IP pools:
+
+```yaml
+runtime:
+  backend: incus
+  incus:
+    panel_extension: true
+    bridge_enabled: false
+```
+
+The bridge remains enabled by default for mixed nodes. Disabling it does not delete an existing bridge; application containers and native bridge instances require it.
+
+Wings installs persistent static IPv4 configuration in Linux guests with systemd or OpenRC and iproute2, identifying the guest interface by its MAC. VMs require the Incus agent. Pool networking cannot be combined with cloud-init network overrides, Tundra, or Wings host firewall rules. Guest or upstream firewalls must protect these direct interfaces. The parent network must allow guest MACs/VLANs, and the host cannot reach macvlan/macvtap guests directly.
+
+`GET /api/system/incus/network` exposes host interface names/MTUs and owned direct-instance IP reservations to the authenticated panel. Inventory waits for Incus provisioning operations; the panel keeps deletion tombstones until reconciliation confirms the address is no longer in use. Changing an existing instance's network requires a new instance.

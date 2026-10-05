@@ -741,6 +741,7 @@ pub struct RuntimeConfiguration {
 #[derive(Clone, Debug, Deserialize, Serialize, ToSchema, PartialEq, Eq)]
 #[serde(default)]
 pub struct IncusRuntime {
+    pub bridge_enabled: bool,
     pub panel_extension: bool,
     pub socket: String,
     pub project: String,
@@ -768,6 +769,7 @@ impl Default for IncusRuntime {
     fn default() -> Self {
         Self {
             panel_extension: false,
+            bridge_enabled: true,
             socket: "/var/lib/incus/unix.socket".into(),
             project: "wings".into(),
             storage_pool: "wings".into(),

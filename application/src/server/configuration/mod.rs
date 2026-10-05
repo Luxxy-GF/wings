@@ -303,6 +303,123 @@ pub struct NativeInstance {
     pub image: String,
     #[serde(default)]
     pub config: std::collections::BTreeMap<String, String>,
+    #[serde(default)]
+    pub network: Option<ExternalNetwork>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, ToSchema, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ExternalNetwork {
+    pub pool_uuid: uuid::Uuid,
+    pub parent: String,
+    pub vlan: Option<u16>,
+    pub mtu: Option<u32>,
+    pub mode: String,
+    pub gvrp: bool,
+    #[schema(value_type = String)]
+    pub address: std::net::Ipv4Addr,
+    pub prefix: u8,
+    #[schema(value_type = String)]
+    pub gateway: std::net::Ipv4Addr,
+    pub gateway_onlink: bool,
+    #[schema(value_type = Vec<String>)]
+    pub dns: Vec<std::net::Ipv4Addr>,
+    pub mac: Option<String>,
+}
+
+impl ExternalNetwork {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!((1..=32).contains(&self.prefix), "invalid IPv4 prefix");
+        anyhow::ensure!(
+            usable_ipv4(self.address) && usable_ipv4(self.gateway) && self.address != self.gateway,
+            "invalid external IPv4 address or gateway"
+        );
+        anyhow::ensure!(
+            !self.parent.is_empty()
+                && self.parent.len() <= 15
+                && self.parent != "lo"
+                && self
+                    .parent
+                    .bytes()
+                    .all(|value| value.is_ascii_alphanumeric()
+                        || matches!(value, b'.' | b'_' | b'-')),
+            "invalid parent interface"
+        );
+        anyhow::ensure!(
+            self.vlan.is_none_or(|vlan| (1..=4094).contains(&vlan)),
+            "VLAN must be 1 through 4094"
+        );
+        anyhow::ensure!(
+            self.mtu.is_none_or(|mtu| (576..=65535).contains(&mtu)),
+            "invalid MTU"
+        );
+        anyhow::ensure!(
+            matches!(self.mode.as_str(), "bridge" | "private" | "vepa"),
+            "invalid macvlan mode"
+        );
+        anyhow::ensure!(
+            !self.dns.is_empty()
+                && self.dns.len() <= 4
+                && self.dns.iter().copied().all(usable_ipv4),
+            "one through four IPv4 DNS servers are required"
+        );
+        if let Some(mac) = &self.mac {
+            validate_mac(mac)?;
+        }
+        let mask = if self.prefix == 0 {
+            0
+        } else {
+            u32::MAX << (32 - self.prefix)
+        };
+        let address = u32::from(self.address);
+        if self.prefix <= 30 {
+            anyhow::ensure!(
+                address & !mask != 0 && address & !mask != !mask,
+                "IPv4 address is a subnet or broadcast address"
+            );
+        }
+        let gateway = u32::from(self.gateway);
+        if self.prefix <= 30 && gateway & mask == address & mask {
+            anyhow::ensure!(
+                gateway & !mask != 0 && gateway & !mask != !mask,
+                "gateway is a subnet or broadcast address"
+            );
+        }
+        anyhow::ensure!(
+            self.gateway_onlink || u32::from(self.gateway) & mask == address & mask,
+            "gateway outside the subnet requires on-link routing"
+        );
+        Ok(())
+    }
+}
+
+fn usable_ipv4(address: std::net::Ipv4Addr) -> bool {
+    address.octets()[0] != 0
+        && address.octets()[0] < 224
+        && !address.is_unspecified()
+        && !address.is_loopback()
+        && !address.is_multicast()
+        && !address.is_broadcast()
+}
+
+pub fn validate_mac(mac: &str) -> anyhow::Result<()> {
+    let bytes = mac
+        .split(':')
+        .map(|part| {
+            anyhow::ensure!(
+                part.len() == 2 && part.bytes().all(|byte| byte.is_ascii_hexdigit()),
+                "invalid MAC address"
+            );
+            Ok(u8::from_str_radix(part, 16)?)
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    anyhow::ensure!(
+        bytes.len() == 6
+            && bytes.first().is_some_and(|byte| byte & 1 == 0)
+            && bytes.iter().any(|value| *value != 0),
+        "MAC must be a non-zero unicast address"
+    );
+    Ok(())
 }
 
 nestify::nest! {

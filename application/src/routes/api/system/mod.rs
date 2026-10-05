@@ -4,6 +4,7 @@ use utoipa_axum::{router::OpenApiRouter, routes};
 mod backups;
 mod config;
 mod images;
+mod incus_network;
 mod ips;
 mod logs;
 mod overview;
@@ -32,6 +33,7 @@ mod get {
     #[derive(ToSchema, Serialize)]
     struct RuntimeCapabilities {
         backend: crate::config::RuntimeBackend,
+        direct_networking: bool,
         system_containers: bool,
         virtual_machines: bool,
         image_server: Option<String>,
@@ -52,6 +54,7 @@ mod get {
                 let incus = config.runtime.backend == crate::config::RuntimeBackend::Incus;
                 RuntimeCapabilities {
                     backend: config.runtime.backend,
+                    direct_networking: incus && !config.tundra.enabled,
                     system_containers: incus,
                     virtual_machines: incus
                         && !config.tundra.enabled
@@ -74,6 +77,7 @@ pub fn router(state: &State) -> OpenApiRouter<State> {
         .nest("/overview", overview::router(state))
         .nest("/ips", ips::router(state))
         .nest("/images", images::router(state))
+        .nest("/incus/network", incus_network::router(state))
         .nest("/logs", logs::router(state))
         .nest("/upgrade", upgrade::router(state))
         .nest("/config", config::router(state))

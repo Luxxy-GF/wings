@@ -7,6 +7,17 @@ impl IncusExecutor {
     pub(super) fn validate_server(config: &ServerConfiguration) -> anyhow::Result<()> {
         if let Some(instance) = &config.instance {
             super::native::validate_config(instance)?;
+            if let Some(network) = &instance.network {
+                network.validate()?;
+                ensure!(
+                    config.firewall.is_empty(),
+                    "macvlan interfaces bypass the host firewall; configure a guest or upstream firewall"
+                );
+                ensure!(
+                    super::network::allocations(config)?.is_empty(),
+                    "IP pool instances cannot use NAT port allocations"
+                );
+            }
         }
         ensure!(
             config.instance.is_none() || config.mounts.is_empty(),
