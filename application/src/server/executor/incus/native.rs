@@ -19,6 +19,7 @@ impl IncusExecutor {
             .instance
             .as_ref()
             .context("missing native instance configuration")?;
+        validate_config(native)?;
         ensure!(
             !native.image.is_empty()
                 && native.image.len() <= 255
@@ -94,6 +95,11 @@ impl IncusExecutor {
         if native.kind == NativeInstanceType::Container {
             config.insert("security.idmap.isolated".into(), "true".into());
         }
+        config.extend(native.config.clone());
+        config.insert(
+            "user.wings.instance-config".into(),
+            serde_json::to_string(&native.config.keys().collect::<Vec<_>>())?,
+        );
         let devices = Devices::from([
             (
                 "root".into(),
@@ -291,6 +297,91 @@ impl IncusExecutor {
         )
         .await
     }
+}
+
+#[derive(serde::Deserialize)]
+struct ConfigOption {
+    key: String,
+    #[serde(rename = "type")]
+    value_type: String,
+    kinds: Vec<String>,
+    managed: bool,
+    choices: Vec<String>,
+}
+
+pub(super) fn validate_config(
+    instance: &crate::server::configuration::NativeInstance,
+) -> anyhow::Result<()> {
+    static OPTIONS: std::sync::LazyLock<Vec<ConfigOption>> = std::sync::LazyLock::new(|| {
+        serde_json::from_str(include_str!("native-options.json"))
+            .expect("invalid Incus option catalog")
+    });
+    ensure!(
+        instance.config.len() <= 128,
+        "too many Incus instance options"
+    );
+    ensure!(
+        instance
+            .config
+            .iter()
+            .map(|(key, value)| key.len() + value.len())
+            .sum::<usize>()
+            <= 524_288,
+        "Incus instance configuration exceeds 512 KiB"
+    );
+    let kind = match instance.kind {
+        NativeInstanceType::Container => "container",
+        NativeInstanceType::VirtualMachine => "virtual_machine",
+    };
+    for (key, value) in &instance.config {
+        ensure!(
+            key.len() <= 255
+                && !key.starts_with("user.wings.")
+                && key
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-')),
+            "invalid or reserved Incus option: {key}"
+        );
+        let option = OPTIONS
+            .iter()
+            .find(|option| {
+                option.key == *key
+                    || option
+                        .key
+                        .strip_suffix('*')
+                        .is_some_and(|prefix| key.starts_with(prefix) && key.len() > prefix.len())
+            })
+            .with_context(|| format!("unsupported Incus 7.0 instance option: {key}"))?;
+        ensure!(
+            !option.managed,
+            "{key} is managed by Wings resource or lifecycle settings"
+        );
+        ensure!(
+            option.kinds.iter().any(|value| value == kind),
+            "{key} is not supported for {kind}"
+        );
+        ensure!(
+            !value.is_empty() && value.len() <= 65_536 && !value.contains('\0'),
+            "invalid value for {key}"
+        );
+        match option.value_type.as_str() {
+            "bool" => ensure!(
+                matches!(value.as_str(), "true" | "false"),
+                "{key} requires true or false"
+            ),
+            "integer" | "int64" => {
+                value
+                    .parse::<i64>()
+                    .with_context(|| format!("{key} requires an integer"))?;
+            }
+            _ => (),
+        }
+        ensure!(
+            option.choices.is_empty() || option.choices.contains(value),
+            "invalid choice for {key}"
+        );
+    }
+    Ok(())
 }
 
 fn mounted(path: &Path, name: &str) -> anyhow::Result<bool> {

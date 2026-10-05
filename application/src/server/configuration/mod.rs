@@ -301,6 +301,8 @@ impl NativeInstanceType {
 pub struct NativeInstance {
     pub kind: NativeInstanceType,
     pub image: String,
+    #[serde(default)]
+    pub config: std::collections::BTreeMap<String, String>,
 }
 
 nestify::nest! {

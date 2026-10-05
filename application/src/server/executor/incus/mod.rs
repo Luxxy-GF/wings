@@ -196,6 +196,24 @@ impl IncusExecutor {
         let cfg = server.configuration.read().await;
         Self::validate_server(&cfg)?;
         let (mut instance, etag) = self.instance_with_etag(name).await?;
+        if let Some(native) = &cfg.instance {
+            let previous: Vec<String> = instance
+                .config
+                .get("user.wings.instance-config")
+                .map(|value| serde_json::from_str(value))
+                .transpose()?
+                .unwrap_or_default();
+            for key in previous {
+                if !key.starts_with("user.wings.") {
+                    instance.config.remove(&key);
+                }
+            }
+            if native.kind == crate::server::configuration::NativeInstanceType::Container {
+                instance
+                    .config
+                    .insert("security.idmap.isolated".into(), "true".into());
+            }
+        }
         let image_environment: BTreeMap<String, String> = if cfg.instance.is_some() {
             if let Some(root) = instance.devices.get_mut("root") {
                 root.insert("size".into(), format!("{}MiB", cfg.build.disk_space));
@@ -216,6 +234,13 @@ impl IncusExecutor {
             instance.config.insert(format!("environment.{key}"), value);
         }
         instance.config.extend(self.resources(&cfg, false)?);
+        if let Some(native) = &cfg.instance {
+            instance.config.extend(native.config.clone());
+            instance.config.insert(
+                "user.wings.instance-config".into(),
+                serde_json::to_string(&native.config.keys().collect::<Vec<_>>())?,
+            );
+        }
         for entry in if cfg.instance.is_some() {
             Vec::new()
         } else {

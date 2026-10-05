@@ -5,6 +5,9 @@ use std::collections::BTreeMap;
 
 impl IncusExecutor {
     pub(super) fn validate_server(config: &ServerConfiguration) -> anyhow::Result<()> {
+        if let Some(instance) = &config.instance {
+            super::native::validate_config(instance)?;
+        }
         ensure!(
             config.instance.is_none() || config.mounts.is_empty(),
             "extra mounts are not supported for native OS instances"

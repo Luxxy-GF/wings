@@ -49,3 +49,9 @@ The panel file manager and Wings SFTP expose the guest root filesystem through I
 Allocations, bridge networking, port publication, and the existing Incus firewall implementation are shared with application containers. CPU and memory limits map to Incus instance limits; VM CPU limits are rounded up to a whole vCPU. Egg startup commands and installer scripts do not run inside native OS instances.
 
 Install the companion panel branch and apply its database migrations before creating OS instances. The migration adds the native instance configuration and a built-in operating-system template. Instance type and image are fixed at creation. Tundra private networking is not supported for native OS instances. VM creation is disabled on nodes that enable Tundra, whose namespace adapter currently handles containers only. Full native backup/export, migration, extra mounts, and OS reinstallation are not implemented in this branch; ordinary game-data backup and transfer operations are rejected for native instances. Application-container backup and transfer behavior is unchanged.
+
+### Extension instance options
+
+Native instance metadata accepts an optional `config` map of Incus 7.0 LTS instance keys to string values. Wings validates supported keys, types, and instance applicability, then passes them to Incus at creation and configuration sync. Existing metadata without this map remains valid. A journal of managed keys ensures removed overrides are cleared without touching Wings ownership markers.
+
+CPU, memory, swap, disk priority, and autostart continue to use Wings resource/lifecycle controls. Volatile and OCI keys, ownership markers, and device/pool/network/daemon settings are not accepted in the instance map. The option catalog is derived from Incus v7.0.1 metadata; its license is included beside the catalog. Incus remains responsible for validating kernel, hardware, storage, and raw configuration support.
