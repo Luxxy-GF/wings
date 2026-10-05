@@ -741,6 +741,7 @@ pub struct RuntimeConfiguration {
 #[derive(Clone, Debug, Deserialize, Serialize, ToSchema, PartialEq, Eq)]
 #[serde(default)]
 pub struct IncusRuntime {
+    pub panel_extension: bool,
     pub socket: String,
     pub project: String,
     pub storage_pool: String,
@@ -766,6 +767,7 @@ pub struct IncusRuntime {
 impl Default for IncusRuntime {
     fn default() -> Self {
         Self {
+            panel_extension: false,
             socket: "/var/lib/incus/unix.socket".into(),
             project: "wings".into(),
             storage_pool: "wings".into(),

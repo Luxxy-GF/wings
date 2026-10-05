@@ -1,13 +1,107 @@
 use super::{ResponseExt, client::Client};
 use crate::server::installation::InstallationScript;
-use serde::Deserialize;
+use anyhow::{Context, ensure};
+use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::collections::HashMap;
 use utoipa::ToSchema;
 
 #[derive(ToSchema, Deserialize)]
 pub struct RawServer {
     pub settings: crate::server::configuration::ServerConfiguration,
     pub process_configuration: crate::server::configuration::process::ProcessConfiguration,
+}
+
+pub(super) async fn apply_incus_metadata(
+    client: &Client,
+    servers: &mut [RawServer],
+) -> anyhow::Result<()> {
+    if !client.incus_extension || servers.is_empty() {
+        return Ok(());
+    }
+    #[derive(Serialize)]
+    struct Request {
+        uuids: Vec<uuid::Uuid>,
+    }
+    #[derive(Deserialize)]
+    struct Entry {
+        uuid: uuid::Uuid,
+        instance: serde_json::Value,
+    }
+    #[derive(Deserialize)]
+    struct Response {
+        version: u32,
+        servers: Vec<Entry>,
+    }
+    for servers in servers.chunks_mut(1000) {
+        let response: Response = super::into_json(
+            client
+                .client
+                .post(format!("{}/incus/servers", client.url))
+                .json(&Request {
+                    uuids: servers.iter().map(|server| server.settings.uuid).collect(),
+                })
+                .send()
+                .await
+                .context("requesting Incus extension metadata")?
+                .error_for_remote_status()
+                .await
+                .context(
+                    "Incus panel extension is required when runtime.incus.panel_extension is enabled",
+                )?
+                .text()
+                .await?,
+        )?;
+        ensure!(
+            response.version == 1,
+            "unsupported Incus extension metadata version"
+        );
+        let mut entries = HashMap::with_capacity(response.servers.len());
+        for entry in response.servers {
+            ensure!(
+                !entries.contains_key(&entry.uuid),
+                "duplicate Incus extension metadata for {}",
+                entry.uuid
+            );
+            entries.insert(
+                entry.uuid,
+                serde_json::from_value::<Option<crate::server::configuration::NativeInstance>>(
+                    entry.instance,
+                )?,
+            );
+        }
+        for server in servers {
+            let instance = entries.remove(&server.settings.uuid).with_context(|| {
+                format!(
+                    "missing Incus extension metadata for {}",
+                    server.settings.uuid
+                )
+            })?;
+            if let Some(existing) = &server.settings.instance {
+                ensure!(
+                    Some(existing) == instance.as_ref(),
+                    "conflicting Incus instance metadata for {}",
+                    server.settings.uuid
+                );
+            }
+            if let Some(instance) = &instance {
+                ensure!(
+                    !instance.image.is_empty()
+                        && instance.image.len() <= 255
+                        && !instance.image.bytes().any(|byte| byte.is_ascii_control()),
+                    "invalid native OS image alias"
+                );
+                server.settings.skip_egg_scripts = true;
+                server.settings.container.image = instance.image.clone().into();
+            }
+            server.settings.instance = instance;
+        }
+        ensure!(
+            entries.is_empty(),
+            "Incus extension returned unrequested server metadata"
+        );
+    }
+    Ok(())
 }
 
 pub async fn get_servers_paged(

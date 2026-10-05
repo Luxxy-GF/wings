@@ -39,7 +39,17 @@ mod post {
             Err(_) => Payload { server: None },
         };
 
-        if let Some(configuration) = data.server {
+        if let Some(mut configuration) = data.server {
+            if configuration.settings.uuid != server.uuid {
+                return ApiResponse::error("server configuration UUID mismatch")
+                    .with_status(axum::http::StatusCode::BAD_REQUEST)
+                    .ok();
+            }
+            state
+                .config
+                .client
+                .resolve_incus_metadata(&mut configuration)
+                .await?;
             let suspended = configuration.settings.suspended;
 
             server
@@ -60,7 +70,8 @@ mod post {
                     }
                 });
             }
-        } else if let Ok(configuration) = state.config.client.server(server.uuid).await {
+        } else {
+            let configuration = state.config.client.server(server.uuid).await?;
             let suspended = configuration.settings.suspended;
 
             server

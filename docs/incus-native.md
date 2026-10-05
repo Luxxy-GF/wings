@@ -1,5 +1,29 @@
 # Native Incus operating systems
 
+## Stock panel extension
+
+The `xyz.luxxy.incus` Calagopus extension provides native instance creation,
+image selection and the interactive console on an unmodified panel. Install
+and rebuild the extension before enabling its metadata adapter on Wings:
+
+```yaml
+runtime:
+  backend: incus
+  incus:
+    panel_extension: true
+```
+
+The adapter reads authenticated `POST /api/remote/incus/servers` metadata
+during startup, individual server fetches and configuration updates. Each
+requested server must have exactly one metadata entry; application servers
+have an explicit `null` instance. Invalid, missing or conflicting metadata
+fails loading instead of converting an OS instance into an application
+container. Requests are batched at 1,000 servers and use normal node
+authentication. The setting defaults to `false` for compatibility with the
+existing native panel branch.
+
+## Native runtime
+
 This branch extends the Incus application-container backend with persistent system containers and virtual machines. The panel's server creation form discovers node capabilities and offers an instance type and OS image selector. Application containers remain the default.
 
 Use Incus 7.0 LTS. Install `sshfs` and `fuse3` on the Wings host for guest file access. Virtual machines also require the full Incus package with QEMU, working KVM and an Incus agent in the guest. Installing only `incus-base` does not provide the VM runtime. Images from the default repository normally include the agent.

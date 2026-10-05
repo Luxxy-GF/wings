@@ -7,6 +7,7 @@ use serde::Serialize;
 use std::fmt::Debug;
 
 pub struct Client {
+    pub(super) incus_extension: bool,
     pub(super) config: crate::config::RemoteQuery,
 
     pub(super) client: reqwest::Client,
@@ -62,6 +63,8 @@ impl Client {
             .expect("failed to build streaming HTTP client");
 
         Self {
+            incus_extension: config.runtime.backend == crate::config::RuntimeBackend::Incus
+                && config.runtime.incus.panel_extension,
             config: config.remote_query,
             client,
             stream_client,
@@ -173,12 +176,13 @@ impl Client {
         let mut page = 1;
         loop {
             tracing::info!("fetching page {} of servers", page);
-            let (new_servers, pagination) = self
+            let (mut new_servers, pagination) = self
                 .retry(
                     || super::servers::get_servers_paged(self, page),
                     Self::skip_client_errors,
                 )
                 .await?;
+            super::servers::apply_incus_metadata(self, &mut new_servers).await?;
             servers.extend(new_servers);
 
             if pagination.current_page >= pagination.last_page {
@@ -197,11 +201,21 @@ impl Client {
         &self,
         uuid: uuid::Uuid,
     ) -> Result<super::servers::RawServer, anyhow::Error> {
-        self.retry(
-            || super::servers::get_server(self, uuid),
-            Self::skip_client_errors,
-        )
-        .await
+        let mut server = self
+            .retry(
+                || super::servers::get_server(self, uuid),
+                Self::skip_client_errors,
+            )
+            .await?;
+        super::servers::apply_incus_metadata(self, std::slice::from_mut(&mut server)).await?;
+        Ok(server)
+    }
+
+    pub async fn resolve_incus_metadata(
+        &self,
+        server: &mut super::servers::RawServer,
+    ) -> Result<(), anyhow::Error> {
+        super::servers::apply_incus_metadata(self, std::slice::from_mut(server)).await
     }
 
     #[tracing::instrument(skip(self))]
