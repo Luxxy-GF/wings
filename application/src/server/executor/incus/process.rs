@@ -345,6 +345,11 @@ async fn monitor_task(
     let mut previous = String::new();
     let mut running_announced = false;
     let mut cpu = None::<(u64, std::time::Instant)>;
+    let address = executor
+        .instance(&name)
+        .await
+        .ok()
+        .and_then(|instance| instance.config.get("user.wings.ip").cloned());
     loop {
         let start_acknowledged = started.load(Ordering::SeqCst);
         let state = executor
@@ -398,7 +403,10 @@ async fn monitor_task(
                                     0
                                 }
                             });
-                        let counters = state.network.get("eth0").map(|nic| &nic.counters);
+                        let counters = address
+                            .as_deref()
+                            .and_then(|address| state.network_for_address(address))
+                            .map(|nic| &nic.counters);
                         usage.network.rx_bytes =
                             counters.map_or(0, |counters| counters.bytes_received);
                         usage.network.tx_bytes = counters.map_or(0, |counters| counters.bytes_sent);

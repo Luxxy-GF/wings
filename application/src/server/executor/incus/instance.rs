@@ -76,6 +76,14 @@ pub(super) struct InstanceState {
     pub started_at: Option<String>,
 }
 
+impl InstanceState {
+    pub(super) fn network_for_address(&self, address: &str) -> Option<&NetworkState> {
+        self.network
+            .values()
+            .find(|nic| nic.addresses.iter().any(|entry| entry.address == address))
+    }
+}
+
 #[derive(Clone, Debug, Default, Deserialize)]
 pub(super) struct NetworkState {
     #[serde(default)]

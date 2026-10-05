@@ -241,8 +241,10 @@ impl IncusExecutor {
             notifier: Some(server.filesystem.server_notifier().clone()),
             server: Some(Arc::downgrade(server)),
         });
+        drop(cfg);
         self.firewall.sync(&spec).await?;
         self.update_instance(&instance, etag.as_deref()).await?;
+        drop(_guard);
         if instance.status == "Running" {
             self.publish(name).await?;
         }
@@ -266,16 +268,12 @@ impl IncusExecutor {
                 .client
                 .get(&format!("{}/state", Self::instance_path(name)))
                 .await?;
-            if state
-                .network
-                .get("eth0")
-                .is_some_and(|nic| nic.addresses.iter().any(|address| &address.address == ip))
-            {
+            if state.network_for_address(ip).is_some() {
                 break;
             }
             ensure!(
                 state.status == "Running",
-                "OCI process exited before network publication"
+                "Incus instance exited before network publication"
             );
             ensure!(
                 tokio::time::Instant::now() < deadline,
