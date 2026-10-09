@@ -803,8 +803,20 @@ impl Server {
         process_configuration: configuration::process::ProcessConfiguration,
         skip_pending_restart_check: bool,
     ) {
-        if self.configuration.read().await.instance != configuration.instance {
-            tracing::error!(server = %self.uuid, "changing an instance type or OS image requires recreating the server");
+        let same_instance = {
+            let current = self.configuration.read().await;
+            match (&current.instance, &configuration.instance) {
+                (Some(current), Some(next)) => {
+                    current.kind == next.kind
+                        && current.image == next.image
+                        && current.network == next.network
+                }
+                (None, None) => true,
+                _ => false,
+            }
+        };
+        if !same_instance {
+            tracing::error!(server = %self.uuid, "changing an instance type, OS image, or network requires recreating the server");
             return;
         }
         self.filesystem

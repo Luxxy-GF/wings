@@ -601,6 +601,15 @@ impl ServerExecutor for IncusExecutor {
         }
         Ok(())
     }
+    async fn reinstall_server_storage(&self, server: &Server) -> anyhow::Result<()> {
+        ensure!(
+            server.configuration.read().await.instance.is_some(),
+            "only native instances can recreate their root filesystem"
+        );
+        self.ensure_native(server).await?;
+        self.delete_server_storage(server).await?;
+        self.prepare_server_storage(server).await
+    }
     async fn delete_server_storage(&self, server: &Server) -> anyhow::Result<()> {
         if server.configuration.read().await.instance.is_some() {
             let _guard = self.provisioning.lock().await;

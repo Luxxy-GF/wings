@@ -24,6 +24,11 @@ mod post {
         ),
     ))]
     pub async fn route(server: GetServer) -> ApiResponseResult {
+        if server.filesystem.native_instance {
+            return ApiResponse::error("native OS recreation cannot be cancelled once accepted")
+                .with_status(StatusCode::CONFLICT)
+                .ok();
+        }
         let installer = server
             .installer
             .write()

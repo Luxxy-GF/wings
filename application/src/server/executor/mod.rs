@@ -136,6 +136,10 @@ pub trait ServerExecutor: Send + Sync {
         Ok(())
     }
 
+    async fn reinstall_server_storage(&self, _server: &super::Server) -> anyhow::Result<()> {
+        anyhow::bail!("native instance reinstallation is not supported by this executor")
+    }
+
     async fn setup_installation_process(
         &self,
         server: &super::Server,

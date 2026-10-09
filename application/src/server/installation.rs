@@ -361,7 +361,57 @@ impl ServerInstaller {
         Ok(())
     }
 
+    async fn start_native_reinstall(self: &Arc<Self>) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.server.locked_state().is_none() && !self.server.set_installing(true).await,
+            "server is locked, cannot recreate the native instance"
+        );
+        if let Err(error) = self.server.websocket.send(
+            super::websocket::WebsocketMessage::builder(
+                super::websocket::WebsocketEvent::ServerInstallStarted,
+            )
+            .build(),
+        ) {
+            self.server.set_installing(false).await;
+            return Err(error.into());
+        }
+        let installer = Arc::clone(self);
+        tokio::spawn(async move {
+            installer.server.log_daemon_with_prelude(
+                "[Incus image] Recreating the OS instance; its previous filesystem will be erased.",
+            );
+            let result = async {
+                installer
+                    .server
+                    .stop_with_kill_timeout(std::time::Duration::from_secs(30), true)
+                    .await?;
+                installer.server.destroy_container().await;
+                installer.server.sync_configuration(true).await;
+                installer
+                    .server
+                    .app_state
+                    .executor
+                    .reinstall_server_storage(&installer.server)
+                    .await
+            }
+            .await;
+            if let Err(error) = &result {
+                tracing::error!(server = %installer.server.uuid, "native reinstallation failed: {error:#}");
+                installer
+                    .server
+                    .log_daemon_with_prelude(&format!("Native reinstallation failed: {error:#}"));
+            }
+            if let Err(error) = installer.unset_installing(result.is_ok()).await {
+                tracing::error!(server = %installer.server.uuid, "failed to finish native reinstallation: {error:#}");
+            }
+        });
+        Ok(())
+    }
+
     pub async fn start(self: &mut Arc<Self>, force: bool) -> Result<(), anyhow::Error> {
+        if self.server.filesystem.native_instance && self.reinstall {
+            return self.start_native_reinstall().await;
+        }
         anyhow::ensure!(
             !self.server.filesystem.native_instance,
             "native OS instances do not run egg installation scripts"

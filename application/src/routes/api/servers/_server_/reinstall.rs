@@ -49,8 +49,25 @@ mod post {
         };
 
         if server.filesystem.native_instance {
-            return ApiResponse::error("native OS reinstallation requires recreating the server")
-                .with_status(StatusCode::BAD_REQUEST)
+            if !data.truncate_directory {
+                return ApiResponse::error("native OS reinstallation erases the entire guest filesystem; confirm truncate_directory")
+                    .with_status(StatusCode::BAD_REQUEST)
+                    .ok();
+            }
+            let mut installer = Arc::new(
+                crate::server::installation::ServerInstaller::new(
+                    &server,
+                    true,
+                    data.start_on_completion,
+                    None,
+                )
+                .await,
+            );
+            let mut slot = server.installer.write().await;
+            installer.start(false).await?;
+            slot.replace(installer);
+            return ApiResponse::new_serialized(Response {})
+                .with_status(StatusCode::ACCEPTED)
                 .ok();
         }
 
