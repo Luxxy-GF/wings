@@ -4,12 +4,13 @@ use anyhow::{Context, ensure};
 use futures::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use std::{
+    collections::BTreeMap,
     path::PathBuf,
     sync::{
         Arc, Weak,
         atomic::{AtomicBool, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tokio::{
     io::AsyncWriteExt,
@@ -77,6 +78,7 @@ pub(super) struct Handle {
     log_path: PathBuf,
     tasks: Vec<tokio::task::JoinHandle<()>>,
 }
+
 impl Drop for Handle {
     fn drop(&mut self) {
         for task in &self.tasks {
@@ -84,6 +86,7 @@ impl Drop for Handle {
         }
     }
 }
+
 impl Handle {
     pub(super) async fn connect(
         executor: IncusExecutor,
@@ -150,7 +153,7 @@ async fn console_task(
 ) {
     let mut line_buffer = crate::io::line_buffer::LineBuffer::new();
     let mut line_count = 0;
-    let mut interval = std::time::Instant::now();
+    let mut interval = Instant::now();
     let mut initial_replay = true;
     let mut emit = |chunk: &[u8]| {
         line_buffer.extend(chunk);
@@ -159,7 +162,7 @@ async fn console_task(
             let _ = lines.send(Arc::clone(&line));
             let cfg = executor.config.load();
             if interval.elapsed() >= Duration::from_millis(cfg.throttles.line_reset_interval) {
-                interval = std::time::Instant::now();
+                interval = Instant::now();
                 line_count = 0;
             }
             line_count += 1;
@@ -203,12 +206,12 @@ async fn console_task(
                 let input_ready = tokio::time::sleep(Duration::from_secs(5));
                 tokio::pin!(input_ready);
                 let mut accept_input = false;
-                let log = tokio::fs::OpenOptions::new()
+                let Ok(mut log) = tokio::fs::OpenOptions::new()
                     .create(true)
                     .append(true)
                     .open(&path)
-                    .await;
-                let Ok(mut log) = log else {
+                    .await
+                else {
                     tracing::error!(instance = %name, "could not open Incus console log");
                     return;
                 };
@@ -289,7 +292,7 @@ async fn monitor_task(
 ) {
     let mut previous = String::new();
     let mut running_announced = false;
-    let mut cpu = None::<(u64, std::time::Instant)>;
+    let mut cpu = None::<(u64, Instant)>;
     loop {
         let start_acknowledged = started.load(Ordering::SeqCst);
         let state = executor
@@ -299,7 +302,7 @@ async fn monitor_task(
         match state {
             Ok(state) => {
                 if runtime && let Some(server) = server.upgrade() {
-                    let now = std::time::Instant::now();
+                    let now = Instant::now();
                     let cpu_usage = state.cpu.get("usage").copied().unwrap_or(0);
                     let percent = cpu.map_or(0.0, |(before, time)| {
                         cpu_usage.saturating_sub(before) as f64
@@ -323,7 +326,7 @@ async fn monitor_task(
                             .as_ref()
                             .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
                             .map_or(0, |time| {
-                                if state.status == "Running" || state.status == "Frozen" {
+                                if matches!(state.status.as_str(), "Running" | "Frozen") {
                                     chrono::Utc::now()
                                         .signed_duration_since(time)
                                         .num_milliseconds()
@@ -359,7 +362,6 @@ async fn monitor_task(
                     if !running_announced && status.send(ProcessStatus::Running).await.is_err() {
                         return;
                     }
-
                     let exit = executor
                         .client
                         .read_file(
@@ -404,20 +406,16 @@ impl ProcessHandle for Handle {
         if let Some(lines) = lines {
             let data = tokio::fs::read(&self.log_path).await?;
             let text = String::from_utf8_lossy(&data);
-            let selected = text
-                .lines()
-                .rev()
-                .take(lines)
-                .collect::<Vec<_>>()
-                .into_iter()
-                .rev()
-                .collect::<Vec<_>>()
-                .join("\n");
-            Ok(Box::new(std::io::Cursor::new(selected.into_bytes())))
+            let mut selected = text.lines().rev().take(lines).collect::<Vec<_>>();
+            selected.reverse();
+            Ok(Box::new(std::io::Cursor::new(
+                selected.join("\n").into_bytes(),
+            )))
         } else {
             Ok(Box::new(tokio::fs::File::open(&self.log_path).await?))
         }
     }
+
     async fn send_stdin(&self, data: Vec<u8>) -> anyhow::Result<()> {
         ensure!(data.len() <= 65536, "console input exceeds 64 KiB");
         self.stdin
@@ -425,16 +423,19 @@ impl ProcessHandle for Handle {
             .await
             .context("Incus console closed")
     }
+
     async fn subscribe_stdout_lines(
         &self,
     ) -> anyhow::Result<broadcast::Receiver<Arc<compact_str::CompactString>>> {
         Ok(self.lines.subscribe())
     }
+
     async fn subscribe_stdout_lines_ratelimited(
         &self,
     ) -> anyhow::Result<broadcast::Receiver<Arc<compact_str::CompactString>>> {
         Ok(self.limited.subscribe())
     }
+
     async fn sync_configuration(&self) -> anyhow::Result<()> {
         if self.name.starts_with("wgs-")
             && let Some(server) = self.server.upgrade()
@@ -443,6 +444,7 @@ impl ProcessHandle for Handle {
         }
         Ok(())
     }
+
     async fn start(&self) -> anyhow::Result<()> {
         self.executor
             .client
@@ -456,7 +458,7 @@ impl ProcessHandle for Handle {
                 let _ = self
                     .executor
                     .network
-                    .sync(server.uuid, "", &std::collections::BTreeMap::new())
+                    .sync(server.uuid, "", &BTreeMap::new())
                     .await;
             }
             let _ = self.executor.client.state(&self.name, "stop", true).await;
@@ -464,6 +466,7 @@ impl ProcessHandle for Handle {
         }
         Ok(())
     }
+
     async fn stop(&self) -> anyhow::Result<()> {
         if self.name.starts_with("wgs-")
             && let Some(server) = self.server.upgrade()
@@ -474,9 +477,10 @@ impl ProcessHandle for Handle {
                     let mut command = config
                         .stop
                         .value
-                        .as_ref()
-                        .map(|value| value.as_bytes().to_vec())
-                        .unwrap_or_default();
+                        .as_deref()
+                        .unwrap_or_default()
+                        .as_bytes()
+                        .to_vec();
                     command.push(b'\n');
                     return self.send_stdin(command).await;
                 }
@@ -524,6 +528,7 @@ impl ProcessHandle for Handle {
         }
         self.executor.client.state(&self.name, "stop", false).await
     }
+
     async fn kill(&self) -> anyhow::Result<()> {
         self.executor.client.state(&self.name, "stop", true).await
     }

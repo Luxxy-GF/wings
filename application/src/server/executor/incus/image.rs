@@ -5,20 +5,19 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, HashMap},
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::Stdio,
     sync::{Arc, Weak},
     time::Duration,
 };
 use tokio::{
-    io::AsyncReadExt,
+    io::{AsyncRead, AsyncReadExt},
     sync::{Mutex, RwLock, Semaphore},
 };
 
-async fn tail(
-    mut stream: impl tokio::io::AsyncRead + Unpin,
-    keep_tail: bool,
-) -> std::io::Result<Vec<u8>> {
+const HEARTBEAT: Duration = Duration::from_secs(15);
+
+async fn tail(mut stream: impl AsyncRead + Unpin, keep_tail: bool) -> std::io::Result<Vec<u8>> {
     let mut output = Vec::new();
     let mut buffer = [0; 8192];
     loop {
@@ -41,15 +40,16 @@ async fn tail(
 }
 
 fn report_progress(server: &crate::server::Server, installation: bool, message: &str) {
+    let message = format!("[Incus image] {message}");
     if installation {
-        server.log_daemon_install(format!("[Incus image] {message}").into());
+        server.log_daemon_install(message.into());
     } else {
-        server.log_daemon_with_prelude(&format!("[Incus image] {message}"));
+        server.log_daemon_with_prelude(&message);
     }
 }
 
 async fn read_stdout(
-    mut stream: impl tokio::io::AsyncRead + Unpin,
+    mut stream: impl AsyncRead + Unpin,
     progress: Option<(&crate::server::Server, bool)>,
 ) -> std::io::Result<Vec<u8>> {
     let Some((server, installation)) = progress else {
@@ -60,21 +60,27 @@ async fn read_stdout(
     let mut last = tokio::time::Instant::now() - Duration::from_secs(1);
     let mut buffer = [0; 8192];
     let started = tokio::time::Instant::now();
-    let mut heartbeat = tokio::time::interval(Duration::from_secs(15));
+    let mut heartbeat = tokio::time::interval(HEARTBEAT);
     heartbeat.tick().await;
     loop {
         let count = tokio::select! {
             count = stream.read(&mut buffer) => count?,
             _ = heartbeat.tick() => {
-                if last.elapsed() >= Duration::from_secs(15) {
-                    report_progress(server, installation,
-                        &format!("Image operation still running ({} seconds elapsed)...", started.elapsed().as_secs()));
+                if last.elapsed() >= HEARTBEAT {
+                    report_progress(
+                        server,
+                        installation,
+                        &format!(
+                            "Image operation still running ({} seconds elapsed)...",
+                            started.elapsed().as_secs()
+                        ),
+                    );
                 }
                 continue;
             }
         };
-        for byte in buffer.get(..count).unwrap_or_default() {
-            if *byte == b'\r' || *byte == b'\n' {
+        for &byte in buffer.get(..count).unwrap_or_default() {
+            if byte == b'\r' || byte == b'\n' {
                 let message = String::from_utf8_lossy(&line).trim().to_string();
                 if !message.is_empty()
                     && message != previous
@@ -86,7 +92,7 @@ async fn read_stdout(
                 }
                 line.clear();
             } else if !byte.is_ascii_control() && line.len() < 4096 {
-                line.push(*byte);
+                line.push(byte);
             }
         }
         if count == 0 {
@@ -109,6 +115,7 @@ pub(super) async fn run(
 }
 
 struct ProcessGroup(Option<rustix::process::Pid>);
+
 impl Drop for ProcessGroup {
     fn drop(&mut self) {
         if let Some(pid) = self.0 {
@@ -153,13 +160,11 @@ async fn run_with_progress(
         )
     })
     .await;
-    let (status, stdout, stderr) = match result {
-        Ok(result) => result?,
-        Err(_) => {
-            let _ = child.kill().await;
-            anyhow::bail!("{executable} timed out");
-        }
+    let Ok(result) = result else {
+        let _ = child.kill().await;
+        anyhow::bail!("{executable} timed out");
     };
+    let (status, stdout, stderr) = result?;
     ensure!(
         status.success(),
         "{executable} failed: {}",
@@ -181,13 +186,23 @@ pub(super) struct Image {
     pub gid: u32,
 }
 
-fn converted_user(archive: &std::path::Path) -> anyhow::Result<(u32, u32)> {
+#[derive(Deserialize)]
+struct ImageConfig {
+    #[serde(default, rename = "Entrypoint")]
+    entrypoint: Option<Vec<String>>,
+    #[serde(default, rename = "Cmd")]
+    cmd: Option<Vec<String>>,
+    #[serde(default, rename = "Env")]
+    environment: Option<Vec<String>>,
+}
+
+fn converted_user(archive: &Path) -> anyhow::Result<(u32, u32)> {
     use std::io::Read;
     let decoder = flate2::read::GzDecoder::new(std::fs::File::open(archive)?);
     let mut archive = tar::Archive::new(decoder.take(4 * 1024 * 1024));
     for entry in archive.entries()? {
         let mut entry = entry?;
-        if entry.path()?.as_ref() != std::path::Path::new("config.json") {
+        if entry.path()?.as_ref() != Path::new("config.json") {
             continue;
         }
         ensure!(
@@ -198,8 +213,7 @@ fn converted_user(archive: &std::path::Path) -> anyhow::Result<(u32, u32)> {
         entry.read_to_end(&mut content)?;
         let config: Value = serde_json::from_slice(&content)?;
         let user = config
-            .get("process")
-            .and_then(|process| process.get("user"))
+            .pointer("/process/user")
             .context("converted OCI process user missing")?;
         let uid = u32::try_from(
             user.get("uid")
@@ -215,15 +229,6 @@ fn converted_user(archive: &std::path::Path) -> anyhow::Result<(u32, u32)> {
     }
     anyhow::bail!("Incus export did not contain an OCI process configuration")
 }
-#[derive(Deserialize)]
-struct ImageConfig {
-    #[serde(default, rename = "Entrypoint")]
-    entrypoint: Option<Vec<String>>,
-    #[serde(default, rename = "Cmd")]
-    cmd: Option<Vec<String>>,
-    #[serde(default, rename = "Env")]
-    environment: Option<Vec<String>>,
-}
 
 pub(super) struct Images {
     config: Arc<crate::config::Config>,
@@ -232,6 +237,7 @@ pub(super) struct Images {
     locks: Mutex<HashMap<String, Weak<Mutex<()>>>>,
     cache_gate: RwLock<()>,
 }
+
 impl Images {
     pub(super) fn new(config: Arc<crate::config::Config>, client: Client) -> Self {
         let concurrency = Semaphore::new(config.load().runtime.incus.max_concurrent_imports);
@@ -243,11 +249,13 @@ impl Images {
             cache_gate: RwLock::new(()),
         }
     }
+
     fn root(&self) -> PathBuf {
         self.config
             .resolve_as_path(|cfg| &cfg.system.root_directory)
             .join("incus-images")
     }
+
     pub(super) async fn boot(self: &Arc<Self>) -> anyhow::Result<()> {
         let cfg = self.config.load().runtime.incus.clone();
         for path in [&cfg.incus_path, &cfg.skopeo_path] {
@@ -271,6 +279,7 @@ impl Images {
         });
         Ok(())
     }
+
     pub(super) async fn ensure(
         &self,
         source: &str,
@@ -285,8 +294,7 @@ impl Images {
         );
         let cfg = self.config.load().runtime.incus.clone();
         let reference = source.trim_end_matches('~').to_string();
-        let key = format!("pull:{reference}");
-        let lock = self.lock(key).await;
+        let lock = self.lock(format!("pull:{reference}")).await;
         let _guard = lock.lock().await;
         let _permit = self.concurrency.acquire().await?;
         let timeout = Duration::from_secs(cfg.image_import_timeout_seconds);
@@ -294,7 +302,6 @@ impl Images {
         let registries = self.config.load().docker.registries.clone();
         let pull =
             super::auth::PullEnvironment::new(&self.root(), &cfg, &registries, &registry).await?;
-        let env = &pull.environment;
         let architecture = match std::env::consts::ARCH {
             "x86_64" => "amd64",
             "aarch64" => "arm64",
@@ -313,7 +320,7 @@ impl Images {
                     format!("docker://{reference}"),
                 ],
                 timeout,
-                Some(env),
+                Some(&pull.environment),
             )
             .await?,
         )
@@ -336,10 +343,7 @@ impl Images {
             .split('@')
             .next()
             .context("OCI repository missing")?;
-        let base = match base.rsplit_once(':') {
-            Some((base, _)) => base,
-            None => base,
-        };
+        let base = base.rsplit_once(':').map_or(base, |(base, _)| base);
         let pinned = format!("{registry}/{base}@{digest}");
         let cache_key = hex::encode(Sha256::digest(
             format!("{pinned}:{architecture}").as_bytes(),
@@ -368,7 +372,7 @@ impl Images {
                     format!("docker://{pinned}"),
                 ],
                 timeout,
-                Some(env),
+                Some(&pull.environment),
             )
             .await?,
         )
@@ -378,13 +382,17 @@ impl Images {
                 .cloned()
                 .context("OCI image config missing")?,
         )?;
-        let mut environment = BTreeMap::new();
-        for entry in process.environment.unwrap_or_default() {
-            let (key, value) = entry
-                .split_once('=')
-                .context("invalid OCI environment entry")?;
-            environment.insert(key.to_owned(), value.to_owned());
-        }
+        let environment = process
+            .environment
+            .unwrap_or_default()
+            .iter()
+            .map(|entry| {
+                let (key, value) = entry
+                    .split_once('=')
+                    .context("invalid OCI environment entry")?;
+                Ok((key.to_owned(), value.to_owned()))
+            })
+            .collect::<anyhow::Result<BTreeMap<_, _>>>()?;
         let cmd = process.cmd.unwrap_or_default();
         let mut args = process.entrypoint.unwrap_or_default();
         args.extend(cmd.clone());
@@ -406,7 +414,7 @@ impl Images {
                 archive.display().to_string(),
             ],
             timeout,
-            Some(env),
+            Some(&pull.environment),
             Some((server, installation)),
         )
         .await?;
@@ -433,15 +441,15 @@ impl Images {
                 cfg.project.clone(),
             ],
             timeout,
-            Some(env),
+            Some(&pull.environment),
             Some((server, installation)),
         )
         .await?;
-        let alias: Value = self
+        let alias_entry: Value = self
             .client
             .get(&format!("/1.0/images/aliases/{}", segment(&alias)))
             .await?;
-        let fingerprint = alias
+        let fingerprint = alias_entry
             .get("target")
             .and_then(Value::as_str)
             .context("Incus import did not create image alias")?
@@ -455,10 +463,9 @@ impl Images {
             uid,
             gid,
         };
-        if !existing
-            .iter()
-            .any(|old| old.get("fingerprint").and_then(Value::as_str) == Some(&image.fingerprint))
-        {
+        if !existing.iter().any(|old| {
+            old.get("fingerprint").and_then(Value::as_str) == Some(image.fingerprint.as_str())
+        }) {
             let image_path = format!("/1.0/images/{}", segment(&image.fingerprint));
             let (mut metadata, etag) = self
                 .client
@@ -499,7 +506,7 @@ impl Images {
         lock
     }
 
-    async fn save(path: &std::path::Path, image: &Image) -> anyhow::Result<()> {
+    async fn save(path: &Path, image: &Image) -> anyhow::Result<()> {
         let temporary = path.with_extension(format!("{}.tmp", uuid::Uuid::new_v4()));
         tokio::fs::write(&temporary, serde_json::to_vec(image)?).await?;
         tokio::fs::rename(temporary, path).await?;
@@ -529,21 +536,23 @@ impl Images {
             {
                 continue;
             }
-            let metadata = entry.metadata().await?;
-            if !metadata.is_file() || metadata.modified()?.elapsed().unwrap_or_default() < retention
+            let file_metadata = entry.metadata().await?;
+            if !file_metadata.is_file()
+                || file_metadata.modified()?.elapsed().unwrap_or_default() < retention
             {
                 continue;
             }
             let Ok(image) = serde_json::from_slice::<Image>(&tokio::fs::read(&path).await?) else {
                 continue;
             };
-            let Some(metadata) = images.iter().find(|metadata| {
-                metadata.get("fingerprint").and_then(Value::as_str) == Some(&image.fingerprint)
+            let Some(cached) = images.iter().find(|candidate| {
+                candidate.get("fingerprint").and_then(Value::as_str)
+                    == Some(image.fingerprint.as_str())
             }) else {
                 tokio::fs::remove_file(&path).await?;
                 continue;
             };
-            if !collectible(metadata, key, &owner, &instances) {
+            if !collectible(cached, key, &owner, &instances) {
                 continue;
             }
             let current: Vec<super::Instance> =
@@ -584,9 +593,9 @@ fn collectible(image: &Value, key: &str, owner: &str, instances: &[super::Instan
             .get("aliases")
             .and_then(Value::as_array)
             .is_some_and(|aliases| {
-                aliases
-                    .iter()
-                    .all(|alias| alias.get("name").and_then(Value::as_str) == Some(&expected))
+                aliases.iter().all(|alias| {
+                    alias.get("name").and_then(Value::as_str) == Some(expected.as_str())
+                })
             })
         && !instances.iter().any(|instance| {
             instance

@@ -1,7 +1,11 @@
-use anyhow::{Context, ensure};
+use anyhow::{Context, bail, ensure};
 use base64::Engine;
 use serde_json::json;
-use std::{collections::BTreeMap, os::unix::fs::PermissionsExt, path::Path};
+use std::{
+    collections::{BTreeMap, HashMap},
+    os::unix::fs::PermissionsExt,
+    path::{Path, PathBuf},
+};
 
 pub(super) struct PullEnvironment {
     _directory: tempfile::TempDir,
@@ -12,7 +16,7 @@ fn quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
-fn executable(path: &str) -> anyhow::Result<std::path::PathBuf> {
+fn executable(path: &str) -> anyhow::Result<PathBuf> {
     let path = Path::new(path);
     if path.components().count() > 1 || path.is_absolute() {
         return std::fs::canonicalize(path).context("resolving configured Skopeo executable");
@@ -26,14 +30,14 @@ fn executable(path: &str) -> anyhow::Result<std::path::PathBuf> {
             return Ok(std::fs::canonicalize(candidate)?);
         }
     }
-    anyhow::bail!("configured Skopeo executable was not found in PATH")
+    bail!("configured Skopeo executable was not found in PATH")
 }
 
 impl PullEnvironment {
     pub async fn new(
         root: &Path,
         cfg: &crate::config::IncusRuntime,
-        registries: &std::collections::HashMap<String, crate::config::DockerRegistryConfiguration>,
+        registries: &HashMap<String, crate::config::DockerRegistryConfiguration>,
         registry: &str,
     ) -> anyhow::Result<Self> {
         let directory = tempfile::tempdir_in(root)?;

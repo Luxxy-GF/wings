@@ -1,4 +1,5 @@
-use anyhow::{Context, bail, ensure};
+use anyhow::{Context, anyhow, bail, ensure};
+use futures::StreamExt;
 use reqwest::{Method, StatusCode};
 use serde::{Deserialize, de::DeserializeOwned};
 use serde_json::{Value, json};
@@ -17,11 +18,13 @@ pub(super) struct ApiError {
     pub status: StatusCode,
     pub message: String,
 }
+
 impl std::fmt::Display for ApiError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "Incus API {}: {}", self.status, self.message)
     }
 }
+
 impl std::error::Error for ApiError {}
 
 #[derive(Deserialize, PartialEq)]
@@ -49,6 +52,7 @@ struct Envelope {
 pub(super) fn segment(value: &str) -> String {
     percent_encoding::utf8_percent_encode(value, percent_encoding::NON_ALPHANUMERIC).to_string()
 }
+
 pub(super) fn is_status(error: &anyhow::Error, status: StatusCode) -> bool {
     error
         .downcast_ref::<ApiError>()
@@ -72,7 +76,7 @@ impl Client {
     }
 
     pub(super) fn url(&self, path: &str, project: bool) -> anyhow::Result<url::Url> {
-        anyhow::ensure!(
+        ensure!(
             path == "/1.0" || path.starts_with("/1.0/") || path.starts_with("/1.0?"),
             "invalid Incus API path"
         );
@@ -175,6 +179,7 @@ impl Client {
     pub(super) async fn get<T: DeserializeOwned>(&self, path: &str) -> anyhow::Result<T> {
         Ok(self.get_with_etag(path).await?.0)
     }
+
     pub(super) async fn optional<T: DeserializeOwned>(
         &self,
         path: &str,
@@ -185,6 +190,7 @@ impl Client {
             Err(err) => Err(err),
         }
     }
+
     pub(super) async fn mutate(
         &self,
         method: Method,
@@ -193,6 +199,7 @@ impl Client {
     ) -> anyhow::Result<Value> {
         Ok(self.request(method, path, Some(&body), None, true).await?.0)
     }
+
     async fn wait(&self, operation: &str) -> anyhow::Result<Value> {
         let mut url = self.url(&format!("{operation}/wait"), true)?;
         url.query_pairs_mut()
@@ -258,6 +265,7 @@ impl Client {
             .context("missing console descriptors")?;
         Ok((envelope.operation, fds))
     }
+
     pub(super) async fn websocket(
         &self,
         operation: &str,
@@ -266,11 +274,11 @@ impl Client {
         Self::validate_operation(operation)?;
         let mut url = self.url(&format!("{operation}/websocket"), true)?;
         url.set_scheme("ws")
-            .map_err(|_| anyhow::anyhow!("invalid websocket URL"))?;
+            .map_err(|_| anyhow!("invalid websocket URL"))?;
         url.query_pairs_mut().append_pair("secret", secret);
         tokio::time::timeout(self.timeout, async {
             let stream = tokio::net::UnixStream::connect(&self.socket).await?;
-            Ok::<_, anyhow::Error>(
+            anyhow::Ok(
                 tokio_tungstenite::client_async(url.as_str(), stream)
                     .await?
                     .0,
@@ -283,6 +291,7 @@ impl Client {
     pub(super) async fn read_file(&self, path: &str) -> anyhow::Result<Vec<u8>> {
         self.read_bytes(path, 4096).await
     }
+
     pub(super) async fn console_buffer(&self, name: &str) -> anyhow::Result<Vec<u8>> {
         self.read_bytes(
             &format!("/1.0/instances/{}/console", segment(name)),
@@ -290,6 +299,7 @@ impl Client {
         )
         .await
     }
+
     async fn read_bytes(&self, path: &str, limit: usize) -> anyhow::Result<Vec<u8>> {
         let response = self.http.get(self.url(path, true)?).send().await?;
         let status = response.status();
@@ -300,16 +310,15 @@ impl Client {
             }
             .into());
         }
-        anyhow::ensure!(
+        ensure!(
             response.content_length().unwrap_or(0) <= limit as u64,
             "oversized Incus status file"
         );
-        use futures::StreamExt;
         let mut stream = response.bytes_stream();
         let mut data = Vec::new();
         while let Some(chunk) = stream.next().await {
             let chunk = chunk?;
-            anyhow::ensure!(
+            ensure!(
                 data.len() + chunk.len() <= limit,
                 "oversized Incus status file"
             );
@@ -317,6 +326,7 @@ impl Client {
         }
         Ok(data)
     }
+
     pub(super) async fn directory(
         &self,
         path: &str,
@@ -324,17 +334,8 @@ impl Client {
         gid: u32,
         mode: &str,
     ) -> anyhow::Result<()> {
-        let response = self
-            .http
-            .post(self.url(path, true)?)
-            .header("X-Incus-type", "directory")
-            .header("X-Incus-mode", mode)
-            .header("X-Incus-uid", uid.to_string())
-            .header("X-Incus-gid", gid.to_string())
-            .send()
-            .await?;
-        Self::decode(response).await?;
-        Ok(())
+        self.create_entry(path, "directory", uid, gid, mode, None)
+            .await
     }
 
     pub(super) async fn write_file(
@@ -345,17 +346,30 @@ impl Client {
         gid: u32,
         mode: &str,
     ) -> anyhow::Result<()> {
-        let response = self
+        self.create_entry(path, "file", uid, gid, mode, Some(data))
+            .await
+    }
+
+    async fn create_entry(
+        &self,
+        path: &str,
+        kind: &str,
+        uid: u32,
+        gid: u32,
+        mode: &str,
+        body: Option<Vec<u8>>,
+    ) -> anyhow::Result<()> {
+        let mut request = self
             .http
             .post(self.url(path, true)?)
-            .header("X-Incus-type", "file")
+            .header("X-Incus-type", kind)
             .header("X-Incus-mode", mode)
             .header("X-Incus-uid", uid.to_string())
-            .header("X-Incus-gid", gid.to_string())
-            .body(data)
-            .send()
-            .await?;
-        Self::decode(response).await?;
+            .header("X-Incus-gid", gid.to_string());
+        if let Some(data) = body {
+            request = request.body(data);
+        }
+        Self::decode(request.send().await?).await?;
         Ok(())
     }
 }

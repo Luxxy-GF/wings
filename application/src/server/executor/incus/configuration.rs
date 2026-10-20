@@ -104,17 +104,10 @@ impl IncusExecutor {
         command: Option<Vec<String>>,
     ) -> anyhow::Result<BTreeMap<String, String>> {
         let mut result = self.resources(config, installer)?;
-        let args = match command {
-            Some(command) => command,
-            None => match config.entrypoint.as_ref() {
-                Some(entrypoint) => {
-                    let mut args = entrypoint.clone();
-                    args.extend(image.cmd.clone());
-                    args
-                }
-                None => image.args.clone(),
-            },
-        };
+        let args = command.unwrap_or_else(|| match config.entrypoint.as_ref() {
+            Some(entrypoint) => [entrypoint.as_slice(), image.cmd.as_slice()].concat(),
+            None => image.args.clone(),
+        });
         let mut supervised = vec![
             "/bin/sh".into(),
             "-c".into(),
@@ -147,11 +140,15 @@ impl IncusExecutor {
             "oci.gid".into(),
             if installer { 0 } else { image.gid }.to_string(),
         );
-        result.insert("security.privileged".into(), "false".into());
-        result.insert("security.nesting".into(), "false".into());
-        result.insert("security.idmap.isolated".into(), "true".into());
-        result.insert("security.guestapi".into(), "false".into());
-        result.insert("boot.autostart".into(), "false".into());
+        for (key, value) in [
+            ("security.privileged", "false"),
+            ("security.nesting", "false"),
+            ("security.idmap.isolated", "true"),
+            ("security.guestapi", "false"),
+            ("boot.autostart", "false"),
+        ] {
+            result.insert(key.into(), value.into());
+        }
         for (key, value) in &image.environment {
             result.insert(format!("environment.{key}"), value.clone());
         }

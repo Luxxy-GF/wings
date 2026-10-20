@@ -1,3 +1,4 @@
+use super::super::UsedPort;
 use super::{
     Instance,
     client::{Client, is_status, segment},
@@ -25,6 +26,7 @@ pub(super) struct ForwardPort {
     #[serde(flatten)]
     pub extra: BTreeMap<String, Value>,
 }
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub(super) struct Forward {
     pub listen_address: String,
@@ -59,7 +61,7 @@ pub(super) fn ipv4_pool(value: &str) -> anyhow::Result<(u32, u32, u32)> {
 pub(super) fn allocations(
     config: &crate::server::configuration::ServerConfiguration,
 ) -> anyhow::Result<BTreeMap<IpAddr, BTreeSet<u16>>> {
-    let mut result = BTreeMap::<IpAddr, BTreeSet<u16>>::new();
+    let mut result: BTreeMap<IpAddr, BTreeSet<u16>> = BTreeMap::new();
     for (address, ports) in &config.allocations.mappings {
         let ip: IpAddr = address.parse().context("invalid panel allocation IP")?;
         ensure!(
@@ -161,11 +163,11 @@ fn overlaps(a: IpAddr, b: IpAddr) -> bool {
     a.is_ipv4() == b.is_ipv4() && (a == b || a.is_unspecified() || b.is_unspecified())
 }
 
-fn check_proxy_conflicts(
-    devices: &Devices,
+fn check_proxy_conflicts<'a>(
+    devices: impl IntoIterator<Item = &'a BTreeMap<String, String>>,
     desired: &BTreeMap<IpAddr, BTreeSet<u16>>,
 ) -> anyhow::Result<()> {
-    for device in devices.values() {
+    for device in devices {
         if let Some((address, ports)) = proxy_binding(device)? {
             for (wanted_ip, wanted_ports) in desired {
                 ensure!(
@@ -178,6 +180,12 @@ fn check_proxy_conflicts(
     Ok(())
 }
 
+fn add_port(entries: &mut Vec<UsedPort>, port: u16, server: Option<uuid::Uuid>) {
+    if !entries.iter().any(|item| item.port == port) {
+        entries.push(UsedPort { port, server });
+    }
+}
+
 pub(super) struct Network {
     client: Client,
     name: String,
@@ -186,6 +194,7 @@ pub(super) struct Network {
     timeout: Duration,
     lock: tokio::sync::Mutex<()>,
 }
+
 impl Network {
     pub(super) fn new(client: Client, cfg: &crate::config::IncusRuntime, node: uuid::Uuid) -> Self {
         Self {
@@ -197,13 +206,30 @@ impl Network {
             lock: tokio::sync::Mutex::new(()),
         }
     }
+
     fn path(&self) -> String {
         format!("/1.0/networks/{}", segment(&self.name))
     }
+
+    fn global(&self) -> Client {
+        let mut client = self.client.clone();
+        client.project = "default".into();
+        client
+    }
+
+    fn owns_forward(&self, forward: &Forward) -> bool {
+        let prefix = format!("{}:", self.owner);
+        forward.description == self.owner
+            && forward
+                .ports
+                .iter()
+                .all(|p| p.description.starts_with(&prefix))
+            && !forward.config.contains_key("target_address")
+    }
+
     pub(super) async fn boot(&self) -> anyhow::Result<()> {
         ipv4_pool(&self.cidr)?;
-        let mut global = self.client.clone();
-        global.project = "default".into();
+        let global = self.global();
         if let Some(network) = global.optional::<Value>(&self.path()).await? {
             ensure!(
                 network.get("type").and_then(Value::as_str) == Some("bridge"),
@@ -224,9 +250,23 @@ impl Network {
                 "existing Incus network subnet differs from configuration"
             );
         } else {
-            global.mutate(Method::POST, "/1.0/networks", json!({"name": self.name, "type": "bridge", "config": {
-                "ipv4.address": self.cidr, "ipv4.nat": "true", "ipv4.dhcp": "true", "ipv6.address": "none", "user.wings.owner": self.owner
-            }})).await?;
+            global
+                .mutate(
+                    Method::POST,
+                    "/1.0/networks",
+                    json!({
+                        "name": self.name,
+                        "type": "bridge",
+                        "config": {
+                            "ipv4.address": self.cidr,
+                            "ipv4.nat": "true",
+                            "ipv4.dhcp": "true",
+                            "ipv6.address": "none",
+                            "user.wings.owner": self.owner
+                        }
+                    }),
+                )
+                .await?;
         }
         self.migrate_forwards().await?;
         let instances: Vec<Instance> = self.client.get("/1.0/instances?recursion=1").await?;
@@ -255,6 +295,7 @@ impl Network {
         }
         Ok(())
     }
+
     pub(super) async fn allocate(&self, instances: &[Instance]) -> anyhow::Result<Ipv4Addr> {
         let (network, broadcast, gateway) = ipv4_pool(&self.cidr)?;
         let mut used: BTreeSet<u32> = instances
@@ -263,39 +304,37 @@ impl Network {
             .filter_map(|ip| ip.parse::<Ipv4Addr>().ok())
             .map(u32::from)
             .collect();
-        let mut global = self.client.clone();
-        global.project = "default".into();
-        let leases: Vec<Value> = global.get(&format!("{}/leases", self.path())).await?;
-        for lease in leases {
-            if let Some(address) = lease
-                .get("address")
-                .and_then(Value::as_str)
-                .and_then(|ip| ip.parse::<Ipv4Addr>().ok())
-            {
-                used.insert(u32::from(address));
-            }
-        }
-        for forward in self.forwards().await? {
-            for entry in forward.ports {
-                if let Ok(address) = entry.target_address.parse::<Ipv4Addr>() {
-                    used.insert(u32::from(address));
-                }
-            }
-        }
-        for address in network + 1..broadcast {
-            if address != gateway && !used.contains(&address) {
-                return Ok(address.into());
-            }
-        }
-        anyhow::bail!("Incus bridge has no free private IPv4 addresses")
+        let leases: Vec<Value> = self
+            .global()
+            .get(&format!("{}/leases", self.path()))
+            .await?;
+        used.extend(
+            leases
+                .iter()
+                .filter_map(|lease| lease.get("address").and_then(Value::as_str))
+                .filter_map(|ip| ip.parse::<Ipv4Addr>().ok())
+                .map(u32::from),
+        );
+        used.extend(
+            self.forwards()
+                .await?
+                .iter()
+                .flat_map(|forward| &forward.ports)
+                .filter_map(|port| port.target_address.parse::<Ipv4Addr>().ok())
+                .map(u32::from),
+        );
+        (network + 1..broadcast)
+            .find(|address| *address != gateway && !used.contains(address))
+            .map(Ipv4Addr::from)
+            .context("Incus bridge has no free private IPv4 addresses")
     }
+
     async fn forwards(&self) -> anyhow::Result<Vec<Forward>> {
-        let mut global = self.client.clone();
-        global.project = "default".into();
-        global
+        self.global()
             .get(&format!("{}/forwards?recursion=1", self.path()))
             .await
     }
+
     async fn all_instances(&self) -> anyhow::Result<Vec<Instance>> {
         let (value, _) = self
             .client
@@ -309,52 +348,38 @@ impl Network {
             .await?;
         serde_json::from_value(value).context("decoding all-project Incus instances")
     }
+
     async fn migrate_forwards(&self) -> anyhow::Result<()> {
         let prefix = format!("{}:", self.owner);
         let forwards = self.forwards().await?;
         for forward in &forwards {
-            if forward
+            let touched = forward
                 .ports
                 .iter()
-                .any(|p| p.description.starts_with(&prefix))
-            {
-                ensure!(
-                    forward.description == self.owner
-                        && forward
-                            .ports
-                            .iter()
-                            .all(|p| p.description.starts_with(&prefix))
-                        && !forward.config.contains_key("target_address"),
-                    "cannot migrate shared/unmanaged Incus forward {}; move its unrelated rules first",
-                    forward.listen_address
-                );
-            }
+                .any(|p| p.description.starts_with(&prefix));
+            ensure!(
+                !touched || self.owns_forward(forward),
+                "cannot migrate shared/unmanaged Incus forward {}; move its unrelated rules first",
+                forward.listen_address
+            );
         }
-        let mut global = self.client.clone();
-        global.project = "default".into();
-        for forward in forwards {
-            if forward.description == self.owner
-                && forward
-                    .ports
-                    .iter()
-                    .all(|p| p.description.starts_with(&prefix))
-                && !forward.config.contains_key("target_address")
-            {
-                global
-                    .mutate(
-                        Method::DELETE,
-                        &format!(
-                            "{}/forwards/{}",
-                            self.path(),
-                            segment(&forward.listen_address)
-                        ),
-                        json!({}),
-                    )
-                    .await?;
-            }
+        let global = self.global();
+        for forward in forwards.iter().filter(|forward| self.owns_forward(forward)) {
+            global
+                .mutate(
+                    Method::DELETE,
+                    &format!(
+                        "{}/forwards/{}",
+                        self.path(),
+                        segment(&forward.listen_address)
+                    ),
+                    json!({}),
+                )
+                .await?;
         }
         Ok(())
     }
+
     pub(super) async fn sync(
         &self,
         server: uuid::Uuid,
@@ -364,22 +389,20 @@ impl Network {
         let _guard = self.lock.lock().await;
         let name = format!("wgs-{server}");
         let path = format!("/1.0/instances/{}", segment(&name));
-        let instances = self.all_instances().await?;
-        for instance in &instances {
+        for instance in self.all_instances().await? {
             if instance.name == name
                 && instance.project == self.client.project
                 && instance.config.get("user.wings.owner") == Some(&self.owner)
                 && instance.config.get("user.wings.server") == Some(&server.to_string())
             {
-                let unmanaged: Devices = instance
+                let unmanaged = instance
                     .effective_devices()
                     .iter()
-                    .filter(|(name, _)| !name.starts_with(PROXY_PREFIX))
-                    .map(|(name, device)| (name.clone(), device.clone()))
-                    .collect();
-                check_proxy_conflicts(&unmanaged, desired)?;
+                    .filter(|(device, _)| !device.starts_with(PROXY_PREFIX))
+                    .map(|(_, device)| device);
+                check_proxy_conflicts(unmanaged, desired)?;
             } else {
-                check_proxy_conflicts(instance.effective_devices(), desired)?;
+                check_proxy_conflicts(instance.effective_devices().values(), desired)?;
             }
         }
         for forward in self.forwards().await? {
@@ -449,33 +472,29 @@ impl Network {
             }
         }
     }
+
     pub(super) async fn used_ports(
         &self,
         ips: &[IpAddr],
-    ) -> anyhow::Result<HashMap<IpAddr, Vec<super::super::UsedPort>>> {
-        let mut result: HashMap<IpAddr, Vec<super::super::UsedPort>> =
+    ) -> anyhow::Result<HashMap<IpAddr, Vec<UsedPort>>> {
+        let mut result: HashMap<IpAddr, Vec<UsedPort>> =
             ips.iter().map(|ip| (*ip, Vec::new())).collect();
-        let instances = self.all_instances().await?;
-        for instance in instances {
-            let server = if instance.config.get("user.wings.owner") == Some(&self.owner) {
-                instance
-                    .config
-                    .get("user.wings.server")
-                    .and_then(|s| s.parse().ok())
-            } else {
-                None
-            };
+        for instance in self.all_instances().await? {
+            let server: Option<uuid::Uuid> =
+                if instance.config.get("user.wings.owner") == Some(&self.owner) {
+                    instance
+                        .config
+                        .get("user.wings.server")
+                        .and_then(|s| s.parse().ok())
+                } else {
+                    None
+                };
             for device in instance.effective_devices().values() {
                 if let Some((address, ports)) = proxy_binding(device)? {
                     for (ip, entries) in &mut result {
                         if overlaps(*ip, address) {
-                            for port in &ports {
-                                if !entries.iter().any(|item| item.port == *port) {
-                                    entries.push(super::super::UsedPort {
-                                        port: *port,
-                                        server,
-                                    });
-                                }
+                            for &port in &ports {
+                                add_port(entries, port, server);
                             }
                         }
                     }
@@ -484,19 +503,14 @@ impl Network {
         }
         for forward in self.forwards().await? {
             let address: IpAddr = forward.listen_address.parse()?;
-            for (ip, entries) in &mut result {
-                if *ip != address {
-                    continue;
-                }
+            if let Some(entries) = result.get_mut(&address) {
                 for entry in &forward.ports {
-                    let server = entry
+                    let server: Option<uuid::Uuid> = entry
                         .description
                         .strip_prefix(&format!("{}:", self.owner))
                         .and_then(|uuid| uuid.parse().ok());
                     for port in port_set(&entry.listen_port)? {
-                        if !entries.iter().any(|item| item.port == port) {
-                            entries.push(super::super::UsedPort { port, server });
-                        }
+                        add_port(entries, port, server);
                     }
                 }
             }

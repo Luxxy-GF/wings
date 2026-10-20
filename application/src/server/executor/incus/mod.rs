@@ -9,10 +9,22 @@ mod provision;
 mod storage;
 
 use super::{ProcessHandle, ServerExecutor, StatusReceiver, UsedPort};
-use crate::server::{
-    Server,
-    configuration::ServerConfiguration,
-    firewall::{FirewallBackend, FirewallServerSpec},
+use crate::{
+    config::Config,
+    remote::servers::RawServer,
+    server::{
+        InnerServer, Server,
+        configuration::ServerConfiguration,
+        filesystem::cap::CapFilesystem,
+        firewall::{
+            FirewallBackend, FirewallBackendKind, FirewallBinding, FirewallServerSpec,
+            nftables::NftablesFirewall,
+            noop::NoopFirewall,
+            runner::CommandRunner,
+            sets::{FirewallFileAccess, SourceFileLimits},
+        },
+        installation::InstallationScript,
+    },
 };
 use anyhow::{Context, ensure};
 use client::{Client, segment};
@@ -23,7 +35,7 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     net::{IpAddr, SocketAddr},
     path::PathBuf,
-    sync::Arc,
+    sync::{Arc, atomic::Ordering},
     time::Duration,
 };
 use storage::Storage;
@@ -43,7 +55,7 @@ impl std::error::Error for RecoveryError {
 
 #[derive(Clone)]
 pub struct IncusExecutor {
-    pub config: Arc<crate::config::Config>,
+    pub config: Arc<Config>,
     client: Client,
     images: Arc<image::Images>,
     network: Arc<network::Network>,
@@ -53,20 +65,17 @@ pub struct IncusExecutor {
     owner: String,
 }
 impl IncusExecutor {
-    pub fn new(config: Arc<crate::config::Config>) -> anyhow::Result<Self> {
+    pub fn new(config: Arc<Config>) -> anyhow::Result<Self> {
         let settings = config.load();
         let client = Client::new(&settings.runtime.incus)?;
         let owner = format!("wings:{}", settings.uuid);
         let firewall: Arc<dyn FirewallBackend> = match settings.docker.firewall.backend {
-            crate::server::firewall::FirewallBackendKind::Disabled => {
-                Arc::new(crate::server::firewall::noop::NoopFirewall::new(false))
-            }
-            crate::server::firewall::FirewallBackendKind::Auto
-            | crate::server::firewall::FirewallBackendKind::Nftables => {
-                Arc::new(crate::server::firewall::nftables::NftablesFirewall::new(
+            FirewallBackendKind::Disabled => Arc::new(NoopFirewall::new(false)),
+            FirewallBackendKind::Auto | FirewallBackendKind::Nftables => {
+                Arc::new(NftablesFirewall::new(
                     Vec::new(),
-                    crate::server::firewall::runner::CommandRunner::Local,
-                    crate::server::firewall::sets::SourceFileLimits::from_config(&config),
+                    CommandRunner::Local,
+                    SourceFileLimits::from_config(&config),
                 ))
             }
             _ => anyhow::bail!(
@@ -147,11 +156,11 @@ impl IncusExecutor {
             if instance.status != "Stopped" {
                 self.client.state(name, "stop", true).await?;
             }
-            let deletion = self
+            match self
                 .client
                 .mutate(Method::DELETE, &Self::instance_path(name), json!({}))
-                .await;
-            match deletion {
+                .await
+            {
                 Ok(_) => break,
                 Err(error) if client::is_status(&error, reqwest::StatusCode::NOT_FOUND) => break,
                 Err(error)
@@ -179,11 +188,7 @@ impl IncusExecutor {
         }
         Ok(())
     }
-    async fn sync_server(
-        &self,
-        server: &Arc<crate::server::InnerServer>,
-        name: &str,
-    ) -> anyhow::Result<()> {
+    async fn sync_server(&self, server: &Arc<InnerServer>, name: &str) -> anyhow::Result<()> {
         let _guard = self.provisioning.lock().await;
         let cfg = server.configuration.read().await;
         Self::validate_server(&cfg)?;
@@ -217,7 +222,7 @@ impl IncusExecutor {
             .context("instance address missing")?
             .parse()?;
         let mut spec = firewall_spec(&cfg, ip)?;
-        spec.files = Some(crate::server::firewall::sets::FirewallFileAccess {
+        spec.files = Some(FirewallFileAccess {
             filesystem: (*server.filesystem).clone(),
             notifier: Some(server.filesystem.server_notifier().clone()),
             server: Some(Arc::downgrade(server)),
@@ -313,12 +318,10 @@ fn firewall_spec(
         bindings: mappings
             .iter()
             .flat_map(|(ip, ports)| {
-                ports
-                    .iter()
-                    .map(|port| crate::server::firewall::FirewallBinding {
-                        ip: (!ip.is_unspecified()).then_some(*ip),
-                        port: *port,
-                    })
+                ports.iter().map(|port| FirewallBinding {
+                    ip: (!ip.is_unspecified()).then_some(*ip),
+                    port: *port,
+                })
             })
             .collect(),
         container_ports: mappings
@@ -393,12 +396,17 @@ impl ServerExecutor for IncusExecutor {
                 .context("Incus extensions missing")?,
         )?;
         verify_version(version, &extensions)?;
-        let path = format!("/1.0/projects/{}", segment(&runtime.project));
-        let existing = self
+        match self
             .client
-            .request(Method::GET, &path, None, None, false)
-            .await;
-        match existing {
+            .request(
+                Method::GET,
+                &format!("/1.0/projects/{}", segment(&runtime.project)),
+                None,
+                None,
+                false,
+            )
+            .await
+        {
             Ok((project, _)) => {
                 ensure!(
                     project
@@ -416,19 +424,24 @@ impl ServerExecutor for IncusExecutor {
                 );
             }
             Err(err) if client::is_status(&err, reqwest::StatusCode::NOT_FOUND) => {
-                let body = json!({
-                    "name": runtime.project,
-                    "description": self.owner,
-                    "config": {
-                        "features.images": "true",
-                        "features.profiles": "true",
-                        "features.storage.volumes": "true",
-                        "features.networks": "false",
-                        "user.wings.owner": self.owner,
-                    },
-                });
                 self.client
-                    .request(Method::POST, "/1.0/projects", Some(&body), None, false)
+                    .request(
+                        Method::POST,
+                        "/1.0/projects",
+                        Some(&json!({
+                            "name": runtime.project,
+                            "description": self.owner,
+                            "config": {
+                                "features.images": "true",
+                                "features.profiles": "true",
+                                "features.storage.volumes": "true",
+                                "features.networks": "false",
+                                "user.wings.owner": self.owner,
+                            },
+                        })),
+                        None,
+                        false,
+                    )
                     .await?;
             }
             Err(err) => return Err(err),
@@ -483,7 +496,7 @@ impl ServerExecutor for IncusExecutor {
     async fn cleanup_server_process(&self, server: &Server) -> anyhow::Result<()> {
         let _guard = self.provisioning.lock().await;
         self.remove_instance(&Self::name(server.uuid)).await?;
-        if server.suspended.load(std::sync::atomic::Ordering::SeqCst) {
+        if server.suspended.load(Ordering::SeqCst) {
             self.cleanup_owned_helpers(server.uuid).await?;
         }
         self.firewall.clear(server.uuid).await?;
@@ -492,7 +505,7 @@ impl ServerExecutor for IncusExecutor {
     async fn setup_installation_process(
         &self,
         server: &Server,
-        script: &crate::server::installation::InstallationScript,
+        script: &InstallationScript,
     ) -> anyhow::Result<(Arc<dyn ProcessHandle>, StatusReceiver)> {
         self.setup_helper(server, script, true).await
     }
@@ -511,7 +524,7 @@ impl ServerExecutor for IncusExecutor {
     async fn setup_script_process(
         &self,
         server: &Server,
-        script: &crate::server::installation::InstallationScript,
+        script: &InstallationScript,
     ) -> anyhow::Result<(Arc<dyn ProcessHandle>, StatusReceiver)> {
         self.setup_helper(server, script, false).await
     }
@@ -546,10 +559,7 @@ impl ServerExecutor for IncusExecutor {
     async fn used_ports(&self, ips: &[IpAddr]) -> anyhow::Result<HashMap<IpAddr, Vec<UsedPort>>> {
         self.network.used_ports(ips).await
     }
-    async fn reconcile_firewall(
-        &self,
-        servers: &[crate::remote::servers::RawServer],
-    ) -> anyhow::Result<()> {
+    async fn reconcile_firewall(&self, servers: &[RawServer]) -> anyhow::Result<()> {
         let instances: Vec<Instance> = self.client.get("/1.0/instances?recursion=1").await?;
         let servers: HashMap<_, _> = servers
             .iter()
@@ -585,11 +595,8 @@ impl ServerExecutor for IncusExecutor {
             }
             let mut spec = firewall_spec(settings, ip)?;
             if spec.references_files() {
-                spec.files = Some(crate::server::firewall::sets::FirewallFileAccess {
-                    filesystem: crate::server::filesystem::cap::CapFilesystem::new(
-                        &self.config.data_path(uuid),
-                    )
-                    .await?,
+                spec.files = Some(FirewallFileAccess {
+                    filesystem: CapFilesystem::new(&self.config.data_path(uuid)).await?,
                     notifier: None,
                     server: None,
                 });

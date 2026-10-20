@@ -8,7 +8,7 @@ use reqwest::Method;
 use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, HashMap},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
 };
@@ -65,8 +65,7 @@ impl IncusExecutor {
                 format!("environment.{key}"),
                 value
                     .as_str()
-                    .map(str::to_owned)
-                    .unwrap_or_else(|| value.to_string()),
+                    .map_or_else(|| value.to_string(), str::to_owned),
             );
         }
         let data_source = self.prepare_data_mount(server).await?;
@@ -137,25 +136,30 @@ impl IncusExecutor {
                 .filter(|mount| mount.target != "/home/container")
                 .enumerate()
             {
-                let source = std::path::Path::new(mount.source.as_str());
+                let source = Path::new(mount.source.as_str());
                 ensure!(
                     source.is_absolute() && source.exists(),
                     "Incus mount source is missing"
                 );
                 let target = if mount.target == "/etc/hosts" {
-                    config.insert("raw.lxc".into(),
-                        "lxc.mount.entry = opt/wings-private-hosts etc/hosts none bind,ro,relative,create=file 0 0\n".into());
+                    config.insert(
+                        "raw.lxc".into(),
+                        "lxc.mount.entry = opt/wings-private-hosts etc/hosts none bind,ro,relative,create=file 0 0\n"
+                            .into(),
+                    );
                     "/opt/wings-private-hosts"
                 } else {
                     mount.target.as_str()
                 };
-                let device = BTreeMap::from([
-                    ("type".into(), "disk".into()),
-                    ("source".into(), mount.source.to_string()),
-                    ("path".into(), target.to_string()),
-                    ("readonly".into(), mount.read_only.to_string()),
-                ]);
-                devices.insert(format!("mount-{index}"), device);
+                devices.insert(
+                    format!("mount-{index}"),
+                    BTreeMap::from([
+                        ("type".into(), "disk".into()),
+                        ("source".into(), mount.source.to_string()),
+                        ("path".into(), target.to_string()),
+                        ("readonly".into(), mount.read_only.to_string()),
+                    ]),
+                );
             }
         }
         let body = json!({
@@ -271,6 +275,7 @@ impl IncusExecutor {
             .context("applying the server data quota")?;
         Ok(source)
     }
+
     pub(super) async fn verify_data_mount(
         &self,
         server: &Server,
@@ -341,15 +346,10 @@ impl IncusExecutor {
                 tokio::fs::write(staging.join(filename), []).await?;
             }
         }
-        let target = if installation {
-            "/mnt/install"
+        let (target, filename) = if installation {
+            ("/mnt/install", "install.sh")
         } else {
-            "/mnt/script"
-        };
-        let filename = if installation {
-            "install.sh"
-        } else {
-            "script.sh"
+            ("/mnt/script", "script.sh")
         };
         let mut env = script.environment.clone();
         if installation {

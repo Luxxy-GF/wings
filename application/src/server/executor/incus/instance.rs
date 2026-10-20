@@ -70,7 +70,6 @@ pub(super) struct InstanceState {
     pub memory: BTreeMap<String, u64>,
     #[serde(default, deserialize_with = "crate::deserialize::deserialize_nullable")]
     pub network: BTreeMap<String, NetworkState>,
-    #[serde(default)]
     pub started_at: Option<String>,
 }
 
